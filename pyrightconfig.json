@@ -1,0 +1,22 @@
+{
+  "venvPath": ".",
+  "venv": ".venv",
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "basic",
+  "include": [
+    "ai_interview_recruitment",
+    "interview_system",
+    "manage.py"
+  ],
+  "exclude": [
+    ".venv",
+    "venv",
+    "**/__pycache__"
+  ],
+  "executionEnvironments": [
+    {
+      "root": ".",
+      "djangoSettingsModule": "ai_interview_recruitment.settings"
+    }
+  ]
+}

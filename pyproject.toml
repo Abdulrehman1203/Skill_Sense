@@ -1,0 +1,13 @@
+[tool.django-stubs]
+django_settings_module = "ai_interview_recruitment.settings"
+
+[tool.mypy]
+plugins = ["mypy_django_plugin.main"]
+python_version = "3.12"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "*.migrations.*"
+ignore_errors = true

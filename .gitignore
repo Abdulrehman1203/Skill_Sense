@@ -1,0 +1,59 @@
+# ── Environment ──────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Python ───────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual environments ─────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+
+# ── IDE ──────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── Database ─────────────────────────────────────────────────
+db.sqlite3
+*.sqlite3
+
+# ── Django collected static & media uploads ──────────────────
+staticfiles/
+static_root/
+media/
+
+# ── Logs ─────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── OS artifacts ─────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Secrets / Certs ──────────────────────────────────────────
+*.pem
+*.key
+*.cert
+*.crt
+secrets.json
+
+# ── Local agent / AI tooling config ──────────────────────────
+.agents/
+
+# ── Coverage / Test artifacts ────────────────────────────────
+.coverage
+htmlcov/
+.pytest_cache/
