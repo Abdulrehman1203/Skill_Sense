@@ -57,5 +57,5 @@ class UserResponseSerializer(serializers.ModelSerializer):
 
     class Meta:  # pyrefly: ignore[bad-override]
         model = User
-        fields = ["id", "email", "first_name", "last_name", "role", "is_verified", "created_at"]
+        fields = ["id", "email", "first_name", "last_name", "role", "is_verified", "created_at", "is_active"]
         read_only_fields = fields
