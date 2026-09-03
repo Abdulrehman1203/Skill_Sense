@@ -2,6 +2,8 @@
 URL configuration for ai_interview_recruitment project.
 """
 
+from django.conf import settings
+from django.conf.urls.static import static
 from django.contrib import admin
 from django.urls import include, path
 from drf_spectacular.views import (
@@ -9,8 +11,6 @@ from drf_spectacular.views import (
     SpectacularRedocView,
     SpectacularSwaggerView,
 )
-
-from interview_system.auth_views import MeView
 
 urlpatterns = [
     path("admin/", admin.site.urls),
@@ -32,11 +32,10 @@ urlpatterns = [
         name="redoc",
     ),
 
-    # ── Auth + Registration API ───────────────────────────────
-    path("api/auth/", include("interview_system.urls", namespace="interview_system")),
-
-    # ── Protected user endpoint ───────────────────────────────
-    path("api/users/me/", MeView.as_view(), name="me"),
+    # ── App API (currently empty — Phase 3 adds Clerk endpoints) ──
+    path("api/", include("interview_system.urls", namespace="interview_system")),
 ]
 
-
+# Serve media files in development (Django ignores this when DEBUG=False)
+if settings.DEBUG:
+    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
