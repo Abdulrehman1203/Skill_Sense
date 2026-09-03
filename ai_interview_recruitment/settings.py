@@ -11,7 +11,6 @@ https://docs.djangoproject.com/en/6.0/ref/settings/
 """
 
 import os
-from datetime import timedelta
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -34,7 +33,7 @@ SECRET_KEY = os.getenv(
 # SECURITY WARNING: don't run with debug turned on in production!
 DEBUG = os.getenv("DJANGO_DEBUG", "True").lower() in ("true", "1", "yes")
 
-ALLOWED_HOSTS = ['localhost', '127.0.0.1']
+ALLOWED_HOSTS = ['localhost', '127.0.0.1', '.ngrok-free.app']
 
 
 # Application definition
@@ -46,14 +45,14 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'django.contrib.postgres',
 
     # ── Third-party ──
     'rest_framework',
-    'rest_framework_simplejwt',
-    'rest_framework_simplejwt.token_blacklist',
     'corsheaders',
     'django_filters',
     'drf_spectacular',
+    'storages',
 
     # ── Local apps ──
     'interview_system.apps.InterviewSystemConfig',
@@ -106,23 +105,9 @@ DATABASES = {
 }
 
 
-# Password validation
-# https://docs.djangoproject.com/en/6.0/ref/settings/#auth-password-validators
-
-AUTH_PASSWORD_VALIDATORS = [
-    {
-        'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
-    },
-    {
-        'NAME': 'django.contrib.auth.password_validation.MinimumLengthValidator',
-    },
-    {
-        'NAME': 'django.contrib.auth.password_validation.CommonPasswordValidator',
-    },
-    {
-        'NAME': 'django.contrib.auth.password_validation.NumericPasswordValidator',
-    },
-]
+# Password validation — removed.
+# Clerk owns all identity; no local passwords. Phase 2 removes password field
+# from the User model. AUTH_PASSWORD_VALIDATORS is dead config now.
 
 
 # Internationalization
@@ -142,47 +127,114 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 
+# ── Media files (user uploads: resumes, logos, etc.) ─────────
+MEDIA_ROOT = BASE_DIR / "media"
+MEDIA_URL = "/media/"
+
+# ── S3 storage (non-dev only) ────────────────────────────────
+# When DEBUG is False and an S3 bucket is configured, switch file storage to S3.
+AWS_STORAGE_BUCKET_NAME = os.getenv("AWS_STORAGE_BUCKET_NAME", "")
+if not DEBUG and AWS_STORAGE_BUCKET_NAME:
+    AWS_S3_REGION_NAME = os.getenv("AWS_S3_REGION_NAME", "us-east-1")
+    AWS_ACCESS_KEY_ID = os.getenv("AWS_ACCESS_KEY_ID", "")
+    AWS_SECRET_ACCESS_KEY = os.getenv("AWS_SECRET_ACCESS_KEY", "")
+    AWS_S3_CUSTOM_DOMAIN = f"{AWS_STORAGE_BUCKET_NAME}.s3.amazonaws.com"
+    AWS_DEFAULT_ACL = "private"
+    AWS_S3_FILE_OVERWRITE = False
+    STORAGES = {
+        "default": {
+            "BACKEND": "storages.backends.s3boto3.S3Boto3Storage",
+        },
+        "staticfiles": {
+            "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
+        },
+    }
+    MEDIA_URL = f"https://{AWS_S3_CUSTOM_DOMAIN}/media/"
+
 # Default primary key field type
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
-# ── Custom user model ────────────────────────────────────────
-AUTH_USER_MODEL = 'interview_system.User'
+# Custom user model setting removed — identity is owned by Clerk.
+# interview_system.User is a plain models.Model, not a Django auth user model.
 
 
 # ══════════════════════════════════════════════════════════════
-#  JWT Authentication  (djangorestframework-simplejwt)
+#  Authentication — Clerk
 # ══════════════════════════════════════════════════════════════
 
-SIMPLE_JWT = {
-    "ACCESS_TOKEN_LIFETIME": timedelta(minutes=15),
-    "REFRESH_TOKEN_LIFETIME": timedelta(days=7),
-    "ROTATE_REFRESH_TOKENS": True,
-    "BLACKLIST_AFTER_ROTATION": True,
-    "UPDATE_LAST_LOGIN": True,
-    "AUTH_HEADER_TYPES": ("Bearer",),
-    "SIGNING_KEY": os.getenv("JWT_SIGNING_KEY", SECRET_KEY),
+CLERK_PUBLISHABLE_KEY = os.getenv("NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY", "")
+CLERK_SECRET_KEY = os.getenv("CLERK_SECRET_KEY", "")
+CLERK_JWKS_URL = os.getenv("CLERK_JWKS_URL", "https://stunning-slug-13.clerk.accounts.dev/.well-known/jwks.json")
+CLERK_WEBHOOK_SECRET = os.getenv("CLERK_WEBHOOK_SECRET", "")
+CLERK_AUTO_PROVISION_DEV = DEBUG
+
+
+
+# ── Redis Cache ──────────────────────────────────────────────
+
+REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/1")
+
+def _get_dev_cache_config():
+    redis_url = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/1")
+    if DEBUG and not os.getenv("REDIS_URL"):
+        try:
+            import socket
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.2)
+            s.connect(("127.0.0.1", 6379))
+            s.close()
+            return {
+                "BACKEND": "django.core.cache.backends.redis.RedisCache",
+                "LOCATION": redis_url,
+            }
+        except Exception:
+            return {
+                "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
+            }
+    return {
+        "BACKEND": "django.core.cache.backends.redis.RedisCache",
+        "LOCATION": redis_url,
+    }
+
+CACHES = {
+    "default": _get_dev_cache_config()
 }
 
 
-# ── Refresh-token cookie settings ────────────────────────────
 
-REFRESH_COOKIE_NAME = "refresh_token"
-REFRESH_COOKIE_MAX_AGE = 60 * 60 * 24 * 7  # 7 days, matches REFRESH_TOKEN_LIFETIME
+# ── Celery (async task queue) ────────────────────────────────
+CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", REDIS_URL)
+CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", REDIS_URL)
+CELERY_ACCEPT_CONTENT = ["json"]
+CELERY_TASK_SERIALIZER = "json"
+CELERY_RESULT_SERIALIZER = "json"
+CELERY_TASK_ALWAYS_EAGER = os.getenv("CELERY_TASK_ALWAYS_EAGER", "False").lower() in ("true", "1", "yes")
+CELERY_TASK_EAGER_PROPAGATES = os.getenv("CELERY_TASK_EAGER_PROPAGATES", "True").lower() in ("true", "1", "yes")
 
-# Only set these True in production over HTTPS.
-# In local development over plain http://localhost, keep COOKIE_SECURE = False
-# or the browser will silently refuse to store the cookie.
-REFRESH_COOKIE_SECURE = os.getenv("COOKIE_SECURE", "False").lower() in ("true", "1", "yes")
-REFRESH_COOKIE_SAMESITE = "Lax"  # use "None" only if frontend and backend are on different domains
+
+# ── Gemini AI ────────────────────────────────────────────────
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash-lite")
+
+# ── SBERT Matching ───────────────────────────────────────────
+SBERT_MODEL_NAME = os.getenv("SBERT_MODEL_NAME", "all-MiniLM-L6-v2")
 
 
 # ── CORS — credentialed cross-origin requests ────────────────
-# Never set CORS_ALLOW_ALL_ORIGINS = True once cookies are involved.
+# ── CORS — credentialed cross-origin requests ────────────────
+
+CORS_ALLOWED_ORIGIN_REGEXES = [
+    r"^http://localhost:\d+$",
+    r"^http://127\.0\.0\.1:\d+$",
+]
+
+if DEBUG:
+    CORS_ALLOW_ALL_ORIGINS = True
 
 CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000",   # Flutter web dev server (adjust port as needed)
-    "http://localhost:50893",  # Flutter web dev server (current port)
-    "http://localhost:50894",  # Flutter web dev server (alternate port)
+    "http://localhost:3000",
+    "http://localhost:50893",
+    "http://localhost:50894",
     "http://127.0.0.1:50893",
     "http://127.0.0.1:50894",
 ]
@@ -194,6 +246,7 @@ CSRF_TRUSTED_ORIGINS = [
     "http://localhost:50894",
     "http://127.0.0.1:50893",
     "http://127.0.0.1:50894",
+    "https://*.ngrok-free.app",     # ngrok tunnel for local webhook testing
 ]
 
 
@@ -201,7 +254,7 @@ CSRF_TRUSTED_ORIGINS = [
 
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": [
-        "rest_framework_simplejwt.authentication.JWTAuthentication",
+        "interview_system.authentication.ClerkJWTAuthentication",
     ],
     "DEFAULT_PERMISSION_CLASSES": [
         "rest_framework.permissions.IsAuthenticated",
@@ -240,9 +293,8 @@ SPECTACULAR_SETTINGS = {
         },
     },
     "TAGS": [
-        {"name": "Auth — Register", "description": "Create recruiter or candidate accounts"},
-        {"name": "Auth — Login", "description": "Login / Logout"},
-        {"name": "Auth — Token", "description": "Refresh access tokens"},
-        {"name": "Auth — User", "description": "Current user endpoints"},
+        {"name": "Auth — User", "description": "Current user profile & identity endpoints"},
+        {"name": "Webhooks — Clerk", "description": "Clerk user provisioning webhooks"},
+        {"name": "Jobs", "description": "Job posting CRUD and skill management"},
     ],
 }
