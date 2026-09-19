@@ -17,6 +17,7 @@ from .views import (
     MeView,
     RecruiterProfileView,
     ResumeDetailView,
+    ScoringRubricViewSet,
 )
 from .webhook_views import ClerkWebhookView
 
@@ -28,6 +29,7 @@ router = DefaultRouter()
 router.register(r"jobs", JobViewSet, basename="job")
 router.register(r"applications", ApplicationViewSet, basename="application")
 router.register(r"candidates/resumes", CandidateResumeViewSet, basename="candidate-resume")
+router.register(r"admin/rubrics", ScoringRubricViewSet, basename="admin-rubric")
 
 # ── Nested skill routes under a specific job ─────────────────
 
@@ -55,4 +57,3 @@ urlpatterns = [
     # Router-generated job CRUD
     path("", include(router.urls)),
 ]
-

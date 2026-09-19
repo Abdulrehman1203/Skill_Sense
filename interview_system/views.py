@@ -1,24 +1,28 @@
 from __future__ import annotations
 
 from typing import Any, Sequence
+from uuid import UUID
 
 import django_filters
-from django.db import models
+from django.db import IntegrityError, models, transaction
+from django.db.models.deletion import ProtectedError
+from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import OpenApiResponse, extend_schema, extend_schema_view
 from rest_framework import filters, generics, mixins, status
 from rest_framework.decorators import action
-from rest_framework.exceptions import NotFound, PermissionDenied
+from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
 from rest_framework.pagination import PageNumberPagination
+from rest_framework.parsers import FormParser, JSONParser, MultiPartParser
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.viewsets import GenericViewSet, ModelViewSet
 
-from .models import Application, CandidateProfile, Job, JobSkill, RecruiterProfile, Resume, User
-from .permissions import IsApplicationAccessible, IsCandidate, IsJobOwner, IsRecruiter, IsResumeAccessible
+from .models import Application, CandidateProfile, Job, JobSkill, RecruiterProfile, Resume, ScoringRubric, User
+from .permissions import IsAdmin, IsApplicationAccessible, IsCandidate, IsJobOwner, IsRecruiter, IsResumeAccessible
 from .serializers import (
     ApplicationAdvanceSerializer,
     ApplicationCreateSerializer,
@@ -31,6 +35,7 @@ from .serializers import (
     RecruiterProfileSerializer,
     ResumeDetailSerializer,
     ResumeListSerializer,
+    ScoringRubricSerializer,
     UserResponseSerializer,
 )
 
@@ -40,6 +45,29 @@ class StandardResultsPagination(PageNumberPagination):
     page_size = 20
     page_size_query_param = "page_size"
     max_page_size = 100
+
+
+class ScoringRubricViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, GenericViewSet):
+    """Admin-only rubric listing, creation, and serialized activation."""
+
+    queryset = ScoringRubric.objects.all().order_by("created_at", "pk")
+    serializer_class = ScoringRubricSerializer
+    permission_classes = [IsAuthenticated, IsAdmin]
+
+    @action(detail=True, methods=["post"])
+    def activate(self, request: Request, pk: str | None = None) -> Response:
+        with transaction.atomic():
+            # Lock every existing rubric in a stable order. Concurrent
+            # activations therefore serialize; the partial unique constraint
+            # is a database backstop for writes outside this endpoint.
+            locked = list(ScoringRubric.objects.order_by("pk").select_for_update())
+            target = next((rubric for rubric in locked if str(rubric.pk) == pk), None)
+            if target is None:
+                raise NotFound("Scoring rubric not found.")
+            ScoringRubric.objects.filter(active=True).exclude(pk=target.pk).update(active=False)
+            ScoringRubric.objects.filter(pk=target.pk).update(active=True)
+            target.active = True
+        return Response(self.get_serializer(target).data, status=status.HTTP_200_OK)
 
 
 class JobFilter(django_filters.FilterSet):
@@ -368,16 +396,72 @@ class JobSkillViewSet(ModelViewSet):
     serializer_class = JobSkillSerializer
 
     def get_queryset(self):
-        return JobSkill.objects.filter(job_id=self.kwargs["job_pk"])
+        if self.action in ("list", "retrieve"):
+            user = self.request.user
+            visible_jobs = Job.objects.filter(status=Job.Status.ACTIVE)
+            if user and user.is_authenticated and user.role == User.Role.RECRUITER:
+                visible_jobs = Job.objects.filter(
+                    models.Q(status=Job.Status.ACTIVE) | models.Q(recruiter__user=user)
+                )
+        else:
+            visible_jobs = Job.objects.filter(recruiter__user=self.request.user)
+        job = get_object_or_404(visible_jobs, pk=self.kwargs["job_pk"])
+        return JobSkill.objects.filter(job=job)
 
     def get_permissions(self) -> list[Any]:
         if self.action in ("list", "retrieve"):
             return [AllowAny()]
-        return [IsAuthenticated(), IsRecruiter()]
+        return [IsAuthenticated(), IsRecruiter(), IsJobOwner()]
 
     def perform_create(self, serializer) -> None:
         """Attach the skill to the parent job from the URL."""
-        serializer.save(job_id=self.kwargs["job_pk"])
+        job = get_object_or_404(
+            Job.objects.filter(recruiter__user=self.request.user),
+            pk=self.kwargs["job_pk"],
+        )
+        with transaction.atomic():
+            job = Job.objects.select_for_update().get(pk=job.pk)
+            try:
+                with transaction.atomic():
+                    skill = serializer.save(job=job)
+            except IntegrityError as exc:
+                raise ValidationError({"skill_name": "This skill already exists for this job."}) from exc
+            required = list(job.skills_required)
+            if skill.is_required and skill.skill_name not in required:
+                required.append(skill.skill_name)
+            elif not skill.is_required and skill.skill_name in required:
+                required.remove(skill.skill_name)
+            if required != job.skills_required:
+                job.skills_required = required
+                job.save(update_fields=["skills_required"])
+
+    def perform_update(self, serializer) -> None:
+        with transaction.atomic():
+            job = Job.objects.select_for_update().get(pk=serializer.instance.job_id)
+            old_name = serializer.instance.skill_name
+            old_required = serializer.instance.is_required
+            try:
+                with transaction.atomic():
+                    skill = serializer.save()
+            except IntegrityError as exc:
+                raise ValidationError({"skill_name": "This skill already exists for this job."}) from exc
+            required = list(job.skills_required)
+            if old_required:
+                required = [name for name in required if name != old_name]
+            if skill.is_required and skill.skill_name not in required:
+                required.append(skill.skill_name)
+            if required != job.skills_required:
+                job.skills_required = required
+                job.save(update_fields=["skills_required"])
+
+    def perform_destroy(self, instance) -> None:
+        with transaction.atomic():
+            job = Job.objects.select_for_update().get(pk=instance.job_id)
+            name, was_required = instance.skill_name, instance.is_required
+            instance.delete()
+            if was_required and name in job.skills_required:
+                job.skills_required = [skill for skill in job.skills_required if skill != name]
+                job.save(update_fields=["skills_required"])
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -425,6 +509,7 @@ class ApplicationViewSet(
     """
 
     pagination_class = StandardResultsPagination
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     # ── Serializer dispatch ────────────────────────────────────
 
@@ -506,6 +591,11 @@ class ApplicationViewSet(
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
+            try:
+                UUID(job_id)
+            except (ValueError, TypeError):
+                return Response({"detail": "Invalid job ID."}, status=status.HTTP_400_BAD_REQUEST)
+
             # Validate the job exists and belongs to this recruiter
             recruiter_profile = getattr(user, "recruiter_profile", None)
             if recruiter_profile is None:
@@ -521,7 +611,7 @@ class ApplicationViewSet(
 
             if (
                 recruiter_profile is None
-                or job.recruiter_id != recruiter_profile.pk
+                or job.recruiter.pk != recruiter_profile.pk
             ):
                 raise PermissionDenied(
                     "You do not have permission to view applications for this job."
@@ -598,8 +688,8 @@ class ResumeDetailView(generics.RetrieveAPIView):
     via an Application to this resume.
 
     Response includes:
-      - status: PENDING / PARSED / FAILED
-      - skills, education, experience, certifications (null while PENDING)
+      - status: STORED / PENDING / PARSED / FAILED
+      - skills, education, experience, certifications (null until parsed)
       - match_score, matched_skills, missing_skills (null until computed)
     """
 
@@ -614,7 +704,7 @@ class ResumeDetailView(generics.RetrieveAPIView):
         description=(
             "Returns the parsed resume data (skills, education, experience, "
             "certifications) and match score. All parsed fields are null "
-            "while parsing is in progress (status=PENDING)."
+            "while a standalone upload is STORED or processing is PENDING."
         ),
         responses={
             200: ResumeDetailSerializer,
@@ -629,12 +719,14 @@ class ResumeDetailView(generics.RetrieveAPIView):
 
 class CandidateResumeViewSet(ModelViewSet):
     """
-    CRUD ViewSet for candidate-managed resumes.
+    CRUD ViewSet for candidate-managed, unsubmitted resumes.
     Strictly scoped to request.user.candidate_profile.
     """
 
+    queryset = Resume.objects.all()
     serializer_class = ResumeListSerializer
     permission_classes = [IsAuthenticated, IsCandidate]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
 
     def get_queryset(self):
         user = self.request.user
@@ -652,6 +744,19 @@ class CandidateResumeViewSet(ModelViewSet):
             candidate_profile = CandidateProfile.objects.filter(user=user).first()
         if candidate_profile is None:
             raise PermissionDenied("Candidate profile not found.")
-        serializer.save(candidate=candidate_profile)
+        serializer.save(candidate=candidate_profile, status=Resume.Status.STORED)
 
-
+    def destroy(self, request, *args, **kwargs):
+        resume = self.get_object()
+        if Application.objects.filter(resume=resume).exists():
+            return Response(
+                {"detail": "A submitted resume cannot be deleted."},
+                status=status.HTTP_409_CONFLICT,
+            )
+        try:
+            return super().destroy(request, *args, **kwargs)
+        except ProtectedError:
+            return Response(
+                {"detail": "A submitted resume cannot be deleted."},
+                status=status.HTTP_409_CONFLICT,
+            )

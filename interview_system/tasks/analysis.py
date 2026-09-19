@@ -1,7 +1,8 @@
 """
-Analysis & Candidate Scoring Celery tasks (Phases 6 & 8 stubs).
+Behavioral analysis Celery stub (Phase 8).
 
-Contains aggregate_behavioral and generate_candidate_score.
+The Phase 6 scoring task is implemented in scoring_tasks.py and re-exported
+here to preserve existing chain imports.
 Carries real retry policy (3x exponential backoff) and real DB persistence.
 """
 
@@ -69,57 +70,4 @@ def aggregate_behavioral(self, session_id: str) -> dict:
     return fake_behavioral
 
 
-@shared_task(**RETRY_POLICY)
-def generate_candidate_score(self, application_id: str) -> dict:
-    """
-    Phase 6: Compute aggregate candidate score for an application.
-
-    Contract:
-      Input: application_id (UUID string)
-      Output: dict with keys {final_score, breakdown, explanation}
-      DB persistence: Creates/updates CandidateScore row for application_id.
-    """
-    from ..models import Application, CandidateScore
-
-    logger.info("generate_candidate_score task executing for application_id=%s (attempt %s)", application_id, self.request.retries + 1)
-
-    try:
-        app = Application.objects.get(pk=application_id)
-    except Application.DoesNotExist:
-        logger.error("Application %s not found", application_id)
-        raise
-
-    fake_score_data = {
-        "final_score": 88.5,
-        "breakdown": {
-            "match_score": 85.0,
-            "interview_score": 90.0,
-            "behavioral_score": 92.0,
-        },
-        "explanation": "stub",
-    }
-
-    score_obj, _ = CandidateScore.objects.update_or_create(
-        application=app,
-        defaults={
-            "final_score": fake_score_data["final_score"],
-            "breakdown": fake_score_data["breakdown"],
-            "explanation": fake_score_data["explanation"],
-        },
-    )
-
-    logger.info("generate_candidate_score completed for application_id=%s, score=%s", application_id, score_obj.final_score)
-
-    # Trigger notification to candidate
-    candidate_user_id = str(app.candidate.user_id)
-    from .notifications import send_notification
-    send_notification.delay(
-        user_id=candidate_user_id,
-        event={
-            "type": "APPLICATION_SCORED",
-            "application_id": application_id,
-            "final_score": fake_score_data["final_score"],
-        },
-    )
-
-    return fake_score_data
+from .scoring_tasks import generate_candidate_score

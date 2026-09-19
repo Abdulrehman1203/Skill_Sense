@@ -14,7 +14,7 @@ Model Loading Strategy:
 
 Skill Matching Strategy:
 - Accepts ``job_skills: list[str] | None = None`` representing required skills.
-- Performs case-insensitive substring search of each skill string against ``resume_text``.
+- Performs case-insensitive, boundary-aware term matching against ``resume_text``.
 - Skills found in ``resume_text`` are assigned to ``matched_skills``; remaining skills
   are assigned to ``missing_skills``.
 """
@@ -24,12 +24,23 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 from typing import Any
+
+from .cache import get_cached_embedding, set_cached_embedding
 
 logger = logging.getLogger(__name__)
 
 # Named constant for model selection
 DEFAULT_MODEL_NAME = "all-MiniLM-L6-v2"
+
+SKILL_ALIASES = {
+    "javascript": ("js",),
+    "typescript": ("ts",),
+    "postgresql": ("postgres",),
+    "postgres": ("postgresql",),
+    "node.js": ("nodejs",),
+}
 
 # Module-level singleton state
 _model = None
@@ -88,6 +99,26 @@ def _compute_cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
     return max(0.0, min(1.0, float(similarity)))
 
 
+def _embedding_for(text: str) -> list[float]:
+    """Reuse each text's embedding independently; compute on a cache miss."""
+    cached = get_cached_embedding(text)
+    if cached is not None:
+        return cached
+    raw = _get_model().encode(text)
+    embedding = raw.tolist() if hasattr(raw, "tolist") else list(raw)
+    set_cached_embedding(text, embedding)
+    return embedding
+
+
+def _contains_skill(resume_text: str, skill: str) -> bool:
+    """Match complete skill terms, including a few common spelling variants."""
+    names = (skill, *SKILL_ALIASES.get(skill.casefold(), ()))
+    return any(
+        re.search(rf"(?<!\w){re.escape(name)}(?!\w)", resume_text, re.IGNORECASE)
+        for name in names
+    )
+
+
 def match(
     resume_text: str,
     job_text: str,
@@ -127,21 +158,8 @@ def match(
             "missing_skills": list(skills_input),
         }
 
-    # Lazy-load model on CPU
-    model = _get_model()
-
-    # Compute embeddings
-    raw_resume_emb = model.encode(resume_text)
-    resume_emb = (
-        raw_resume_emb.tolist()
-        if hasattr(raw_resume_emb, "tolist")
-        else list(raw_resume_emb)
-    )
-
-    raw_job_emb = model.encode(job_text)
-    job_emb = (
-        raw_job_emb.tolist() if hasattr(raw_job_emb, "tolist") else list(raw_job_emb)
-    )
+    resume_emb = _embedding_for(resume_text)
+    job_emb = _embedding_for(job_text)
 
     # Cosine similarity
     similarity = _compute_cosine_similarity(resume_emb, job_emb)
@@ -150,9 +168,8 @@ def match(
     matched_skills: list[str] = []
     missing_skills: list[str] = []
 
-    resume_lower = resume_text.lower()
     for skill in skills_input:
-        if skill.strip() and skill.strip().lower() in resume_lower:
+        if skill.strip() and _contains_skill(resume_text, skill.strip()):
             matched_skills.append(skill)
         else:
             missing_skills.append(skill)
