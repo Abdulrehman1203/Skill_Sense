@@ -21,12 +21,14 @@ from ..resumes.extraction import ExtractionError
 logger = logging.getLogger(__name__)
 
 
-def _mark_resume_failed(resume_id: str) -> None:
+def _mark_resume_failed(resume_id: str, reason: str) -> None:
     """Mark a Resume row as FAILED — invoked on permanent failures or exhausted retries."""
     from ..models import Resume
 
     try:
-        Resume.objects.filter(pk=resume_id).update(status=Resume.Status.FAILED)
+        Resume.objects.filter(pk=resume_id).update(
+            status=Resume.Status.FAILED, processing_error=reason[:500]
+        )
         logger.error("Resume marked as FAILED: resume_id=%s", resume_id)
     except Exception as exc:
         logger.error("Could not set Resume status=FAILED for %s: %s", resume_id, exc)
@@ -83,7 +85,7 @@ def parse_resume(self, resume_id: str) -> dict:
         raw_text = extract_text(resume.file)
     except ExtractionError as exc:
         logger.error("Text extraction failed permanently for resume %s: %s", resume_id, exc)
-        _mark_resume_failed(resume_id)
+        _mark_resume_failed(resume_id, f"Text extraction failed: {exc}")
         return {"error": str(exc), "status": "FAILED"}
 
     # 3. Parse via Gemini (wrapped behind cache check)
@@ -97,7 +99,7 @@ def parse_resume(self, resume_id: str) -> dict:
             set_cached_gemini_parse(raw_text, parsed_data)
         except GeminiParseError:
             if self.request.retries >= self.max_retries:
-                _mark_resume_failed(resume_id)
+                _mark_resume_failed(resume_id, "Gemini parsing failed after retries.")
             raise
 
     # 4. Persist ParsedResume row
@@ -113,7 +115,8 @@ def parse_resume(self, resume_id: str) -> dict:
     )
 
     resume.status = Resume.Status.PARSED
-    resume.save(update_fields=["status"])
+    resume.processing_error = ""
+    resume.save(update_fields=["status", "processing_error"])
 
     logger.info(
         "parse_resume completed for resume_id=%s, ParsedResume pk=%s",
@@ -168,13 +171,13 @@ def compute_match_score(self, resume_id: str) -> dict:
         )
     except ParsedResume.DoesNotExist:
         logger.error("ParsedResume for resume_id=%s not found", resume_id)
-        _mark_resume_failed(resume_id)
+        _mark_resume_failed(resume_id, "Parsed resume data is missing.")
         raise
 
     app = Application.objects.select_related("job").filter(resume_id=resume_id).first()
     if not app:
         logger.error("No Application found for resume_id=%s", resume_id)
-        _mark_resume_failed(resume_id)
+        _mark_resume_failed(resume_id, "No linked application found for matching.")
         return {"error": "No linked application found", "status": "FAILED"}
 
     job = app.job
@@ -184,11 +187,24 @@ def compute_match_score(self, resume_id: str) -> dict:
     # SBERT matching
     from ai.matching.sbert import match as sbert_match
 
-    match_result = sbert_match(
-        resume_text=parsed_resume.raw_text,
-        job_text=job_text,
-        job_skills=job_skills,
-    )
+    try:
+        match_result = sbert_match(
+            resume_text=parsed_resume.raw_text,
+            job_text=job_text,
+            job_skills=job_skills,
+        )
+    except Exception as exc:
+        transient = isinstance(exc, (OSError, TimeoutError, ConnectionError, RuntimeError))
+        if transient and self.request.retries < self.max_retries:
+            logger.warning("Matching failed for resume %s; retrying: %s", resume_id, exc)
+            raise self.retry(exc=exc, countdown=min(2 ** self.request.retries, 600))
+        reason = f"Matching failed: {type(exc).__name__}: {exc}"
+        _mark_resume_failed(resume_id, reason)
+        parsed_resume.match_score = None
+        parsed_resume.matched_skills = []
+        parsed_resume.missing_skills = []
+        parsed_resume.save(update_fields=["match_score", "matched_skills", "missing_skills"])
+        raise
 
     # Persist match results (score on 0-100 scale)
     parsed_resume.match_score = round(match_result["similarity"] * 100, 2)
@@ -204,7 +220,7 @@ def compute_match_score(self, resume_id: str) -> dict:
         parsed_resume.match_score,
     )
 
-    # Chain → Phase 6 stub
+    # Chain → Phase 6 scoring task (public signature and position unchanged)
     from .analysis import generate_candidate_score
 
     generate_candidate_score.delay(application_id=str(app.id))

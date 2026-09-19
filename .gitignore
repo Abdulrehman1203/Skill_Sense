@@ -57,3 +57,5 @@ secrets.json
 .coverage
 htmlcov/
 .pytest_cache/
+
+review/

@@ -6,14 +6,26 @@ and Job / JobSkill serializers for the job posting API.
 """
 
 from typing import TYPE_CHECKING, Any
+import re
+import math
 
 from django.utils import timezone
+from django.db import transaction
 from rest_framework import serializers
 
-from .models import Application, CandidateProfile, Job, JobSkill, RecruiterProfile, Resume, User
+from .models import Application, CandidateProfile, Job, JobSkill, RecruiterProfile, Resume, ScoringRubric, User
+from .resumes.validation import validate_resume_upload
 
 if TYPE_CHECKING:
     from .models import ParsedResume
+
+
+def validate_phone_format(value: str) -> str:
+    """Accept optional '+' followed by 7–15 digits, or an empty phone."""
+    phone = value.strip()
+    if phone and not re.fullmatch(r"\+?\d{7,15}", phone):
+        raise serializers.ValidationError("Use 7–15 digits, optionally prefixed with '+'.")
+    return phone
 
 
 class UserResponseSerializer(serializers.ModelSerializer):
@@ -44,6 +56,15 @@ class UserSummarySerializer(serializers.ModelSerializer):
         read_only_fields = list(fields)
 
 
+try:
+    from drf_spectacular.types import OpenApiTypes
+    from drf_spectacular.utils import extend_schema_field
+    _extend_image_field = extend_schema_field(OpenApiTypes.STR)
+except ImportError:
+    def _extend_image_field(cls): return cls
+
+
+@_extend_image_field
 class ImageOrURLField(serializers.Field):
     """
     Field that accepts either an uploaded image file or a URL string,
@@ -51,27 +72,23 @@ class ImageOrURLField(serializers.Field):
     """
 
     def to_representation(self, value: Any) -> str | None:
-        if not value:
+        if value.company_logo_url:
+            return value.company_logo_url
+        logo = value.company_logo
+        if not logo:
             return None
-        if hasattr(value, "url"):
-            try:
-                request = self.context.get("request")
-                if request is not None:
-                    return request.build_absolute_uri(value.url)
-                return value.url
-            except Exception:
-                return str(value)
-        return str(value)
+        request = self.context.get("request")
+        return request.build_absolute_uri(logo.url) if request else logo.url
 
     def to_internal_value(self, data: Any) -> Any:
         if data is None or data == "":
-            return None
+            return {"company_logo": None, "company_logo_url": ""}
         if hasattr(data, "read") or hasattr(data, "chunks"):
             file_field = serializers.ImageField()
-            return file_field.to_internal_value(data)
+            return {"company_logo": file_field.to_internal_value(data), "company_logo_url": ""}
         if isinstance(data, str):
             url_field = serializers.URLField()
-            return url_field.to_internal_value(data)
+            return {"company_logo": None, "company_logo_url": url_field.to_internal_value(data)}
         raise serializers.ValidationError("Expected an image file or a valid URL string.")
 
 
@@ -82,7 +99,7 @@ class RecruiterProfileSerializer(serializers.ModelSerializer):
     """
 
     user = UserSummarySerializer(read_only=True)
-    company_logo = ImageOrURLField(required=False, allow_null=True)
+    company_logo = ImageOrURLField(source="*", required=False, allow_null=True)
     company_size = serializers.ChoiceField(
         choices=[
             ("1-10", "1-10"),
@@ -112,6 +129,9 @@ class RecruiterProfileSerializer(serializers.ModelSerializer):
         if value is not None and not value.strip():
             raise serializers.ValidationError("Company name cannot be blank.")
         return value.strip() if value else ""
+
+    def validate_phone(self, value: str) -> str:
+        return validate_phone_format(value)
 
     def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
         if not self.partial:
@@ -165,6 +185,9 @@ class CandidateProfileSerializer(serializers.ModelSerializer):
         ]
         read_only_fields = ["user"]
 
+    def validate_phone(self, value: str) -> str:
+        return validate_phone_format(value)
+
 
 
 # ── Job Skill ────────────────────────────────────────────────
@@ -176,6 +199,36 @@ class JobSkillSerializer(serializers.ModelSerializer):
         model = JobSkill
         fields = ["id", "job", "skill_name", "is_required"]
         read_only_fields = ["id", "job"]
+
+    def validate_skill_name(self, value: str) -> str:
+        job_pk = self.context["view"].kwargs["job_pk"]
+        duplicates = JobSkill.objects.filter(job_id=job_pk, skill_name=value)
+        if self.instance is not None:
+            duplicates = duplicates.exclude(pk=self.instance.pk)
+        if duplicates.exists():
+            raise serializers.ValidationError("This skill already exists for this job.")
+        return value
+
+
+class ScoringRubricSerializer(serializers.ModelSerializer):
+    """Admin-facing rubric representation; activation has its own action."""
+
+    weight_match = serializers.FloatField(min_value=0.0, max_value=1.0)
+    weight_interview = serializers.FloatField(min_value=0.0, max_value=1.0)
+    weight_behavioral = serializers.FloatField(min_value=0.0, max_value=1.0)
+
+    class Meta:  # type: ignore
+        model = ScoringRubric
+        fields = ["id", "name", "weight_match", "weight_interview", "weight_behavioral", "active", "created_at"]
+        read_only_fields = ["id", "active", "created_at"]
+
+    def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
+        # 1e-6 accepts ordinary float representation error while rejecting
+        # materially unbalanced scoring configurations.
+        weights = (attrs["weight_match"], attrs["weight_interview"], attrs["weight_behavioral"])
+        if not math.isclose(math.fsum(weights), 1.0, rel_tol=0.0, abs_tol=1e-6):
+            raise serializers.ValidationError({"weights": "Weights must sum to 1.0 within 1e-6."})
+        return attrs
 
 
 # ── Job ──────────────────────────────────────────────────────
@@ -295,6 +348,7 @@ class JobCreateUpdateSerializer(serializers.ModelSerializer):
             )
         return attrs
 
+    @transaction.atomic
     def create(self, validated_data: dict[str, Any]) -> Job:
         validated_data["status"] = Job.Status.DRAFT
         skills = validated_data.get("skills_required", [])
@@ -302,6 +356,7 @@ class JobCreateUpdateSerializer(serializers.ModelSerializer):
         self._sync_job_skills(job, skills)
         return job
 
+    @transaction.atomic
     def update(self, instance: Job, validated_data: dict[str, Any]) -> Job:
         skills = validated_data.get("skills_required", None)
         job = super().update(instance, validated_data)
@@ -310,13 +365,19 @@ class JobCreateUpdateSerializer(serializers.ModelSerializer):
         return job
 
     def _sync_job_skills(self, job: Job, skills: list[str]) -> None:
-        JobSkill.objects.filter(job=job).delete()
         unique_skills = list(dict.fromkeys(skills))
-        job_skills = [
-            JobSkill(job=job, skill_name=skill, is_required=True)
-            for skill in unique_skills
-        ]
-        JobSkill.objects.bulk_create(job_skills)
+        existing = {row.skill_name: row for row in JobSkill.objects.select_for_update().filter(job=job)}
+        for name in unique_skills:
+            row = existing.get(name)
+            if row is None:
+                JobSkill.objects.create(job=job, skill_name=name, is_required=True)
+            elif not row.is_required:
+                row.is_required = True
+                row.save(update_fields=["is_required"])
+        JobSkill.objects.filter(job=job, is_required=True).exclude(skill_name__in=unique_skills).delete()
+        if job.skills_required != unique_skills:
+            job.skills_required = unique_skills
+            job.save(update_fields=["skills_required"])
 
     def to_representation(self, instance: Job) -> dict[str, Any]:
         return JobSerializer(instance, context=self.context).data
@@ -366,59 +427,7 @@ class ApplicationCreateSerializer(serializers.Serializer):
         return value
 
     def validate_resume_file(self, value: Any) -> Any:
-        """
-        Validate file extension, content type (magic-byte sniffing), and size.
-
-        Phase 5 hardening: sniff actual bytes rather than trusting the
-        client-sent MIME type or filename extension.
-        """
-        allowed_extensions = (".pdf", ".docx")
-        filename = value.name.lower()
-        if not filename.endswith(allowed_extensions):
-            raise serializers.ValidationError(
-                f"Unsupported file type. Allowed extensions: "
-                f"{', '.join(allowed_extensions)}."
-            )
-
-        # Hard 5 MB limit (server-side, not just client-side)
-        max_size = Resume.MAX_FILE_SIZE_MB * 1024 * 1024
-        if value.size > max_size:
-            raise serializers.ValidationError(
-                f"File size must not exceed {Resume.MAX_FILE_SIZE_MB}MB."
-            )
-
-        # ── Magic-byte content-type sniffing ──────────────────
-        try:
-            import magic
-
-            # Read first 2048 bytes for sniffing, then reset cursor
-            value.seek(0)
-            header = value.read(2048)
-            value.seek(0)
-
-            detected_mime = magic.from_buffer(header, mime=True)
-        except ImportError:
-            # python-magic not installed — skip sniffing in dev
-            detected_mime = None
-        except Exception:
-            detected_mime = None
-
-        if detected_mime is not None:
-            valid_mimes = {
-                "application/pdf",
-                "application/vnd.openxmlformats-officedocument"
-                ".wordprocessingml.document",
-                "application/zip",          # DOCX is a ZIP archive
-                "application/x-zip-compressed",
-                "application/octet-stream",  # some systems report DOCX this way
-            }
-            if detected_mime not in valid_mimes:
-                raise serializers.ValidationError(
-                    f"File content does not match a valid PDF or DOCX. "
-                    f"Detected type: {detected_mime}."
-                )
-
-        return value
+        return validate_resume_upload(value)
 
     def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
         """Check (candidate, job) uniqueness at the application layer."""
@@ -565,11 +574,12 @@ class ResumeDetailSerializer(serializers.Serializer):
     Read-only serializer for GET /api/resumes/{id}/.
 
     Returns parsed resume data from the linked ParsedResume row.
-    All parsed fields are null while status is PENDING.
+    All parsed fields are null while status is STORED or PENDING.
     """
 
     id = serializers.UUIDField(read_only=True)
     status = serializers.CharField(read_only=True)
+    processing_error = serializers.CharField(read_only=True)
     skills = serializers.SerializerMethodField()
     education = serializers.SerializerMethodField()
     experience = serializers.SerializerMethodField()
@@ -617,15 +627,22 @@ class ResumeDetailSerializer(serializers.Serializer):
 
 
 class ResumeListSerializer(serializers.ModelSerializer):
-    """Serializer for candidate-managed resume list/upload API."""
+    """Serializer for stored candidate resumes; applications queue processing separately."""
 
     filename = serializers.SerializerMethodField()
     file_url = serializers.SerializerMethodField()
 
     class Meta:  # type: ignore
         model = Resume
-        fields = ["id", "file", "filename", "file_url", "status", "uploaded_at"]
-        read_only_fields = ["id", "status", "uploaded_at"]
+        fields = ["id", "file", "filename", "file_url", "status", "processing_error", "uploaded_at"]
+        read_only_fields = ["id", "status", "processing_error", "uploaded_at"]
+
+    def validate_file(self, value: Any) -> Any:
+        if self.instance and Application.objects.filter(resume=self.instance).exists():
+            raise serializers.ValidationError(
+                "A resume submitted with an application cannot be replaced."
+            )
+        return validate_resume_upload(value)
 
     def get_filename(self, obj: Resume) -> str:
         if obj.file:
@@ -640,4 +657,3 @@ class ResumeListSerializer(serializers.ModelSerializer):
         if request:
             return request.build_absolute_uri(obj.file.url)
         return obj.file.url
-

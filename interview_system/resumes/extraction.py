@@ -37,10 +37,12 @@ class ExtractionError(Exception):
 
 def _detect_mime(file_bytes: bytes) -> str:
     """Sniff the actual MIME type from raw bytes using python-magic."""
-    import magic
+    try:
+        import magic
 
-    mime = magic.from_buffer(file_bytes, mime=True)
-    return mime
+        return magic.from_buffer(file_bytes, mime=True)
+    except Exception as exc:
+        raise ExtractionError(f"Could not identify resume file type: {exc}") from exc
 
 
 def _extract_pdf_text(file_bytes: bytes) -> str:
@@ -50,10 +52,10 @@ def _extract_pdf_text(file_bytes: bytes) -> str:
     If the result is near-empty (image-only / scanned PDF), fall back
     to OCR via pdf2image + pytesseract (FR-14).
     """
-    import pdfplumber
-
     text_parts: list[str] = []
     try:
+        import pdfplumber
+
         with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
             for page in pdf.pages:
                 page_text = page.extract_text() or ""
@@ -122,7 +124,21 @@ def _extract_docx_text(file_bytes: bytes) -> str:
     except Exception as exc:
         raise ExtractionError(f"Failed to parse DOCX: {exc}") from exc
 
-    paragraphs = [p.text for p in doc.paragraphs if p.text.strip()]
+    from docx.table import Table
+
+    def block_text(container):
+        for block in container.iter_inner_content():
+            if isinstance(block, Table):
+                for row in block.rows:
+                    for cell in row.cells:
+                        yield from block_text(cell)
+            elif block.text.strip():
+                yield block.text
+
+    paragraphs = list(block_text(doc))
+    for section in doc.sections:
+        paragraphs.extend(block_text(section.header))
+        paragraphs.extend(block_text(section.footer))
     full_text = "\n".join(paragraphs).strip()
 
     if not full_text:
@@ -153,21 +169,42 @@ def extract_text(resume_file: Union[IO[bytes], "File", Any]) -> str:
         If the file is corrupt, unsupported, or yields no text.
     """
     # Read all bytes — works for both Django storage files and plain IO
+    # FieldFile owns a storage handle; release it after the task reads it.
+    # Leave caller-owned BytesIO and other file objects open.
+    from django.db.models.fields.files import FieldFile
+
+    storage_file = isinstance(resume_file, FieldFile)
     try:
-        resume_file.seek(0)
+        if storage_file:
+            resume_file.open("rb")
+        else:
+            resume_file.seek(0)
         file_bytes = resume_file.read()
     except Exception as exc:
         raise ExtractionError(f"Could not read resume file: {exc}") from exc
+    finally:
+        if storage_file:
+            resume_file.close()
 
     if not file_bytes:
         raise ExtractionError("Resume file is empty (0 bytes).")
 
     # Detect real content type
-    mime = _detect_mime(file_bytes)
+    try:
+        mime = _detect_mime(file_bytes)
+    except ExtractionError:
+        raise
+    except Exception as exc:
+        raise ExtractionError(f"Could not identify resume file type: {exc}") from exc
     logger.info("Detected MIME type: %s", mime)
 
     if mime == "application/pdf":
-        return _extract_pdf_text(file_bytes)
+        try:
+            return _extract_pdf_text(file_bytes)
+        except ExtractionError:
+            raise
+        except Exception as exc:
+            raise ExtractionError(f"PDF extraction failed: {exc}") from exc
 
     # DOCX is a ZIP archive — python-magic reports it as a zip or
     # as the Office Open XML MIME type.
@@ -178,7 +215,12 @@ def extract_text(resume_file: Union[IO[bytes], "File", Any]) -> str:
         "application/octet-stream",
     }
     if mime in docx_mimes:
-        return _extract_docx_text(file_bytes)
+        try:
+            return _extract_docx_text(file_bytes)
+        except ExtractionError:
+            raise
+        except Exception as exc:
+            raise ExtractionError(f"DOCX extraction failed: {exc}") from exc
 
     raise ExtractionError(
         f"Unsupported file type: {mime}. Only PDF and DOCX are accepted."

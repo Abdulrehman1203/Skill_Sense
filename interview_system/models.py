@@ -111,6 +111,17 @@ class User(models.Model):
         return False
 
 
+class ClerkWebhookState(models.Model):
+    """Ordering cursor and deletion tombstone for one Clerk identity."""
+
+    clerk_id = models.CharField(max_length=255, primary_key=True)
+    last_event_at = models.DateTimeField()
+    is_deleted = models.BooleanField(default=False)
+
+    class Meta:
+        db_table = "clerk_webhook_states"
+
+
 # ═══════════════════════════════════════════════════════════════
 #  RecruiterProfile
 # ═══════════════════════════════════════════════════════════════
@@ -131,6 +142,7 @@ class RecruiterProfile(models.Model):
         blank=True,
         null=True,
     )
+    company_logo_url = models.URLField(blank=True, default="")
     industry = models.CharField(max_length=150, blank=True, default="")
     position = models.CharField(max_length=150, blank=True, default="")
     company_size = models.CharField(max_length=50, blank=True, default="")
@@ -292,6 +304,7 @@ class Resume(models.Model):
     """A resume file uploaded by a candidate."""
 
     class Status(models.TextChoices):
+        STORED = "STORED", "Stored"
         PENDING = "PENDING", "Pending"
         PARSED = "PARSED", "Parsed"
         FAILED = "FAILED", "Failed"
@@ -304,14 +317,15 @@ class Resume(models.Model):
     )
     file = models.FileField(
         upload_to=resume_upload_path,
-        validators=[FileExtensionValidator(allowed_extensions=["pdf", "doc", "docx"])],
+        validators=[FileExtensionValidator(allowed_extensions=["pdf", "docx"])],
     )
     status = models.CharField(
         max_length=10,
         choices=Status.choices,
         default=Status.PENDING,
-        help_text="Pipeline state: PENDING → PARSED or FAILED.",
+        help_text="STORED until submitted; application processing is PENDING → PARSED or FAILED.",
     )
+    processing_error = models.TextField(blank=True, default="")
     uploaded_at = models.DateTimeField(auto_now_add=True)
 
     MAX_FILE_SIZE_MB = 5
@@ -626,7 +640,7 @@ class ScoringRubric(models.Model):
     weight_match = models.FloatField(default=0)
     weight_interview = models.FloatField(default=0)
     weight_behavioral = models.FloatField(default=0)
-    active = models.BooleanField(default=True)
+    active = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -635,6 +649,13 @@ class ScoringRubric(models.Model):
         verbose_name_plural = "scoring rubrics"
         indexes = [
             models.Index(fields=["active"], name="idx_rubric_active"),
+        ]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["active"],
+                condition=models.Q(active=True),
+                name="uniq_active_scoring_rubric",
+            ),
         ]
 
     def __str__(self):
@@ -729,4 +750,3 @@ class AuditLogEntry(models.Model):
 
     def __str__(self):
         return f"AuditLog({self.action} on {self.target_type}:{self.target_id})"
-

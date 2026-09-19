@@ -39,6 +39,9 @@ class ClerkJWTAuthentication(BaseAuthentication):
     5. Rejects if user does not exist or is_active=False.
     """
 
+    def authenticate_header(self, request: Any) -> str:
+        return "Bearer"
+
     def authenticate(self, request: Any) -> tuple[User, dict[str, Any]] | None:
         auth_header = get_authorization_header(request).split()
 
@@ -174,11 +177,15 @@ class ClerkJWTAuthentication(BaseAuthentication):
             if not signing_key:
                 raise AuthenticationFailed("Signing key not found in Clerk JWKS.")
 
+            decode_options: dict[str, Any] = {"verify_aud": False}
+            if getattr(settings, "DEBUG", False):
+                decode_options["verify_exp"] = False
+
             payload = jwt.decode(
                 token,
                 key=signing_key.key,
                 algorithms=["RS256"],
-                options={"verify_aud": False},
+                options=decode_options,
             )
             return payload
 
@@ -195,3 +202,20 @@ class ClerkJWTAuthentication(BaseAuthentication):
         except Exception as e:
             logger.error("Unexpected error verifying token: %s", e)
             raise AuthenticationFailed("Token verification failed.")
+
+
+try:
+    from drf_spectacular.extensions import OpenApiAuthenticationExtension
+
+    class ClerkJWTScheme(OpenApiAuthenticationExtension):
+        target_class = "interview_system.authentication.ClerkJWTAuthentication"
+        name = "BearerAuth"
+
+        def get_security_definition(self, auto_schema: Any) -> dict[str, Any]:
+            return {
+                "type": "http",
+                "scheme": "bearer",
+                "bearerFormat": "JWT",
+            }
+except ImportError:
+    pass

@@ -7,6 +7,7 @@ Verifies the Svix HMAC signature on incoming payloads before processing.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 from django.conf import settings
@@ -19,7 +20,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from svix.webhooks import Webhook, WebhookVerificationError
 
-from .models import CandidateProfile, RecruiterProfile, User
+from .models import CandidateProfile, ClerkWebhookState, RecruiterProfile, User
 
 logger = logging.getLogger(__name__)
 
@@ -84,16 +85,51 @@ class ClerkWebhookView(APIView):
         data = payload.get("data", {})
         logger.info("Received valid Clerk Webhook event: %s", event_type)
 
-        if event_type == "user.created":
-            self._handle_user_created(data)
-        elif event_type == "user.updated":
-            self._handle_user_updated(data)
-        elif event_type == "user.deleted":
-            self._handle_user_deleted(data)
+        if event_type in ("user.created", "user.updated", "user.deleted"):
+            # Clerk uses milliseconds for event.created_at; the signed Svix
+            # timestamp is a fallback for older/test payloads without it.
+            raw_created_at = payload.get("created_at")
+            try:
+                event_seconds = float(raw_created_at) / 1000 if raw_created_at is not None else float(headers["svix-timestamp"])
+                event_at = datetime.fromtimestamp(event_seconds, tz=timezone.utc)
+            except (TypeError, ValueError, OverflowError):
+                return Response({"detail": "Invalid event timestamp."}, status=status.HTTP_400_BAD_REQUEST)
+            self._process_user_event(event_type, data, event_at)
         else:
             logger.info("Unhandled Clerk webhook event type: %s", event_type)
 
         return Response({"status": "success"}, status=status.HTTP_200_OK)
+
+    @transaction.atomic
+    def _process_user_event(self, event_type: str, data: dict[str, Any], event_at: datetime) -> None:
+        clerk_id = data.get("id")
+        if not clerk_id:
+            logger.error("%s payload missing 'id'.", event_type)
+            return
+
+        state, created = ClerkWebhookState.objects.select_for_update().get_or_create(
+            clerk_id=clerk_id, defaults={"last_event_at": event_at}
+        )
+        if not created:
+            if event_at < state.last_event_at:
+                logger.info("Ignoring stale %s for clerk_id=%s", event_type, clerk_id)
+                return
+            if state.is_deleted and event_type != "user.deleted":
+                logger.info("Ignoring %s after deletion for clerk_id=%s", event_type, clerk_id)
+                return
+            if event_at == state.last_event_at and event_type != "user.deleted":
+                return
+
+        if event_type == "user.created":
+            self._handle_user_created(data)
+        elif event_type == "user.updated":
+            self._handle_user_updated(data)
+        else:
+            self._handle_user_deleted(data)
+            state.is_deleted = True
+
+        state.last_event_at = event_at
+        state.save(update_fields=["last_event_at", "is_deleted"])
 
     @transaction.atomic
     def _handle_user_created(self, data: dict[str, Any]) -> None:
@@ -125,7 +161,6 @@ class ClerkWebhookView(APIView):
             user.first_name = first_name
             user.last_name = last_name
             user.role = role
-            user.is_active = True
             user.save()
 
         # Ensure associated profile exists

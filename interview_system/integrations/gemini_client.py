@@ -194,7 +194,7 @@ def _strip_markdown_fences(text: str) -> str:
 
 def parse_resume_text(text: str) -> dict[str, Any]:
     """
-    Send plain resume text to Gemini 2.5 Flash-Lite and return structured parsed data.
+    Send plain resume text to the configured Gemini model and return structured parsed data.
 
     Parameters
     ----------
@@ -228,27 +228,28 @@ def parse_resume_text(text: str) -> dict[str, Any]:
     # Guard against absurdly long input
     truncated_text = cleaned_input[:_MAX_TEXT_LENGTH]
 
-    # Resolve API Key lazily
+    # Resolve configuration lazily so tests and workers use the active settings.
     try:
         from django.conf import settings
 
         api_key = getattr(settings, "GEMINI_API_KEY", "")
+        model_name = getattr(settings, "GEMINI_MODEL_NAME", "gemini-2.5-flash-lite")
+        timeout_ms = getattr(settings, "GEMINI_REQUEST_TIMEOUT_MS", 30000)
     except Exception:
         import os
 
         api_key = os.getenv("GEMINI_API_KEY", "")
+        model_name = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash-lite")
+        timeout_ms = int(os.getenv("GEMINI_REQUEST_TIMEOUT_MS", "30000"))
 
     if not api_key:
         raise GeminiParseError("GEMINI_API_KEY is not configured.")
-
-    # Model choice: strictly gemini-2.5-flash-lite
-    model_name = "gemini-2.5-flash-lite"
 
     try:
         from google import genai
         from google.genai import types
 
-        client = genai.Client(api_key=api_key)
+        client = genai.Client(api_key=api_key, http_options=types.HttpOptions(timeout=timeout_ms))
         prompt = _PARSE_PROMPT.format(resume_text=truncated_text)
 
         config = types.GenerateContentConfig(
