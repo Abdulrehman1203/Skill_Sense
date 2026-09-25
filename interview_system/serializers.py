@@ -63,7 +63,7 @@ class UserSummarySerializer(serializers.ModelSerializer):
 
     class Meta:  # type: ignore
         model = User
-        fields = ["id", "email", "role", "created_at"]
+        fields = ["id", "email", "first_name", "last_name", "role", "created_at"]
         read_only_fields = list(fields)
 
 
