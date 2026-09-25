@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import logging
 
+from typing import Any, cast
+
 from celery import shared_task
 
 from ..integrations.gemini_client import GeminiParseError
@@ -32,6 +34,102 @@ def _mark_resume_failed(resume_id: str, reason: str) -> None:
         logger.error("Resume marked as FAILED: resume_id=%s", resume_id)
     except Exception as exc:
         logger.error("Could not set Resume status=FAILED for %s: %s", resume_id, exc)
+
+
+# ═══════════════════════════════════════════════════════════════
+#  compute_match_score
+# ═══════════════════════════════════════════════════════════════
+
+
+@shared_task(
+    bind=True,
+    max_retries=3,
+    retry_backoff=True,
+    retry_backoff_max=600,
+)
+def compute_match_score(self, resume_id: str) -> dict:
+    """
+    Compute job-relative match score and skills breakdown via SBERT.
+
+    Steps:
+      1. Load ParsedResume + linked Job
+      2. ai.matching.sbert.match(raw_text, job_text, job_skills)
+      3. Write match_score, matched_skills, missing_skills to ParsedResume
+      4. Chain → generate_candidate_score.delay(application_id)
+    """
+    from ..models import Application, ParsedResume
+
+    logger.info(
+        "compute_match_score executing for resume_id=%s (attempt %d)",
+        resume_id,
+        self.request.retries + 1,
+    )
+
+    try:
+        parsed_resume = ParsedResume.objects.select_related("resume").get(
+            resume_id=resume_id
+        )
+    except ParsedResume.DoesNotExist:
+        logger.error("ParsedResume for resume_id=%s not found", resume_id)
+        _mark_resume_failed(resume_id, "Parsed resume data is missing.")
+        raise
+
+    app = Application.objects.select_related("job").filter(resume_id=resume_id).first()
+    if not app:
+        logger.error("No Application found for resume_id=%s", resume_id)
+        _mark_resume_failed(resume_id, "No linked application found for matching.")
+        return {"error": "No linked application found", "status": "FAILED"}
+
+    job = app.job
+    job_text = f"{job.title}\n{job.description}\n{job.requirements}"
+    job_skills = list(job.skills_required) if job.skills_required else []
+
+    # SBERT matching
+    from ai.matching.sbert import match as sbert_match
+
+    try:
+        match_result = sbert_match(
+            resume_text=parsed_resume.raw_text,
+            job_text=job_text,
+            job_skills=job_skills,
+        )
+    except Exception as exc:
+        transient = isinstance(exc, (OSError, TimeoutError, ConnectionError, RuntimeError))
+        if transient and self.request.retries < self.max_retries:
+            logger.warning("Matching failed for resume %s; retrying: %s", resume_id, exc)
+            raise self.retry(exc=exc, countdown=min(2 ** self.request.retries, 600))
+        reason = f"Matching failed: {type(exc).__name__}: {exc}"
+        _mark_resume_failed(resume_id, reason)
+        parsed_resume.match_score = None
+        parsed_resume.matched_skills = []
+        parsed_resume.missing_skills = []
+        parsed_resume.save(update_fields=["match_score", "matched_skills", "missing_skills"])
+        raise
+
+    # Persist match results (score on 0-100 scale)
+    parsed_resume.match_score = round(match_result["similarity"] * 100, 2)
+    parsed_resume.matched_skills = match_result["matched_skills"]
+    parsed_resume.missing_skills = match_result["missing_skills"]
+    parsed_resume.save(
+        update_fields=["match_score", "matched_skills", "missing_skills"]
+    )
+
+    logger.info(
+        "compute_match_score completed for resume_id=%s, score=%.2f",
+        resume_id,
+        parsed_resume.match_score,
+    )
+
+    # Chain → Phase 6 scoring task
+    from .scoring_tasks import generate_candidate_score
+
+    cast(Any, generate_candidate_score).delay(application_id=str(app.id))
+
+    return {
+        "match_score": parsed_resume.match_score,
+        "matched_skills": match_result["matched_skills"],
+        "missing_skills": match_result["missing_skills"],
+    }
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -125,7 +223,9 @@ def parse_resume(self, resume_id: str) -> dict:
     )
 
     # 5. Chain → compute_match_score
-    compute_match_score.delay(resume_id=resume_id)
+    from ..models import Application
+    if Application.objects.filter(resume_id=resume_id).exists():
+        cast(Any, compute_match_score).delay(resume_id=resume_id)
 
     return {
         "skills": parsed_data["skills"],
@@ -135,98 +235,3 @@ def parse_resume(self, resume_id: str) -> dict:
         "raw_text": raw_text[:200],
     }
 
-
-# ═══════════════════════════════════════════════════════════════
-#  compute_match_score
-# ═══════════════════════════════════════════════════════════════
-
-
-@shared_task(
-    bind=True,
-    max_retries=3,
-    retry_backoff=True,
-    retry_backoff_max=600,
-)
-def compute_match_score(self, resume_id: str) -> dict:
-    """
-    Compute job-relative match score and skills breakdown via SBERT.
-
-    Steps:
-      1. Load ParsedResume + linked Job
-      2. ai.matching.sbert.match(raw_text, job_text, job_skills)
-      3. Write match_score, matched_skills, missing_skills to ParsedResume
-      4. Chain → generate_candidate_score.delay(application_id)
-    """
-    from ..models import Application, ParsedResume
-
-    logger.info(
-        "compute_match_score executing for resume_id=%s (attempt %d)",
-        resume_id,
-        self.request.retries + 1,
-    )
-
-    try:
-        parsed_resume = ParsedResume.objects.select_related("resume").get(
-            resume_id=resume_id
-        )
-    except ParsedResume.DoesNotExist:
-        logger.error("ParsedResume for resume_id=%s not found", resume_id)
-        _mark_resume_failed(resume_id, "Parsed resume data is missing.")
-        raise
-
-    app = Application.objects.select_related("job").filter(resume_id=resume_id).first()
-    if not app:
-        logger.error("No Application found for resume_id=%s", resume_id)
-        _mark_resume_failed(resume_id, "No linked application found for matching.")
-        return {"error": "No linked application found", "status": "FAILED"}
-
-    job = app.job
-    job_text = f"{job.title}\n{job.description}\n{job.requirements}"
-    job_skills = list(job.skills_required) if job.skills_required else []
-
-    # SBERT matching
-    from ai.matching.sbert import match as sbert_match
-
-    try:
-        match_result = sbert_match(
-            resume_text=parsed_resume.raw_text,
-            job_text=job_text,
-            job_skills=job_skills,
-        )
-    except Exception as exc:
-        transient = isinstance(exc, (OSError, TimeoutError, ConnectionError, RuntimeError))
-        if transient and self.request.retries < self.max_retries:
-            logger.warning("Matching failed for resume %s; retrying: %s", resume_id, exc)
-            raise self.retry(exc=exc, countdown=min(2 ** self.request.retries, 600))
-        reason = f"Matching failed: {type(exc).__name__}: {exc}"
-        _mark_resume_failed(resume_id, reason)
-        parsed_resume.match_score = None
-        parsed_resume.matched_skills = []
-        parsed_resume.missing_skills = []
-        parsed_resume.save(update_fields=["match_score", "matched_skills", "missing_skills"])
-        raise
-
-    # Persist match results (score on 0-100 scale)
-    parsed_resume.match_score = round(match_result["similarity"] * 100, 2)
-    parsed_resume.matched_skills = match_result["matched_skills"]
-    parsed_resume.missing_skills = match_result["missing_skills"]
-    parsed_resume.save(
-        update_fields=["match_score", "matched_skills", "missing_skills"]
-    )
-
-    logger.info(
-        "compute_match_score completed for resume_id=%s, score=%.2f",
-        resume_id,
-        parsed_resume.match_score,
-    )
-
-    # Chain → Phase 6 scoring task (public signature and position unchanged)
-    from .analysis import generate_candidate_score
-
-    generate_candidate_score.delay(application_id=str(app.id))
-
-    return {
-        "match_score": parsed_resume.match_score,
-        "matched_skills": match_result["matched_skills"],
-        "missing_skills": match_result["missing_skills"],
-    }

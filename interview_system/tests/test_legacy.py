@@ -1491,7 +1491,7 @@ class ApplicationAPITestCase(APITestCase):
 
     @patch("interview_system.signals.parse_resume")
     def test_full_lifecycle_advancement(self, mock_parse_resume) -> None:
-        """Advance through APPLIED → SCREENED → INTERVIEWED → DECISION."""
+        """Advance with scheduling as the sole SCREENED → INTERVIEWED trigger."""
         self._auth(self.candidate_user)
         create_resp = self.client.post(
             reverse("interview_system:application-list"),
@@ -1505,14 +1505,32 @@ class ApplicationAPITestCase(APITestCase):
         app_id = create_resp.data["id"]
         self._auth(self.recruiter_user)
 
-        for next_status in ["SCREENED", "INTERVIEWED", "DECISION"]:
-            response = self.client.patch(
-                reverse("interview_system:application-advance", args=[app_id]),
-                data={"status": next_status},
-                format="json",
-            )
-            self.assertEqual(response.status_code, status.HTTP_200_OK)
-            self.assertEqual(response.data["status"], next_status)
+        screened = self.client.patch(
+            reverse("interview_system:application-advance", args=[app_id]),
+            data={"status": "SCREENED"},
+            format="json",
+        )
+        self.assertEqual(screened.status_code, status.HTTP_200_OK)
+
+        scheduled = self.client.post(
+            reverse("interview_system:interview-list"),
+            data={
+                "application": app_id,
+                "scheduled_at": (
+                    datetime.now(timezone.utc) + timedelta(days=1)
+                ).isoformat(),
+            },
+            format="json",
+        )
+        self.assertEqual(scheduled.status_code, status.HTTP_201_CREATED)
+
+        decided = self.client.patch(
+            reverse("interview_system:application-advance", args=[app_id]),
+            data={"status": "DECISION"},
+            format="json",
+        )
+        self.assertEqual(decided.status_code, status.HTTP_200_OK)
+        self.assertEqual(decided.data["status"], "DECISION")
 
     # ────────────────────────────────────────────────────────────
     #  7. Error: job.status != ACTIVE
@@ -2033,15 +2051,29 @@ class TaskPipelineTestCase(TestCase):
         self.assertEqual(res_sched["status"], "SCHEDULED")
         interview_id = res_sched["interview_id"]
 
-        # Task 4: generate_questions
-        with patch("interview_system.tasks.interviewing.process_retell_transcript.delay"):
+        # Task 4: generate_questions (external Gemini call is always mocked)
+        generated_questions = [
+            {"text": "Behavioral question", "category": "BEHAVIORAL", "source": "GENERATED"},
+            {"text": "Technical question", "category": "TECHNICAL", "source": "GENERATED"},
+            {"text": "Situational question", "category": "SITUATIONAL", "source": "GENERATED"},
+        ]
+        with patch(
+            "interview_system.integrations.gemini_client.generate_questions_for",
+            return_value=generated_questions,
+        ):
             res_q = cast(Any, generate_questions).run(interview_id=interview_id)
         self.assertEqual(len(res_q), 3)
+        self.assertTrue(all(question["approved"] is False for question in res_q))
 
         # Task 5: process_retell_transcript
         with patch("interview_system.tasks.analysis.aggregate_behavioral.delay"):
-            res_trans = cast(Any, process_retell_transcript).run(payload={"interview_id": interview_id, "transcript": "Custom transcript"})
-        self.assertEqual(res_trans["transcript"], "Custom transcript")
+            from django.utils import timezone
+            Interview.objects.filter(pk=interview_id).update(retell_session_id="legacy_test_call")
+            res_trans = cast(Any, process_retell_transcript).run(payload={
+                "retell_session_id": "legacy_test_call", "transcript": "Custom transcript",
+                "ended_at": timezone.now().isoformat(),
+            })
+        self.assertEqual(InterviewSession.objects.get(pk=res_trans["session_id"]).transcript, "Custom transcript")
         session_id = res_trans["session_id"]
 
         # Task 6: aggregate_behavioral

@@ -20,6 +20,16 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+class _MissingCropBoxFilter(logging.Filter):
+    """pdfminer already uses MediaBox when an optional CropBox is absent."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        return record.getMessage() != "CropBox missing from /Page, defaulting to MediaBox"
+
+
+logging.getLogger("pdfminer.pdfpage").addFilter(_MissingCropBoxFilter())
+
 # Minimum character count to consider a PDF's text layer "real".
 # Below this threshold we assume the PDF is scanned / image-only and
 # fall back to OCR.

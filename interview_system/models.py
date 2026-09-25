@@ -518,6 +518,30 @@ class Question(models.Model):
         return f"Q({self.category}): {self.text[:50]}"
 
 
+class TemplateQuestion(models.Model):
+    """Generic fallback question used when job-specific generation fails."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    text = models.TextField()
+    category = models.CharField(max_length=15, choices=Question.Category.choices)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "template_questions"
+        verbose_name = "template question"
+        verbose_name_plural = "template questions"
+        ordering = ["category", "created_at", "pk"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["text", "category"],
+                name="uniq_template_question_text_category",
+            ),
+        ]
+
+    def __str__(self):
+        return f"Template Q({self.category}): {self.text[:50]}"
+
+
 # ═══════════════════════════════════════════════════════════════
 #  InterviewSession
 # ═══════════════════════════════════════════════════════════════
@@ -531,6 +555,10 @@ class InterviewSession(models.Model):
     )
     started_at = models.DateTimeField(null=True, blank=True)
     ended_at = models.DateTimeField(null=True, blank=True)
+    audio_ended_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text='Retell audio completion; ended_at is reserved for video disconnect.',
+    )
     transcript = models.TextField(blank=True)
 
     class Meta:

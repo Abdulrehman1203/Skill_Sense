@@ -20,6 +20,11 @@ load_dotenv()  # reads .env file at project root
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+# Retell voice interview integration. Secrets stay in the environment/.env;
+# application code accesses them only through integrations/retell_client.py.
+RETELL_API_KEY = os.getenv("RETELL_API_KEY", "")
+RETELL_AGENT_ID = os.getenv("RETELL_AGENT_ID", "")
+
 
 # Quick-start development settings - unsuitable for production
 # See https://docs.djangoproject.com/en/6.0/howto/deployment/checklist/
@@ -214,8 +219,10 @@ CELERY_TASK_EAGER_PROPAGATES = os.getenv("CELERY_TASK_EAGER_PROPAGATES", "True")
 
 # ── Gemini AI ────────────────────────────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash-lite")
+GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-3.5-flash-lite")
 GEMINI_REQUEST_TIMEOUT_MS = int(os.getenv("GEMINI_REQUEST_TIMEOUT_MS", "30000"))
+GEMINI_QUESTION_MODEL_NAME = os.getenv("GEMINI_QUESTION_MODEL_NAME", "gemini-2.5-flash")
+GEMINI_QUESTION_TIMEOUT_MS = int(os.getenv("GEMINI_QUESTION_TIMEOUT_MS", "7000"))
 
 # ── SBERT Matching ───────────────────────────────────────────
 SBERT_MODEL_NAME = os.getenv("SBERT_MODEL_NAME", "all-MiniLM-L6-v2")
@@ -278,6 +285,12 @@ SPECTACULAR_SETTINGS = {
     "VERSION": "1.0.0",
     "SERVE_INCLUDE_SCHEMA": False,   # hide the raw /api/schema/ from Swagger sidebar
     "COMPONENT_SPLIT_REQUEST": True, # separate request/response schemas
+    "ENUM_NAME_OVERRIDES": {
+        "JobStatusEnum": "interview_system.models.Job.Status",
+        "ResumeStatusEnum": "interview_system.models.Resume.Status",
+        "ApplicationStatusEnum": "interview_system.models.Application.Status",
+        "InterviewStatusEnum": "interview_system.models.Interview.Status",
+    },
     "SWAGGER_UI_SETTINGS": {
         "deepLinking": True,
         "displayOperationId": False,

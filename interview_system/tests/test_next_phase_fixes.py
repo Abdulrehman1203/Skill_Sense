@@ -149,4 +149,5 @@ class GeminiConfigurationTests(SimpleTestCase):
         })
         self.assertEqual(parse_resume_text("Resume text")["skills"], [])
         self.assertEqual(client_class.call_args.kwargs["http_options"].timeout, 12345)
+        self.assertEqual(client_class.call_args.kwargs["http_options"].retry_options.attempts, 1)
         self.assertEqual(client_class.return_value.models.generate_content.call_args.kwargs["model"], "chosen-model")

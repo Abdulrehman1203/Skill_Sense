@@ -59,10 +59,6 @@ def schedule_interview(self, application_id: str) -> dict:
 
     logger.info("schedule_interview completed for application_id=%s, interview_id=%s", application_id, interview.id)
 
-    # Trigger next stage in pipeline: question generation
-    from .interviewing import generate_questions
-    generate_questions.delay(interview_id=str(interview.id))
-
     return result
 
 
@@ -71,120 +67,82 @@ def generate_questions(self, interview_id: str) -> list[dict]:
     """
     Phase 7: Generate / select interview questions for an interview.
 
-    Contract:
-      Input: interview_id (UUID string)
-      Output: list of 3 question dicts {text, category, source}
-      DB persistence: Creates 3 Question rows in DB for interview_id.
+    The Gemini integration owns its three-attempt, sub-30-second retry budget.
+    This task treats template fallback as a successful result and only relies
+    on Celery retries for failures outside that external-call policy, such as
+    temporary database errors.
     """
+    from django.db import transaction
+
+    from ..integrations import gemini_client
     from ..models import Interview, Question
 
     logger.info("generate_questions task executing for interview_id=%s (attempt %s)", interview_id, self.request.retries + 1)
 
     try:
-        interview = Interview.objects.get(pk=interview_id)
+        interview = Interview.objects.select_related(
+            "application__job", "application__resume__parsed_data"
+        ).get(pk=interview_id)
     except Interview.DoesNotExist:
         logger.error("Interview %s not found", interview_id)
         raise
 
-    questions_data = [
+    application = interview.application
+    existing = list(interview.questions.values("id", "text", "category", "source", "approved"))
+    if existing:
+        return [{**item, "id": str(item["id"])} for item in existing]
+    parsed_resume = getattr(application.resume, "parsed_data", None)
+    try:
+        questions_data = gemini_client.generate_questions_for(
+            application.job, parsed_resume
+        )
+    except Exception as exc:
+        # Defensive boundary: Step 1 already handles Gemini failures internally,
+        # but the task must still never persist an empty interview if that
+        # integration unexpectedly raises.
+        logger.warning(
+            "Question integration failed for interview %s; using templates: %s",
+            interview_id,
+            exc,
+        )
+        questions_data = gemini_client.get_template_questions()
+
+    if not questions_data:
+        questions_data = gemini_client.get_template_questions()
+
+    question_rows = [
+        Question(
+            interview=interview,
+            text=item["text"],
+            category=item["category"],
+            source=item["source"],
+            approved=False,
+        )
+        for item in questions_data
+    ]
+    with transaction.atomic():
+        # Duplicate delivery must preserve recruiter edits, approvals and IDs.
+        Interview.objects.select_for_update().get(pk=interview.pk)
+        existing = list(interview.questions.values("id", "text", "category", "source", "approved"))
+        if existing:
+            return [{**item, "id": str(item["id"])} for item in existing]
+        created = Question.objects.bulk_create(question_rows)
+
+    created_questions = [
         {
-            "text": "Explain Django's ORM query evaluation and prefetch_related.",
-            "category": Question.Category.TECHNICAL,
-            "source": Question.Source.TEMPLATE,
-        },
-        {
-            "text": "Describe a situation where you resolved a team technical disagreement.",
-            "category": Question.Category.BEHAVIORAL,
-            "source": Question.Source.TEMPLATE,
-        },
-        {
-            "text": "How would you handle a sudden traffic spike causing high latency?",
-            "category": Question.Category.SITUATIONAL,
-            "source": Question.Source.TEMPLATE,
-        },
+            "id": str(question.pk),
+            "text": question.text,
+            "category": question.category,
+            "source": question.source,
+            "approved": question.approved,
+        }
+        for question in created
     ]
 
-    # Clean existing questions for stub idempotency
-    Question.objects.filter(interview=interview).delete()
-
-    created_questions = []
-    for q_data in questions_data:
-        q = Question.objects.create(
-            interview=interview,
-            text=q_data["text"],
-            category=q_data["category"],
-            source=q_data["source"],
-            approved=True,
-        )
-        created_questions.append({
-            "id": str(q.id),
-            "text": q.text,
-            "category": q.category,
-            "source": q.source,
-        })
-
     logger.info("generate_questions completed for interview_id=%s (%d questions created)", interview_id, len(created_questions))
-
-    # Trigger next stage in pipeline: retell transcript processing stub
-    from .interviewing import process_retell_transcript
-    process_retell_transcript.delay(payload={
-        "interview_id": interview_id,
-        "transcript": "Candidate answered all 3 technical and behavioral questions clearly with strong problem-solving examples.",
-    })
 
     return created_questions
 
 
-@shared_task(**RETRY_POLICY)
-def process_retell_transcript(self, payload: dict) -> dict:
-    """
-    Phase 9: Process Retell voice interview webhook transcript.
-
-    Contract:
-      Input: payload dict containing {interview_id / session_id, transcript}
-      Output: dict with keys {session_id, transcript}
-      DB persistence: Writes transcript verbatim to InterviewSession and sets Interview.status = DONE.
-    """
-    from ..models import Interview, InterviewSession
-
-    logger.info("process_retell_transcript executing for payload=%s (attempt %s)", payload, self.request.retries + 1)
-
-    interview_id = payload.get("interview_id")
-    session_id = payload.get("session_id")
-    transcript_text = payload.get("transcript", "Stub transcript text.")
-
-    if session_id:
-        try:
-            session = InterviewSession.objects.get(pk=session_id)
-            interview = session.interview
-        except InterviewSession.DoesNotExist:
-            logger.error("InterviewSession %s not found", session_id)
-            raise
-    elif interview_id:
-        try:
-            interview = Interview.objects.get(pk=interview_id)
-            session, _ = InterviewSession.objects.get_or_create(interview=interview)
-        except Interview.DoesNotExist:
-            logger.error("Interview %s not found", interview_id)
-            raise
-    else:
-        raise ValueError("Payload must contain either interview_id or session_id.")
-
-    session.transcript = transcript_text
-    session.save(update_fields=["transcript"])
-
-    interview.status = Interview.Status.DONE
-    interview.save(update_fields=["status", "updated_at"])
-
-    result = {
-        "session_id": str(session.id),
-        "transcript": session.transcript,
-    }
-
-    logger.info("process_retell_transcript completed for session_id=%s", session.id)
-
-    # Trigger next stage: behavioral analysis
-    from .analysis import aggregate_behavioral
-    aggregate_behavioral.delay(session_id=str(session.id))
-
-    return result
+# Preserve old imports and the registered Celery name for existing producers.
+from .interview_tasks import process_retell_transcript  # noqa: F401
