@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from typing import Any, Sequence
+import logging
+
+from typing import Any, Sequence, cast
 from uuid import UUID
 
 import django_filters
@@ -21,7 +23,9 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework.viewsets import GenericViewSet, ModelViewSet
 
-from .models import Application, CandidateProfile, Job, JobSkill, RecruiterProfile, Resume, ScoringRubric, User
+from .integrations import retell_client
+from .models import InterviewSession
+from .models import Application, CandidateProfile, Interview, Job, JobSkill, RecruiterProfile, Resume, ScoringRubric, User
 from .permissions import IsAdmin, IsApplicationAccessible, IsCandidate, IsJobOwner, IsRecruiter, IsResumeAccessible
 from .serializers import (
     ApplicationAdvanceSerializer,
@@ -29,6 +33,11 @@ from .serializers import (
     ApplicationDetailSerializer,
     ApplicationListSerializer,
     CandidateProfileSerializer,
+    StartVoiceSessionResponseSerializer,
+    InterviewCreateSerializer,
+    InterviewSerializer,
+    InterviewQuestionSerializer,
+    InterviewQuestionsPatchSerializer,
     JobCreateUpdateSerializer,
     JobSerializer,
     JobSkillSerializer,
@@ -41,10 +50,207 @@ from .serializers import (
 
 
 
+logger = logging.getLogger(__name__)
+
+
 class StandardResultsPagination(PageNumberPagination):
     page_size = 20
     page_size_query_param = "page_size"
     max_page_size = 100
+
+
+class InterviewViewSet(mixins.CreateModelMixin, GenericViewSet):
+    """Recruiter interview scheduling and owned-question review."""
+
+    permission_classes = [IsAuthenticated, IsRecruiter]
+    lookup_value_regex = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    serializer_class = InterviewCreateSerializer
+    queryset = Interview.objects.none()
+
+    def get_queryset(self):
+        # Match ApplicationViewSet.retrieve: inaccessible objects return 404.
+        return Interview.objects.filter(
+            application__job__recruiter__user=self.request.user
+        )
+
+    @extend_schema(
+        tags=["Interviews"],
+        summary="Start a live interview session",
+        request=None,
+        responses={
+            201: StartVoiceSessionResponseSerializer,
+            400: OpenApiResponse(description="Interview is not SCHEDULED, has no approved questions, or already has a session."),
+            403: OpenApiResponse(description="Recruiter does not own the linked job."),
+            404: OpenApiResponse(description="Interview does not exist."),
+        },
+    )
+    @action(detail=True, methods=["post"], url_path="start-voice-session")
+    def start_voice_session(self, request, pk=None):
+        with transaction.atomic():
+            # Use the same parent lock as question review/generation. A second
+            # start waits, then sees LIVE instead of creating another session.
+            # Deliberately do not use the owner-filtered get_queryset(): this
+            # action requires 403 for an existing interview owned by someone else.
+            interview = get_object_or_404(
+                Interview.objects.select_for_update(), pk=pk,
+            )
+            if interview.application.job.recruiter.user_id != request.user.pk:
+                raise PermissionDenied("You do not own this interview's linked job.")
+            if interview.status != Interview.Status.SCHEDULED:
+                raise ValidationError({
+                    "status": (
+                        "Interview must be SCHEDULED to start a voice session; "
+                        f"current status is '{interview.status}'."
+                    ),
+                })
+            approved_questions = list(
+                interview.questions.select_for_update().filter(approved=True)
+                .order_by("created_at", "pk")
+            )
+            # FR-22: unapproved questions never satisfy the gate or reach Retell.
+            if not approved_questions:
+                raise ValidationError({
+                    "questions": "At least one approved question is required to start the interview.",
+                })
+            if InterviewSession.objects.filter(interview=interview).exists():
+                raise ValidationError({"session": "This interview already has a session."})
+            session = InterviewSession.objects.create(
+                interview=interview, started_at=timezone.now(),
+            )
+            interview.retell_session_id = None
+            try:
+                interview.retell_session_id = retell_client.create_session(
+                    interview, approved_questions,
+                )
+            except retell_client.RetellUnavailableError as exc:
+                # Expected external failure is caught INSIDE atomic: the local
+                # session and LIVE status must still commit for recruiter-led
+                # questions and Phase 8 analysis. DB/programming errors propagate.
+                # Step 1 guarantees sanitized exception messages; never log a
+                # request, response, credentials, or provider exception traceback.
+                logger.warning(
+                    "Retell session creation failed; proceeding without voice: "
+                    "interview_id=%s interview_session_id=%s reason=%s",
+                    interview.pk, session.pk, str(exc),
+                )
+            interview.status = Interview.Status.LIVE
+            interview.save(update_fields=["status", "retell_session_id", "updated_at"])
+            result = StartVoiceSessionResponseSerializer({
+                "interview_session_id": session.pk,
+                "retell_session_id": interview.retell_session_id,
+            }).data
+        return Response(result, status=status.HTTP_201_CREATED)
+
+    @extend_schema(
+        methods=["GET"], responses={200: InterviewQuestionSerializer(many=True)},
+    )
+    @extend_schema(
+        methods=["PATCH"], request=InterviewQuestionsPatchSerializer,
+        responses={200: InterviewQuestionSerializer(many=True)},
+    )
+    @action(detail=True, methods=["get", "patch"], url_path="questions")
+    def questions(self, request, pk=None):
+        if request.method == "GET":
+            interview = self.get_object()
+            return Response(InterviewQuestionSerializer(
+                interview.questions.order_by("created_at", "pk"), many=True,
+            ).data)
+
+        with transaction.atomic():
+            # Share this parent lock with generation, serializing changes to
+            # the question set without locking throughout a Gemini request.
+            interview = get_object_or_404(self.get_queryset().select_for_update(), pk=pk)
+            serializer = InterviewQuestionsPatchSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            items = serializer.validated_data["questions"]
+            rows = {q.pk: q for q in interview.questions.select_for_update().filter(
+                pk__in=[item["id"] for item in items]
+            )}
+            if len(rows) != len(items):
+                raise ValidationError({"questions": "Every question ID must belong to this interview."})
+            for item in items:
+                question = rows[item["id"]]
+                for field in ("text", "approved"):
+                    if field in item:
+                        setattr(question, field, item[field])
+            interview.questions.model.objects.bulk_update(list(rows.values()), ["text", "approved"])
+            result = InterviewQuestionSerializer(
+                interview.questions.order_by("created_at", "pk"), many=True,
+            ).data
+        return Response(result)
+
+    @extend_schema(
+        tags=["Interviews"],
+        summary="Schedule an interview",
+        request=InterviewCreateSerializer,
+        responses={201: InterviewSerializer},
+    )
+    def create(self, request: Request, *args: Any, **kwargs: Any) -> Response:
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        application_id = serializer.validated_data["application"]
+        scheduled_at = serializer.validated_data["scheduled_at"]
+
+        recruiter_profile = getattr(request.user, "recruiter_profile", None)
+        if recruiter_profile is None:
+            recruiter_profile = RecruiterProfile.objects.filter(user=request.user).first()
+
+        with transaction.atomic():
+            try:
+                application = (
+                    Application.objects.select_for_update()
+                    .select_related("job")
+                    .get(pk=application_id)
+                )
+            except Application.DoesNotExist:
+                raise ValidationError(
+                    {"application": "Application does not exist."}
+                )
+
+            if (
+                recruiter_profile is None
+                or application.job.recruiter_id != recruiter_profile.pk
+            ):
+                raise PermissionDenied(
+                    "You do not have permission to schedule an interview for this application."
+                )
+
+            if application.status != Application.Status.SCREENED:
+                raise ValidationError(
+                    {
+                        "application": (
+                            "Application must be in SCREENED status before scheduling "
+                            f"an interview; current status is '{application.status}'."
+                        )
+                    }
+                )
+
+            if scheduled_at <= timezone.now():
+                raise ValidationError(
+                    {"scheduled_at": "Interview must be scheduled for a future time."}
+                )
+
+            interview = Interview.objects.create(
+                application=application,
+                status=Interview.Status.SCHEDULED,
+                scheduled_at=scheduled_at,
+            )
+            application.status = Application.Status.INTERVIEWED
+            application.save(update_fields=["status", "updated_at"])
+
+            from .tasks.interviewing import generate_questions
+
+            _generate = cast(Any, generate_questions)
+            transaction.on_commit(
+                lambda interview_id=str(interview.pk): _generate.delay(interview_id)
+            )
+            # Snapshot before dispatch, including in eager development mode.
+            result = InterviewSerializer(interview, context={"request": request}).data
+
+        return Response(
+            result,
+            status=status.HTTP_201_CREATED,
+        )
 
 
 class ScoringRubricViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, GenericViewSet):
@@ -399,7 +605,7 @@ class JobSkillViewSet(ModelViewSet):
         if self.action in ("list", "retrieve"):
             user = self.request.user
             visible_jobs = Job.objects.filter(status=Job.Status.ACTIVE)
-            if user and user.is_authenticated and user.role == User.Role.RECRUITER:
+            if user and user.is_authenticated and getattr(user, "role", None) == User.Role.RECRUITER:
                 visible_jobs = Job.objects.filter(
                     models.Q(status=Job.Status.ACTIVE) | models.Q(recruiter__user=user)
                 )
@@ -498,8 +704,8 @@ class ApplicationViewSet(
     Application endpoints — no update/destroy via standard CRUD.
 
     Uses GenericViewSet + explicit mixins instead of ModelViewSet because
-    applications are immutable once created; the only mutation is the
-    explicit ``/advance/`` action for lifecycle transitions.
+    applications are immutable once created; lifecycle changes occur through
+    the explicit ``/advance/`` action and interview scheduling.
 
     Endpoints:
         POST   /api/applications/               — IsCandidate
@@ -625,9 +831,8 @@ class ApplicationViewSet(
         tags=["Applications"],
         summary="Advance application status",
         description=(
-            "Advances an application through the lifecycle: "
-            "APPLIED → SCREENED → INTERVIEWED → DECISION. "
-            "Forward-only, no skipping or reverting."
+            "Handles APPLIED → SCREENED and INTERVIEWED → DECISION. "
+            "SCREENED → INTERVIEWED occurs only through POST /api/interviews/."
         ),
         request=ApplicationAdvanceSerializer,
         responses={
@@ -664,8 +869,6 @@ class ApplicationViewSet(
 
         new_status = serializer.validated_data["status"]
 
-        # TODO: Phase 9 — advancing to INTERVIEWED will trigger Retell
-        # session creation. For now, just update the status.
         application.status = new_status
         application.save(update_fields=["status", "updated_at"])
 
@@ -737,6 +940,25 @@ class CandidateResumeViewSet(ModelViewSet):
             return Resume.objects.none()
         return Resume.objects.filter(candidate=candidate_profile).order_by("-uploaded_at")
 
+    @staticmethod
+    def _dispatch_parse(resume_id: str) -> None:
+        """Dispatch parsing and record a failure when dispatch cannot complete."""
+        import logging
+        from django.conf import settings
+        from .tasks.parsing import parse_resume
+        _parse = cast(Any, parse_resume)
+        try:
+            _parse.delay(resume_id=resume_id)
+        except Exception as exc:  # noqa: BLE001
+            mode = "inline task" if settings.CELERY_TASK_ALWAYS_EAGER else "broker dispatch"
+            logging.getLogger(__name__).exception(
+                "Resume parsing %s failed for resume_id=%s", mode, resume_id,
+            )
+            Resume.objects.filter(pk=resume_id, status=Resume.Status.PENDING).update(
+                status=Resume.Status.FAILED,
+                processing_error=f"{mode} failed: {type(exc).__name__}: {exc}"[:500],
+            )
+
     def perform_create(self, serializer):
         user = self.request.user
         candidate_profile = getattr(user, "candidate_profile", None)
@@ -744,7 +966,17 @@ class CandidateResumeViewSet(ModelViewSet):
             candidate_profile = CandidateProfile.objects.filter(user=user).first()
         if candidate_profile is None:
             raise PermissionDenied("Candidate profile not found.")
-        serializer.save(candidate=candidate_profile, status=Resume.Status.STORED)
+
+        with transaction.atomic():
+            resume = serializer.save(candidate=candidate_profile, status=Resume.Status.PENDING)
+            resume_id = str(resume.id)
+            transaction.on_commit(lambda: self._dispatch_parse(resume_id))
+
+    def perform_update(self, serializer):
+        with transaction.atomic():
+            resume = serializer.save(status=Resume.Status.PENDING)
+            resume_id = str(resume.id)
+            transaction.on_commit(lambda: self._dispatch_parse(resume_id))
 
     def destroy(self, request, *args, **kwargs):
         resume = self.get_object()

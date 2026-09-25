@@ -14,12 +14,14 @@ from .views import (
     CandidateResumeViewSet,
     JobSkillViewSet,
     JobViewSet,
+    InterviewViewSet,
     MeView,
     RecruiterProfileView,
     ResumeDetailView,
     ScoringRubricViewSet,
 )
 from .webhook_views import ClerkWebhookView
+from .retell_webhook import RetellCallEndedView
 
 app_name = "interview_system"
 
@@ -28,6 +30,7 @@ app_name = "interview_system"
 router = DefaultRouter()
 router.register(r"jobs", JobViewSet, basename="job")
 router.register(r"applications", ApplicationViewSet, basename="application")
+router.register(r"interviews", InterviewViewSet, basename="interview")
 router.register(r"candidates/resumes", CandidateResumeViewSet, basename="candidate-resume")
 router.register(r"admin/rubrics", ScoringRubricViewSet, basename="admin-rubric")
 
@@ -39,6 +42,7 @@ job_skill_detail = JobSkillViewSet.as_view(
 )
 
 urlpatterns = [
+    path("webhooks/retell/call-ended/", RetellCallEndedView.as_view(), name="retell-call-ended"),
     # Manual endpoints
     path("auth/clerk/webhook/", ClerkWebhookView.as_view(), name="clerk-webhook"),
     path("users/me/", MeView.as_view(), name="me"),

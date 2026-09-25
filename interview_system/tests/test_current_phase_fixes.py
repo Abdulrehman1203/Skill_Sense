@@ -139,42 +139,63 @@ class CurrentPhaseRegressionTests(APITestCase):
                 self.assertEqual(response.status_code, 400)
         self.assertEqual(Resume.objects.count(), 0)
 
-    def test_standalone_upload_is_stored_without_scheduling_processing(self):
+    def test_standalone_upload_triggers_processing(self):
         self.client.force_authenticate(self.candidate)
-        with self.captureOnCommitCallbacks(execute=True) as callbacks, patch(
-            "interview_system.signals.parse_resume.delay"
+        with patch(
+            "interview_system.views.CandidateResumeViewSet._dispatch_parse"
         ) as parse_task:
-            response = self.client.post(
-                "/api/candidates/resumes/",
-                {"file": SimpleUploadedFile("stored.pdf", valid_pdf_bytes())},
-                format="multipart",
-            )
+            with self.captureOnCommitCallbacks(execute=True) as callbacks:
+                response = self.client.post(
+                    "/api/candidates/resumes/",
+                    {"file": SimpleUploadedFile("stored.pdf", valid_pdf_bytes())},
+                    format="multipart",
+                )
         self.assertEqual(response.status_code, 201)
-        self.assertEqual(response.data["status"], Resume.Status.STORED)
-        self.assertEqual(callbacks, [])
-        parse_task.assert_not_called()
+        self.assertEqual(response.data["status"], Resume.Status.PENDING)
+        self.assertTrue(len(callbacks) > 0)
+        parse_task.assert_called_once_with(str(response.data["id"]))
+
+    @override_settings(CELERY_TASK_ALWAYS_EAGER=False)
+    def test_failed_dispatch_does_not_leave_resume_pending(self):
+        resume = Resume.objects.create(
+            candidate=self.candidate_profile,
+            file=SimpleUploadedFile("stored.pdf", valid_pdf_bytes()),
+            status=Resume.Status.PENDING,
+        )
+        with patch("interview_system.tasks.parsing.parse_resume.delay", side_effect=ConnectionError("broker offline")):
+            self.client.force_authenticate(self.candidate)
+            with self.assertLogs("interview_system.views", level="ERROR") as logs:
+                from interview_system.views import CandidateResumeViewSet
+
+                CandidateResumeViewSet._dispatch_parse(str(resume.pk))
+        resume.refresh_from_db()
+        self.assertEqual(resume.status, Resume.Status.FAILED)
+        self.assertIn("broker offline", resume.processing_error)
+        self.assertIn("broker dispatch failed", logs.output[0])
 
     def test_unsubmitted_resume_can_be_replaced_with_valid_docx(self):
         from docx import Document
 
         self.client.force_authenticate(self.candidate)
-        created = self.client.post(
-            "/api/candidates/resumes/",
-            {"file": SimpleUploadedFile("original.pdf", valid_pdf_bytes())},
-            format="multipart",
-        )
+        with patch("interview_system.views.CandidateResumeViewSet._dispatch_parse"):
+            created = self.client.post(
+                "/api/candidates/resumes/",
+                {"file": SimpleUploadedFile("original.pdf", valid_pdf_bytes())},
+                format="multipart",
+            )
         self.assertEqual(created.status_code, 201)
         document = Document()
         document.add_paragraph("Python developer")
         stream = io.BytesIO()
         document.save(stream)
-        response = self.client.patch(
-            f"/api/candidates/resumes/{created.data['id']}/",
-            {"file": SimpleUploadedFile("replacement.docx", stream.getvalue())},
-            format="multipart",
-        )
+        with patch("interview_system.views.CandidateResumeViewSet._dispatch_parse"):
+            response = self.client.patch(
+                f"/api/candidates/resumes/{created.data['id']}/",
+                {"file": SimpleUploadedFile("replacement.docx", stream.getvalue())},
+                format="multipart",
+            )
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.data["status"], Resume.Status.STORED)
+        self.assertEqual(response.data["status"], Resume.Status.PENDING)
         resume = Resume.objects.get(pk=created.data["id"])
         self.assertTrue(resume.file.name.endswith(".docx"))
 

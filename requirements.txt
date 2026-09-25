@@ -1,4 +1,6 @@
 
+# Python Version Requirement: Python 3.12+ (Tested with 3.12.7)
+
 # ── Django Core ──────────────────────────────────────────────
 Django==6.0.6
 psycopg[binary]==3.3.4            # PostgreSQL adapter (v3, async-ready)
@@ -24,7 +26,7 @@ daphne==4.2.2                     # ASGI server (HTTP + WS)
 celery==5.6.3                     # Distributed task queue
 redis==8.0.1                      # Redis client (broker + cache)
 
-# ── Phase 5: Resume Intelligence ─────────────────────────────
+# ── Phase 5: Resume Intelligence & Matching ──────────────────
 pdfplumber==0.11.6                # PDF text extraction
 python-docx==1.1.2                # DOCX text extraction
 pytesseract==0.3.13               # OCR fallback for scanned PDFs
@@ -33,10 +35,13 @@ python-magic-bin==0.4.14          # File type sniffing (bundles libmagic for Win
 google-genai==1.14.0              # Google Gemini API SDK
 google-auth>=2.27.0               # Required sub-dependency for Google GenAI SDK
 sentence-transformers==4.1.0      # SBERT embeddings for matching
+torch>=2.0.0                      # PyTorch tensor framework (used by SBERT)
+numpy>=1.26.0                     # Numerical computations for embeddings
 django-storages==1.14.4           # S3 storage backend (non-dev)
 boto3==1.36.26                    # AWS SDK for S3
 
 # ── Dev / Typing ─────────────────────────────────────────────
 django-stubs==5.2.0               # Type stubs for Django ORM
+django-stubs-ext==6.0.6           # Type stub extensions for Django 5/6
 djangorestframework-stubs==3.16.0 # Type stubs for DRF
 drf-spectacular==0.28.0           # OpenAPI 3.0 schema + Swagger UI

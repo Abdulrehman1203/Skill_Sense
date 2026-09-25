@@ -28,10 +28,22 @@ def compute_sha256(text: str) -> str:
 
 
 def _get_redis_client():
-    """Lazily obtain a Redis client, returning None if Redis is unreachable."""
+    """Use the local Django cache in development, otherwise connect to Redis."""
     try:
         import redis as redis_lib
         from django.conf import settings
+
+        if settings.CACHES["default"]["BACKEND"].endswith("LocMemCache"):
+            from django.core.cache import cache
+
+            class LocalCacheClient:
+                def get(self, key):
+                    return cache.get(key)
+
+                def setex(self, key, ttl, value):
+                    cache.set(key, value, timeout=ttl)
+
+            return LocalCacheClient()
 
         redis_url = getattr(settings, "REDIS_URL", "redis://127.0.0.1:6379/1")
         client = redis_lib.from_url(redis_url)

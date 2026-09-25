@@ -1,0 +1,14 @@
+[
+  {"model":"interview_system.templatequestion","pk":"98b36e4c-14aa-5e43-a348-0f31dd0ff826","fields":{"text":"Tell me about a time you received difficult feedback. How did you respond?","category":"BEHAVIORAL","created_at":"2026-09-21T00:00:00Z"}},
+  {"model":"interview_system.templatequestion","pk":"273e9981-f479-5a3d-8da0-bf23c9f0edf1","fields":{"text":"Describe a time you collaborated with someone whose working style differed from yours.","category":"BEHAVIORAL","created_at":"2026-09-21T00:00:01Z"}},
+  {"model":"interview_system.templatequestion","pk":"df9d2034-706f-5ed2-b5de-5328b4b6554c","fields":{"text":"Tell me about a professional mistake and what you learned from it.","category":"BEHAVIORAL","created_at":"2026-09-21T00:00:02Z"}},
+  {"model":"interview_system.templatequestion","pk":"01968dce-446e-525f-b4dd-33308f9ec39d","fields":{"text":"Describe a time you had to prioritize several competing responsibilities.","category":"BEHAVIORAL","created_at":"2026-09-21T00:00:03Z"}},
+  {"model":"interview_system.templatequestion","pk":"60ea1b0c-d3df-54ce-a91e-f472d1d79244","fields":{"text":"Walk me through how you diagnose an unfamiliar technical problem.","category":"TECHNICAL","created_at":"2026-09-21T00:00:04Z"}},
+  {"model":"interview_system.templatequestion","pk":"87f581fa-6086-5b86-87d4-f13c86cbce81","fields":{"text":"How do you verify that a solution is correct, reliable, and maintainable?","category":"TECHNICAL","created_at":"2026-09-21T00:00:05Z"}},
+  {"model":"interview_system.templatequestion","pk":"f5ad33f9-de6a-5a35-84a5-42f1c1e10903","fields":{"text":"Describe a technical trade-off you made and how you evaluated the alternatives.","category":"TECHNICAL","created_at":"2026-09-21T00:00:06Z"}},
+  {"model":"interview_system.templatequestion","pk":"ac1e5373-4ccc-5aa3-922a-b71a3921e150","fields":{"text":"How do you approach learning a tool or technology that is new to you?","category":"TECHNICAL","created_at":"2026-09-21T00:00:07Z"}},
+  {"model":"interview_system.templatequestion","pk":"b1bd22c8-8f79-5c7a-88a0-2eb8245c5aa4","fields":{"text":"What would you do if a critical deadline were at risk?","category":"SITUATIONAL","created_at":"2026-09-21T00:00:08Z"}},
+  {"model":"interview_system.templatequestion","pk":"25eaee55-7d83-55c1-b33d-e584e295b9c6","fields":{"text":"How would you respond if requirements changed late in a project?","category":"SITUATIONAL","created_at":"2026-09-21T00:00:09Z"}},
+  {"model":"interview_system.templatequestion","pk":"8ed2de46-ca83-5d70-a09e-3308a55f1de5","fields":{"text":"What would you do if you strongly disagreed with a teammate's proposed approach?","category":"SITUATIONAL","created_at":"2026-09-21T00:00:10Z"}},
+  {"model":"interview_system.templatequestion","pk":"e56f1ab7-f2f0-5eb1-a16a-06aea3ef1586","fields":{"text":"How would you proceed if you lacked important information needed for a decision?","category":"SITUATIONAL","created_at":"2026-09-21T00:00:11Z"}}
+]

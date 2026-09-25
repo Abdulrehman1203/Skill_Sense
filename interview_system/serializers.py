@@ -13,7 +13,18 @@ from django.utils import timezone
 from django.db import transaction
 from rest_framework import serializers
 
-from .models import Application, CandidateProfile, Job, JobSkill, RecruiterProfile, Resume, ScoringRubric, User
+from .models import (
+    Application,
+    CandidateProfile,
+    Interview,
+    Job,
+    JobSkill,
+    Question,
+    RecruiterProfile,
+    Resume,
+    ScoringRubric,
+    User,
+)
 from .resumes.validation import validate_resume_upload
 
 if TYPE_CHECKING:
@@ -201,12 +212,25 @@ class JobSkillSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "job"]
 
     def validate_skill_name(self, value: str) -> str:
-        job_pk = self.context["view"].kwargs["job_pk"]
-        duplicates = JobSkill.objects.filter(job_id=job_pk, skill_name=value)
-        if self.instance is not None:
-            duplicates = duplicates.exclude(pk=self.instance.pk)
-        if duplicates.exists():
-            raise serializers.ValidationError("This skill already exists for this job.")
+        job_pk = None
+        instance = self.instance
+        if isinstance(instance, JobSkill):
+            job_pk = instance.job_id
+        elif "job" in self.context:
+            job = self.context["job"]
+            job_pk = getattr(job, "pk", job)
+        elif "job_id" in self.context:
+            job_pk = self.context["job_id"]
+        elif "view" in self.context and hasattr(self.context["view"], "kwargs"):
+            view_kwargs = self.context["view"].kwargs
+            job_pk = view_kwargs.get("job_pk") or view_kwargs.get("pk")
+
+        if job_pk is not None:
+            duplicates = JobSkill.objects.filter(job_id=job_pk, skill_name__iexact=value.strip())
+            if isinstance(instance, JobSkill):
+                duplicates = duplicates.exclude(pk=instance.pk)
+            if duplicates.exists():
+                raise serializers.ValidationError("This skill already exists for this job.")
         return value
 
 
@@ -521,39 +545,39 @@ class ApplicationAdvanceSerializer(serializers.Serializer):
     """
     Input serializer for PATCH /api/applications/{id}/advance/.
 
-    Validates that the submitted status is the exact next value in the
-    forward-only lifecycle: APPLIED → SCREENED → INTERVIEWED → DECISION.
-    """
+    Validates the transitions owned by the generic advance endpoint.
 
-    # The lifecycle order — used to compute the "next valid status"
-    _LIFECYCLE = [
-        Application.Status.APPLIED,
-        Application.Status.SCREENED,
-        Application.Status.INTERVIEWED,
-        Application.Status.DECISION,
-    ]
+    Scheduling is the sole owner of SCREENED → INTERVIEWED, so that
+    transition is deliberately rejected here.
+    """
 
     status = serializers.ChoiceField(choices=Application.Status.choices)
 
     def validate_status(self, value: str) -> str:
         application: Application = self.context["application"]
-        current = str(application.status)
+        current = application.status
 
-        try:
-            current_idx = [str(x) for x in self._LIFECYCLE].index(current)
-        except ValueError:
+        if current == Application.Status.SCREENED:
+            raise serializers.ValidationError(
+                "SCREENED applications become INTERVIEWED only when an "
+                "interview is scheduled through POST /api/interviews/."
+            )
+
+        allowed = {
+            Application.Status.APPLIED: Application.Status.SCREENED,
+            Application.Status.INTERVIEWED: Application.Status.DECISION,
+        }
+        if current == Application.Status.DECISION:
+            raise serializers.ValidationError(
+                "Application is already in terminal status 'DECISION'. "
+                "No further advancement is possible."
+            )
+        if current not in allowed:
             raise serializers.ValidationError(
                 f"Application is in an unrecognized status: {current}."
             )
 
-        # Terminal state — no further advancement
-        if current_idx >= len(self._LIFECYCLE) - 1:
-            raise serializers.ValidationError(
-                f"Application is already in terminal status '{current}'. "
-                f"No further advancement is possible."
-            )
-
-        next_status = str(self._LIFECYCLE[current_idx + 1])
+        next_status = str(allowed[current])
 
         if value != next_status:
             raise serializers.ValidationError(
@@ -563,6 +587,80 @@ class ApplicationAdvanceSerializer(serializers.Serializer):
             )
 
         return value
+
+
+class StartVoiceSessionResponseSerializer(serializers.Serializer):
+    """A local session always starts, even when Retell is unavailable."""
+
+    interview_session_id = serializers.UUIDField(
+        read_only=True,
+        help_text="Local session ID used for the Phase 8 /analysis/{interview_session_id}/ WebSocket.",
+    )
+    retell_session_id = serializers.CharField(
+        read_only=True, allow_null=True,
+        help_text="Retell call ID; null when voice creation failed and the interview proceeds without Retell.",
+    )
+
+
+class InterviewCreateSerializer(serializers.Serializer):
+    """Input contract for recruiter interview scheduling."""
+
+    application = serializers.UUIDField()
+    scheduled_at = serializers.DateTimeField()
+
+
+class InterviewQuestionSerializer(serializers.ModelSerializer):
+    """Read-only question representation nested in an interview response."""
+
+    class Meta:  # type: ignore
+        model = Question
+        fields = ["id", "text", "category", "source", "approved"]
+        read_only_fields = list(fields)
+
+
+class QuestionPatchSerializer(serializers.Serializer):
+    id = serializers.UUIDField()
+    text = serializers.CharField(required=False, allow_blank=False)
+    approved = serializers.BooleanField(required=False)
+
+    def to_internal_value(self, data):
+        if isinstance(data, dict) and set(data) - {"id", "text", "approved"}:
+            raise serializers.ValidationError("Only id, text, and approved may be supplied.")
+        return super().to_internal_value(data)
+
+    def validate(self, attrs):
+        if not {"text", "approved"}.intersection(attrs):
+            raise serializers.ValidationError("Supply text or approved for each question.")
+        return attrs
+
+
+class InterviewQuestionsPatchSerializer(serializers.Serializer):
+    questions = QuestionPatchSerializer(many=True, allow_empty=False)
+
+    def validate_questions(self, items):
+        ids = [item["id"] for item in items]
+        if len(ids) != len(set(ids)):
+            raise serializers.ValidationError("Question IDs must be unique within the request.")
+        return items
+
+
+class InterviewSerializer(serializers.ModelSerializer):
+    """Read-only scheduled interview response."""
+
+    questions = InterviewQuestionSerializer(many=True, read_only=True)
+
+    class Meta:  # type: ignore
+        model = Interview
+        fields = [
+            "id",
+            "application",
+            "status",
+            "scheduled_at",
+            "questions",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = list(fields)
 
 
 # ═══════════════════════════════════════════════════════════════
