@@ -59,3 +59,4 @@ htmlcov/
 .pytest_cache/
 
 review/
+interview_system/tests/
