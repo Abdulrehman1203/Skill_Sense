@@ -11,10 +11,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 from django.conf import settings
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from drf_spectacular.utils import OpenApiResponse, extend_schema
 from rest_framework import status
 from rest_framework.permissions import AllowAny
+from rest_framework.exceptions import ValidationError
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -94,7 +95,13 @@ class ClerkWebhookView(APIView):
                 event_at = datetime.fromtimestamp(event_seconds, tz=timezone.utc)
             except (TypeError, ValueError, OverflowError):
                 return Response({"detail": "Invalid event timestamp."}, status=status.HTTP_400_BAD_REQUEST)
-            self._process_user_event(event_type, data, event_at)
+            try:
+                self._process_user_event(event_type, data, event_at)
+            except IntegrityError:
+                return Response(
+                    {"detail": "Account conflicts with an existing registration."},
+                    status=status.HTTP_409_CONFLICT,
+                )
         else:
             logger.info("Unhandled Clerk webhook event type: %s", event_type)
 
@@ -139,6 +146,7 @@ class ClerkWebhookView(APIView):
             return
 
         email = self._extract_primary_email(data)
+        self._validate_email(email, clerk_id)
         first_name = data.get("first_name") or ""
         last_name = data.get("last_name") or ""
 
@@ -160,7 +168,7 @@ class ClerkWebhookView(APIView):
             user.email = email
             user.first_name = first_name
             user.last_name = last_name
-            user.role = role
+            # Account type is fixed at provisioning, including replayed create events.
             user.save()
 
         # Ensure associated profile exists
@@ -191,10 +199,12 @@ class ClerkWebhookView(APIView):
             self._handle_user_created(data)
             return
 
-        user.email = self._extract_primary_email(data)
+        email = self._extract_primary_email(data)
+        self._validate_email(email, clerk_id)
+        user.email = email
         user.first_name = data.get("first_name") or ""
         user.last_name = data.get("last_name") or ""
-        user.role = self._extract_role(data, default_role=user.role)
+        # Never authorize a role change from user-editable Clerk metadata.
         user.save()
 
         # Ensure profile for role exists
@@ -220,16 +230,22 @@ class ClerkWebhookView(APIView):
         except User.DoesNotExist:
             logger.info("user.deleted received for non-existent clerk_id=%s.", clerk_id)
 
+    def _validate_email(self, email: str, clerk_id: str) -> None:
+        if not email:
+            raise ValidationError({"email": "A primary email is required."})
+        if User.objects.filter(email__iexact=email).exclude(clerk_id=clerk_id).exists():
+            raise ValidationError({"email": "This email is already registered. Use your existing account login."})
+
     def _extract_primary_email(self, data: dict[str, Any]) -> str:
         primary_email_id = data.get("primary_email_address_id")
         email_addresses = data.get("email_addresses", [])
 
         for item in email_addresses:
             if item.get("id") == primary_email_id:
-                return item.get("email_address", "")
+                return item.get("email_address", "").strip().lower()
 
         if email_addresses:
-            return email_addresses[0].get("email_address", "")
+            return email_addresses[0].get("email_address", "").strip().lower()
 
         return ""
 
@@ -247,7 +263,7 @@ class ClerkWebhookView(APIView):
         """
         unsafe_metadata = data.get("unsafe_metadata", {}) or {}
         public_metadata = data.get("public_metadata", {}) or {}
-        role_raw = unsafe_metadata.get("role") or public_metadata.get("role")
+        role_raw = public_metadata.get("role") or unsafe_metadata.get("role")
 
         if role_raw:
             role_str = str(role_raw).upper()

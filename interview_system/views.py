@@ -302,6 +302,15 @@ class JobFilter(django_filters.FilterSet):
         ]
 
 
+class LoginRoleView(APIView):
+    """Authenticate a prospective app session before frontend activation."""
+
+    permission_classes = [IsAuthenticated]
+
+    def get(self, request: Request) -> Response:
+        return Response(UserResponseSerializer(request.user).data)
+
+
 class MeView(APIView):
     """
     Return current authenticated user's details.

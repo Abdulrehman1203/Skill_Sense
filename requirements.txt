@@ -32,7 +32,7 @@ python-docx==1.1.2                # DOCX text extraction
 pytesseract==0.3.13               # OCR fallback for scanned PDFs
 pdf2image==1.17.0                 # PDF → image for OCR rasterization
 python-magic-bin==0.4.14          # File type sniffing (bundles libmagic for Windows)
-google-genai==1.14.0              # Google Gemini API SDK
+google-genai>=2.19.0              # Google Gemini API SDK
 google-auth>=2.27.0               # Required sub-dependency for Google GenAI SDK
 sentence-transformers==4.1.0      # SBERT embeddings for matching
 torch>=2.0.0                      # PyTorch tensor framework (used by SBERT)

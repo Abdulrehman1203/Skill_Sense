@@ -181,6 +181,8 @@ def parse_resume(self, resume_id: str) -> dict:
         from ..resumes.extraction import extract_text
 
         raw_text = extract_text(resume.file)
+        if raw_text:
+            raw_text = raw_text.replace('\x00', '')
     except ExtractionError as exc:
         logger.error("Text extraction failed permanently for resume %s: %s", resume_id, exc)
         _mark_resume_failed(resume_id, f"Text extraction failed: {exc}")

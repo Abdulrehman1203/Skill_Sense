@@ -15,6 +15,7 @@ from .views import (
     JobSkillViewSet,
     JobViewSet,
     InterviewViewSet,
+    LoginRoleView,
     MeView,
     RecruiterProfileView,
     ResumeDetailView,
@@ -45,6 +46,7 @@ urlpatterns = [
     path("webhooks/retell/call-ended/", RetellCallEndedView.as_view(), name="retell-call-ended"),
     # Manual endpoints
     path("auth/clerk/webhook/", ClerkWebhookView.as_view(), name="clerk-webhook"),
+    path("auth/login-role/", LoginRoleView.as_view(), name="login-role"),
     path("users/me/", MeView.as_view(), name="me"),
 
     # Profile endpoints

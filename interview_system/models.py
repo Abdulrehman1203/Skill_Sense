@@ -90,6 +90,12 @@ class User(models.Model):
 
     class Meta:
         db_table = "users"
+        constraints = [
+            models.UniqueConstraint(
+                models.functions.Lower(models.functions.Trim("email")),
+                name="users_email_normalized_unique",
+            ),
+        ]
         verbose_name = "user"
         verbose_name_plural = "users"
         ordering = ["-created_at"]

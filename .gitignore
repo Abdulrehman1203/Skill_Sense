@@ -60,3 +60,6 @@ htmlcov/
 
 review/
 interview_system/tests/
+
+# ── Temporary / AI scratch files ─────────────────────────────
+tmp_genai/
