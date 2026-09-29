@@ -59,3 +59,7 @@ htmlcov/
 .pytest_cache/
 
 review/
+interview_system/tests/
+
+# ── Temporary / AI scratch files ─────────────────────────────
+tmp_genai/

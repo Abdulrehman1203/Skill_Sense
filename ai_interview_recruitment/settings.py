@@ -171,7 +171,6 @@ CLERK_PUBLISHABLE_KEY = os.getenv("NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY", "")
 CLERK_SECRET_KEY = os.getenv("CLERK_SECRET_KEY", "")
 CLERK_JWKS_URL = os.getenv("CLERK_JWKS_URL", "https://stunning-slug-13.clerk.accounts.dev/.well-known/jwks.json")
 CLERK_WEBHOOK_SECRET = os.getenv("CLERK_WEBHOOK_SECRET", "")
-CLERK_AUTO_PROVISION_DEV = DEBUG
 
 
 
@@ -220,7 +219,8 @@ CELERY_TASK_EAGER_PROPAGATES = os.getenv("CELERY_TASK_EAGER_PROPAGATES", "True")
 # ── Gemini AI ────────────────────────────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-3.5-flash-lite")
-GEMINI_REQUEST_TIMEOUT_MS = int(os.getenv("GEMINI_REQUEST_TIMEOUT_MS", "30000"))
+GEMINI_REQUEST_TIMEOUT_MS = int(os.getenv("GEMINI_REQUEST_TIMEOUT_MS", "60000"))
+GEMINI_PARSE_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_PARSE_MAX_OUTPUT_TOKENS", "4096"))
 GEMINI_QUESTION_MODEL_NAME = os.getenv("GEMINI_QUESTION_MODEL_NAME", "gemini-2.5-flash")
 GEMINI_QUESTION_TIMEOUT_MS = int(os.getenv("GEMINI_QUESTION_TIMEOUT_MS", "7000"))
 

@@ -9,15 +9,17 @@ JSON Web Key Set (JWKS). Resolves the authenticated user via their `clerk_id`
 from __future__ import annotations
 
 import logging
+from urllib.parse import quote
 from typing import Any
 
 from django.conf import settings
 from django.core.cache import cache
+from django.db import IntegrityError
 import jwt
 from jwt.exceptions import ExpiredSignatureError, InvalidTokenError, PyJWKSetError
 import requests
 from rest_framework.authentication import BaseAuthentication, get_authorization_header
-from rest_framework.exceptions import AuthenticationFailed
+from rest_framework.exceptions import AuthenticationFailed, ValidationError
 
 from .models import User
 
@@ -36,7 +38,8 @@ class ClerkJWTAuthentication(BaseAuthentication):
        fetches fresh keys from CLERK_JWKS_URL and populates cache.
     3. Verifies the RS256 signature and expiration via PyJWT.
     4. Resolves local User by clerk_id (JWT 'sub' claim).
-    5. Rejects if user does not exist or is_active=False.
+    5. Resolves a missing local user from Clerk's server-side user record.
+    6. Rejects if user is_active=False.
     """
 
     def authenticate_header(self, request: Any) -> str:
@@ -71,40 +74,53 @@ class ClerkJWTAuthentication(BaseAuthentication):
         try:
             user = User.objects.get(clerk_id=clerk_id)
         except User.DoesNotExist:
-            if getattr(settings, "CLERK_AUTO_PROVISION_DEV", False):
-                logger.info("Auto-provisioning missing local user for clerk_id=%s (CLERK_AUTO_PROVISION_DEV=True)", clerk_id)
-                from .models import CandidateProfile, RecruiterProfile
-                
-                email = payload.get("email") or payload.get("primary_email") or f"{clerk_id}@example.com"
-                first_name = payload.get("first_name", "")
-                last_name = payload.get("last_name", "")
-                raw_role = payload.get("role") or payload.get("public_metadata", {}).get("role") or User.Role.CANDIDATE
-                role = str(raw_role).upper() if str(raw_role).upper() in (User.Role.RECRUITER, User.Role.CANDIDATE) else User.Role.CANDIDATE
-
-                user = User.objects.create(
-                    clerk_id=clerk_id,
-                    email=email,
-                    first_name=first_name,
-                    last_name=last_name,
-                    role=role,
-                    is_active=True,
-                )
-
-                if user.role == User.Role.RECRUITER:
-                    RecruiterProfile.objects.get_or_create(user=user)
-                else:
-                    CandidateProfile.objects.get_or_create(user=user)
-            else:
-                logger.warning("Authentication failed: User with clerk_id=%s not found locally.", clerk_id)
-                raise AuthenticationFailed("User account not found. Webhook provisioning required.")
-
-
+            user = self._provision_verified_user(clerk_id)
 
         if not user.is_active:
             logger.warning("Authentication failed: User with clerk_id=%s is deactivated.", clerk_id)
             raise AuthenticationFailed("User account has been deactivated.")
 
         return (user, payload)
+
+    def _provision_verified_user(self, clerk_id: str) -> User:
+        """Close the gap between Clerk sign-up completion and webhook delivery."""
+        secret = getattr(settings, "CLERK_SECRET_KEY", "")
+        if not secret:
+            raise AuthenticationFailed("Account setup is unavailable. Please contact support.")
+
+        try:
+            response = requests.get(
+                f"https://api.clerk.com/v1/users/{quote(clerk_id, safe='')}",
+                headers={"Authorization": f"Bearer {secret}"},
+                timeout=5,
+            )
+            response.raise_for_status()
+            clerk_user = response.json()
+        except (requests.RequestException, ValueError) as exc:
+            logger.warning("Could not load Clerk user %s for provisioning: %s", clerk_id, type(exc).__name__)
+            raise AuthenticationFailed("Account setup is still in progress. Please retry shortly.") from exc
+
+        if not isinstance(clerk_user, dict) or clerk_user.get("id") != clerk_id:
+            raise AuthenticationFailed("Clerk returned an invalid account record.")
+
+        # Reuse the webhook's email normalization, role whitelist, and profile creation.
+        from .webhook_views import ClerkWebhookView
+
+        try:
+            ClerkWebhookView()._handle_user_created(clerk_user)
+        except ValidationError as exc:
+            if "email" in exc.detail:
+                message = exc.detail["email"]
+                raise AuthenticationFailed(str(message)) from exc
+            raise AuthenticationFailed("Account setup failed. Please contact support.") from exc
+        except IntegrityError:
+            # A simultaneous webhook may have created the same identity.
+            pass
+
+        try:
+            return User.objects.get(clerk_id=clerk_id)
+        except User.DoesNotExist as exc:
+            raise AuthenticationFailed("This email is already registered to another account.") from exc
 
     def _get_jwks(self, force_refresh: bool = False) -> dict[str, Any] | None:
         """
