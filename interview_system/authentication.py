@@ -109,8 +109,12 @@ class ClerkJWTAuthentication(BaseAuthentication):
         try:
             ClerkWebhookView()._handle_user_created(clerk_user)
         except ValidationError as exc:
-            if "email" in exc.detail:
+            # exc.detail is typed as list | dict; narrow to dict before key access.
+            if isinstance(exc.detail, dict) and "email" in exc.detail:
                 message = exc.detail["email"]
+                # DRF wraps string errors in a list of ErrorDetail objects.
+                if isinstance(message, list) and message:
+                    message = message[0]
                 raise AuthenticationFailed(str(message)) from exc
             raise AuthenticationFailed("Account setup failed. Please contact support.") from exc
         except IntegrityError:
