@@ -50,6 +50,7 @@ class UserResponseSerializer(serializers.ModelSerializer):
             "email",
             "first_name",
             "last_name",
+            "profile_image_url",
             "role",
             "is_active",
             "created_at",
@@ -58,12 +59,20 @@ class UserResponseSerializer(serializers.ModelSerializer):
         read_only_fields = list(fields)
 
 
+class UserUpdateSerializer(serializers.ModelSerializer):
+    """Writable serializer for updating current user details."""
+
+    class Meta:  # type: ignore
+        model = User
+        fields = ["first_name", "last_name", "email", "profile_image_url"]
+
+
 class UserSummarySerializer(serializers.ModelSerializer):
     """Read-only summary of user identity details included in profile responses."""
 
     class Meta:  # type: ignore
         model = User
-        fields = ["id", "email", "first_name", "last_name", "role", "created_at"]
+        fields = ["id", "email", "first_name", "last_name", "profile_image_url", "role", "created_at"]
         read_only_fields = list(fields)
 
 
@@ -271,6 +280,9 @@ class JobSerializer(serializers.ModelSerializer):
         read_only=True,
     )
 
+    match_score = serializers.SerializerMethodField()
+    average_match_score = serializers.SerializerMethodField()
+
     class Meta:  # type: ignore
         model = Job
         fields = [
@@ -282,6 +294,7 @@ class JobSerializer(serializers.ModelSerializer):
             "requirements",
             "skills_required",
             "location",
+            "salary",
             "job_type",
             "experience_level",
             "status",
@@ -289,6 +302,8 @@ class JobSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
             "job_skills",
+            "match_score",
+            "average_match_score",
         ]
         read_only_fields = [
             "id",
@@ -296,6 +311,25 @@ class JobSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
+
+    def get_match_score(self, obj: Job) -> float | None:
+        request = self.context.get("request")
+        if not request or not request.user.is_authenticated:
+            return None
+        candidate = getattr(request.user, "candidate_profile", None)
+        if not candidate:
+            return None
+        app = obj.applications.filter(candidate=candidate).first()
+        if app and hasattr(app, "resume") and hasattr(app.resume, "parsed_data"):
+            return app.resume.parsed_data.match_score
+        return None
+
+    def get_average_match_score(self, obj: Job) -> float | None:
+        from django.db.models import Avg
+        avg = obj.applications.filter(
+            resume__parsed_data__match_score__isnull=False
+        ).aggregate(avg=Avg("resume__parsed_data__match_score"))["avg"]
+        return round(avg, 2) if avg is not None else None
 
     def validate_skills_required(
         self, value: list[str],
@@ -324,6 +358,7 @@ class JobCreateUpdateSerializer(serializers.ModelSerializer):
     description = serializers.CharField(required=True)
     requirements = serializers.CharField(required=False, allow_blank=True, default="")
     location = serializers.CharField(required=True)
+    salary = serializers.CharField(required=False, allow_blank=True, default="")
     job_type = serializers.ChoiceField(choices=Job.JobType.choices, required=True)
     experience_level = serializers.ChoiceField(
         choices=Job.ExperienceLevel.choices, required=True
@@ -343,6 +378,7 @@ class JobCreateUpdateSerializer(serializers.ModelSerializer):
             "requirements",
             "skills_required",
             "location",
+            "salary",
             "job_type",
             "experience_level",
             "deadline",
@@ -425,7 +461,8 @@ class ApplicationCreateSerializer(serializers.Serializer):
     """
 
     job = serializers.UUIDField()
-    resume_file = serializers.FileField()
+    resume_file = serializers.FileField(required=False)
+    resume_id = serializers.UUIDField(required=False)
     consent_given = serializers.BooleanField()
 
     def validate_job(self, value: Any) -> Job:
@@ -462,11 +499,33 @@ class ApplicationCreateSerializer(serializers.Serializer):
                 "Candidate profile not found for this user."
             )
 
-        job = attrs["job"]
-        if Application.objects.filter(candidate=candidate_profile, job=job).exists():
+        job = attrs.get("job")
+        if job and Application.objects.filter(candidate=candidate_profile, job=job).exists():
             raise serializers.ValidationError(
                 {"job": "You have already applied to this job."}
             )
+
+        resume_file = attrs.get("resume_file")
+        resume_id = attrs.get("resume_id")
+
+        if not resume_file and not resume_id:
+            raise serializers.ValidationError(
+                "Either a resume file or an existing resume ID must be provided."
+            )
+            
+        if resume_file and resume_id:
+            raise serializers.ValidationError(
+                "Provide either a resume file or a resume ID, not both."
+            )
+            
+        if resume_id:
+            try:
+                resume = Resume.objects.get(pk=resume_id, candidate=candidate_profile)
+                attrs["resume"] = resume
+            except Resume.DoesNotExist:
+                raise serializers.ValidationError(
+                    {"resume_id": "Resume not found or does not belong to you."}
+                )
 
         attrs["_candidate_profile"] = candidate_profile
         return attrs
@@ -476,13 +535,16 @@ class ApplicationCreateSerializer(serializers.Serializer):
 
         candidate_profile = validated_data["_candidate_profile"]
         job = validated_data["job"]
-        resume_file = validated_data["resume_file"]
+        resume_file = validated_data.get("resume_file")
+        resume = validated_data.get("resume")
 
         with transaction.atomic():
-            resume = Resume.objects.create(
-                candidate=candidate_profile,
-                file=resume_file,
-            )
+            if resume_file:
+                resume = Resume.objects.create(
+                    candidate=candidate_profile,
+                    file=resume_file,
+                    original_filename=getattr(resume_file, 'name', ''),
+                )
             application = Application.objects.create(
                 candidate=candidate_profile,
                 job=job,
@@ -735,6 +797,12 @@ class ResumeListSerializer(serializers.ModelSerializer):
         fields = ["id", "file", "filename", "file_url", "status", "processing_error", "uploaded_at"]
         read_only_fields = ["id", "status", "processing_error", "uploaded_at"]
 
+    def create(self, validated_data: dict[str, Any]) -> Resume:
+        file_obj = validated_data.get("file")
+        if file_obj:
+            validated_data["original_filename"] = getattr(file_obj, 'name', '')
+        return super().create(validated_data)
+
     def validate_file(self, value: Any) -> Any:
         if self.instance and Application.objects.filter(resume=self.instance).exists():
             raise serializers.ValidationError(
@@ -743,6 +811,8 @@ class ResumeListSerializer(serializers.ModelSerializer):
         return validate_resume_upload(value)
 
     def get_filename(self, obj: Resume) -> str:
+        if obj.original_filename:
+            return obj.original_filename
         if obj.file:
             import os
             return os.path.basename(obj.file.name)

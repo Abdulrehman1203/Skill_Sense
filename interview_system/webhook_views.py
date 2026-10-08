@@ -149,6 +149,11 @@ class ClerkWebhookView(APIView):
         self._validate_email(email, clerk_id)
         first_name = data.get("first_name") or ""
         last_name = data.get("last_name") or ""
+        image_url = data.get("image_url") or ""
+
+        unsafe_metadata = data.get("unsafe_metadata") or {}
+        public_metadata = data.get("public_metadata") or {}
+        company_name = unsafe_metadata.get("company_name") or public_metadata.get("company_name") or ""
 
         role = self._extract_role(data, default_role=User.Role.CANDIDATE)
 
@@ -158,6 +163,7 @@ class ClerkWebhookView(APIView):
                 "email": email,
                 "first_name": first_name,
                 "last_name": last_name,
+                "profile_image_url": image_url,
                 "role": role,
                 "is_active": True,
             },
@@ -168,12 +174,16 @@ class ClerkWebhookView(APIView):
             user.email = email
             user.first_name = first_name
             user.last_name = last_name
+            user.profile_image_url = image_url
             # Account type is fixed at provisioning, including replayed create events.
             user.save()
 
         # Ensure associated profile exists
         if user.role == User.Role.RECRUITER:
-            RecruiterProfile.objects.get_or_create(user=user)
+            profile, _ = RecruiterProfile.objects.get_or_create(user=user)
+            if company_name and not profile.company_name:
+                profile.company_name = company_name
+                profile.save()
         else:
             CandidateProfile.objects.get_or_create(user=user)
 
@@ -204,12 +214,20 @@ class ClerkWebhookView(APIView):
         user.email = email
         user.first_name = data.get("first_name") or ""
         user.last_name = data.get("last_name") or ""
+        user.profile_image_url = data.get("image_url") or user.profile_image_url
         # Never authorize a role change from user-editable Clerk metadata.
         user.save()
 
+        unsafe_metadata = data.get("unsafe_metadata") or {}
+        public_metadata = data.get("public_metadata") or {}
+        company_name = unsafe_metadata.get("company_name") or public_metadata.get("company_name") or ""
+
         # Ensure profile for role exists
         if user.role == User.Role.RECRUITER:
-            RecruiterProfile.objects.get_or_create(user=user)
+            profile, _ = RecruiterProfile.objects.get_or_create(user=user)
+            if company_name and not profile.company_name:
+                profile.company_name = company_name
+                profile.save()
         elif user.role == User.Role.CANDIDATE:
             CandidateProfile.objects.get_or_create(user=user)
 
