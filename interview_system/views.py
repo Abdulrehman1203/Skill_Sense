@@ -46,6 +46,7 @@ from .serializers import (
     ResumeListSerializer,
     ScoringRubricSerializer,
     UserResponseSerializer,
+    UserUpdateSerializer,
 )
 
 
@@ -59,19 +60,48 @@ class StandardResultsPagination(PageNumberPagination):
     max_page_size = 100
 
 
-class InterviewViewSet(mixins.CreateModelMixin, GenericViewSet):
-    """Recruiter interview scheduling and owned-question review."""
+@extend_schema_view(
+    list=extend_schema(tags=["Interviews"], summary="List interviews"),
+    retrieve=extend_schema(tags=["Interviews"], summary="Retrieve an interview"),
+)
+class InterviewViewSet(
+    mixins.CreateModelMixin,
+    mixins.ListModelMixin,
+    mixins.RetrieveModelMixin,
+    GenericViewSet
+):
+    """Interview listing, scheduling, and owned-question review."""
 
-    permission_classes = [IsAuthenticated, IsRecruiter]
     lookup_value_regex = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
-    serializer_class = InterviewCreateSerializer
     queryset = Interview.objects.none()
+    pagination_class = StandardResultsPagination
+
+    def get_permissions(self) -> list[Any]:
+        if self.action in ("list", "retrieve"):
+            return [IsAuthenticated()]
+        return [IsAuthenticated(), IsRecruiter()]
+
+    def get_serializer_class(self):
+        if self.action == "create":
+            return InterviewCreateSerializer
+        return InterviewSerializer
 
     def get_queryset(self):
-        # Match ApplicationViewSet.retrieve: inaccessible objects return 404.
-        return Interview.objects.filter(
-            application__job__recruiter__user=self.request.user
-        )
+        user = self.request.user
+        if not user or not user.is_authenticated:
+            return Interview.objects.none()
+
+        if getattr(user, "role", None) == User.Role.CANDIDATE:
+            return Interview.objects.filter(
+                application__candidate__user=user
+            ).order_by("-created_at")
+
+        if getattr(user, "role", None) == User.Role.RECRUITER:
+            return Interview.objects.filter(
+                application__job__recruiter__user=user
+            ).order_by("-created_at")
+
+        return Interview.objects.none()
 
     @extend_schema(
         tags=["Interviews"],
@@ -337,6 +367,22 @@ class MeView(APIView):
     def get(self, request: Request) -> Response:
         serializer = UserResponseSerializer(request.user)
         return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @extend_schema(
+        tags=["Auth — User"],
+        summary="Update current user",
+        description="Update profile details for the currently authenticated user.",
+        request=UserUpdateSerializer,
+        responses={
+            200: UserResponseSerializer,
+            400: OpenApiResponse(description="Invalid data."),
+        },
+    )
+    def patch(self, request: Request) -> Response:
+        serializer = UserUpdateSerializer(request.user, data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(UserResponseSerializer(request.user).data, status=status.HTTP_200_OK)
 
 
 # ═══════════════════════════════════════════════════════════════

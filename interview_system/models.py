@@ -81,6 +81,7 @@ class User(models.Model):
         choices=Role.choices,
         default=Role.CANDIDATE,
     )
+    profile_image_url = models.URLField(blank=True, default="", max_length=1024)
     is_active = models.BooleanField(
         default=True,
         help_text="Soft-disable flag for admin deactivation (FR-06). Not a Django auth flag.",
@@ -239,6 +240,7 @@ class Job(models.Model):
     experience_level = models.CharField(
         max_length=10, choices=ExperienceLevel.choices
     )
+    salary = models.CharField(max_length=255, blank=True, default="")
     status = models.CharField(
         max_length=10, choices=Status.choices, default=Status.DRAFT
     )
@@ -324,6 +326,12 @@ class Resume(models.Model):
     file = models.FileField(
         upload_to=resume_upload_path,
         validators=[FileExtensionValidator(allowed_extensions=["pdf", "docx"])],
+    )
+    original_filename = models.CharField(
+        max_length=255,
+        blank=True,
+        default="",
+        help_text="The original name of the uploaded file."
     )
     status = models.CharField(
         max_length=10,
