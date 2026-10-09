@@ -146,7 +146,9 @@ class ClerkWebhookView(APIView):
             return
 
         email = self._extract_primary_email(data)
-        self._validate_email(email, clerk_id)
+        if not email:
+            raise ValidationError({"email": "A primary email is required."})
+
         first_name = data.get("first_name") or ""
         last_name = data.get("last_name") or ""
         image_url = data.get("image_url") or ""
@@ -157,26 +159,41 @@ class ClerkWebhookView(APIView):
 
         role = self._extract_role(data, default_role=User.Role.CANDIDATE)
 
-        user, created = User.objects.get_or_create(
-            clerk_id=clerk_id,
-            defaults={
-                "email": email,
-                "first_name": first_name,
-                "last_name": last_name,
-                "profile_image_url": image_url,
-                "role": role,
-                "is_active": True,
-            },
-        )
-
-        if not created:
-            # If user already existed, update fields
-            user.email = email
-            user.first_name = first_name
-            user.last_name = last_name
-            user.profile_image_url = image_url
-            # Account type is fixed at provisioning, including replayed create events.
-            user.save()
+        existing_user = User.objects.filter(email__iexact=email).first()
+        if existing_user:
+            if existing_user.clerk_id != clerk_id:
+                if existing_user.is_active:
+                    raise ValidationError({"email": "This email is already registered. Use your existing account login."})
+                else:
+                    logger.info("Reclaiming inactive account for email=%s with new clerk_id=%s", email, clerk_id)
+                    existing_user.clerk_id = clerk_id
+                    existing_user.is_active = True
+                    existing_user.first_name = first_name
+                    existing_user.last_name = last_name
+                    existing_user.profile_image_url = image_url
+                    existing_user.save()
+                    user = existing_user
+                    created = False
+            else:
+                # Same clerk_id, just an update or replay
+                existing_user.is_active = True
+                existing_user.first_name = first_name
+                existing_user.last_name = last_name
+                existing_user.profile_image_url = image_url
+                existing_user.save()
+                user = existing_user
+                created = False
+        else:
+            user = User.objects.create(
+                clerk_id=clerk_id,
+                email=email,
+                first_name=first_name,
+                last_name=last_name,
+                profile_image_url=image_url,
+                role=role,
+                is_active=True,
+            )
+            created = True
 
         # Ensure associated profile exists
         if user.role == User.Role.RECRUITER:
@@ -189,7 +206,7 @@ class ClerkWebhookView(APIView):
 
         logger.info(
             "Clerk Webhook: %s user record for clerk_id=%s (email=%s, role=%s).",
-            "Created" if created else "Updated existing",
+            "Created" if created else "Updated/Reclaimed existing",
             clerk_id,
             email,
             role,
