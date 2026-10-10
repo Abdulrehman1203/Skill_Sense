@@ -29,6 +29,8 @@ from .models import Application, CandidateProfile, Interview, Job, JobSkill, Rec
 from .permissions import IsAdmin, IsApplicationAccessible, IsCandidate, IsJobOwner, IsRecruiter, IsResumeAccessible
 from .serializers import (
     ApplicationAdvanceSerializer,
+    ScreeningActionSerializer,
+    ScreeningRetrySerializer,
     ApplicationCreateSerializer,
     ApplicationDetailSerializer,
     ApplicationListSerializer,
@@ -245,11 +247,11 @@ class InterviewViewSet(
                     "You do not have permission to schedule an interview for this application."
                 )
 
-            if application.status != Application.Status.SCREENED:
+            if application.status not in (Application.Status.SCREENED, Application.Status.SHORTLISTED):
                 raise ValidationError(
                     {
                         "application": (
-                            "Application must be in SCREENED status before scheduling "
+                            "Application must be in SCREENED status (legacy) or SHORTLISTED status before scheduling "
                             f"an interview; current status is '{application.status}'."
                         )
                     }
@@ -682,6 +684,8 @@ class JobSkillViewSet(ModelViewSet):
         )
         with transaction.atomic():
             job = Job.objects.select_for_update().get(pk=job.pk)
+            job.screening_policy_version += 1
+            job.save(update_fields=["screening_policy_version"])
             try:
                 with transaction.atomic():
                     skill = serializer.save(job=job)
@@ -699,6 +703,8 @@ class JobSkillViewSet(ModelViewSet):
     def perform_update(self, serializer) -> None:
         with transaction.atomic():
             job = Job.objects.select_for_update().get(pk=serializer.instance.job_id)
+            job.screening_policy_version += 1
+            job.save(update_fields=["screening_policy_version"])
             old_name = serializer.instance.skill_name
             old_required = serializer.instance.is_required
             try:
@@ -718,6 +724,8 @@ class JobSkillViewSet(ModelViewSet):
     def perform_destroy(self, instance) -> None:
         with transaction.atomic():
             job = Job.objects.select_for_update().get(pk=instance.job_id)
+            job.screening_policy_version += 1
+            job.save(update_fields=["screening_policy_version"])
             name, was_required = instance.skill_name, instance.is_required
             instance.delete()
             if was_required and name in job.skills_required:
@@ -788,7 +796,7 @@ class ApplicationViewSet(
     def get_permissions(self) -> list[Any]:
         if self.action == "create":
             return [IsAuthenticated(), IsCandidate()]
-        if self.action == "advance":
+        if self.action in ("advance", "shortlist", "reject", "rescreen"):
             return [IsAuthenticated(), IsRecruiter()]
         if self.action == "retrieve":
             return [IsAuthenticated(), IsApplicationAccessible()]
@@ -798,87 +806,138 @@ class ApplicationViewSet(
     # ── Queryset — role-scoped ─────────────────────────────────
 
     def get_queryset(self):
-        user = self.request.user
-
-        if getattr(user, "role", None) == User.Role.CANDIDATE:
-            candidate_profile = getattr(user, "candidate_profile", None)
-            if candidate_profile is None:
-                return Application.objects.none()
-            return (
-                Application.objects
-                .filter(candidate=candidate_profile)
-                .select_related("job", "resume")
-                .order_by("-created_at")
-            )
-
-        if getattr(user, "role", None) == User.Role.RECRUITER:
-            recruiter_profile = getattr(user, "recruiter_profile", None)
-            if recruiter_profile is None:
-                return Application.objects.none()
-
-            # For retrieve and advance, return all applications for owned jobs
-            if self.action in ("retrieve", "advance"):
-                return (
-                    Application.objects
-                    .filter(job__recruiter=recruiter_profile)
-                    .select_related("job", "resume", "candidate__user")
-                    .order_by("-created_at")
-                )
-
-            # For list, require ?job= param (validated in list() override)
-            job_id = self.request.query_params.get("job")
-            if job_id:
-                return (
-                    Application.objects
-                    .filter(job_id=job_id, job__recruiter=recruiter_profile)
-                    .select_related("job", "resume", "candidate__user")
-                    .order_by("-created_at")
-                )
-            # If no job param, return empty — list() will raise 400 first
-            return Application.objects.none()
-
-        return Application.objects.none()
-
-    # ── List override — recruiter must scope by job ────────────
-
-    def list(self, request: Request, *args: Any, **kwargs: Any) -> Response:
-        user = request.user
-
-        if getattr(user, "role", None) == User.Role.RECRUITER:
-            job_id = request.query_params.get("job")
-            if not job_id:
-                return Response(
-                    {"detail": "Recruiters must provide a ?job={id} query parameter."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
+        from decimal import Decimal, InvalidOperation
+        from uuid import UUID
+        user = cast(User, self.request.user)
+        qs = Application.objects.select_related("job", "resume", "candidate__user", "current_assessment").prefetch_related("interviews").order_by("-created_at", "-pk")
+        if user.role == User.Role.CANDIDATE:
+            qs = qs.filter(candidate__user=user)
+        elif user.role == User.Role.RECRUITER:
+            qs = qs.filter(job__recruiter__user=user)
+        else:
+            return qs.none()
+        if self.action not in ("list", "summary"):
+            return qs
+        params = self.request.query_params
+        supported = {"job", "status", "processing_status", "min_match_score", "eligibility", "eligible_for_interview", "ordering", "page", "page_size", "format"}
+        if set(params) - supported:
+            raise ValidationError({"filters": "Unsupported filter parameter."})
+        job_id = params.get("job")
+        if user.role == User.Role.RECRUITER and not job_id:
+            raise ValidationError({"job": "Recruiters must provide a ?job={id} query parameter."})
+        if job_id:
             try:
                 UUID(job_id)
             except (ValueError, TypeError):
-                return Response({"detail": "Invalid job ID."}, status=status.HTTP_400_BAD_REQUEST)
-
-            # Validate the job exists and belongs to this recruiter
-            recruiter_profile = getattr(user, "recruiter_profile", None)
-            if recruiter_profile is None:
-                recruiter_profile = RecruiterProfile.objects.filter(user=user).first()
-
+                raise ValidationError({"job": "Invalid job ID."})
+            if user.role == User.Role.RECRUITER and not Job.objects.filter(pk=job_id, recruiter__user=user).exists():
+                raise PermissionDenied("This job is not accessible.")
+            qs = qs.filter(job_id=job_id)
+        for param, field, valid in (
+            ("status", "status", set(Application.Status.values)),
+            ("processing_status", "current_assessment__status", {"QUEUED", "PARSING", "MATCHING", "SCREENING", "SUCCEEDED", "FAILED"}),
+            ("eligibility", "current_assessment__eligibility", {"PASS", "FAIL", "UNKNOWN"}),
+        ):
+            if param in params:
+                if params[param] not in valid:
+                    raise ValidationError({param: "Invalid filter value."})
+                qs = qs.filter(**{field: params[param]})
+        if "min_match_score" in params:
             try:
-                job = Job.objects.get(pk=job_id)
-            except (Job.DoesNotExist, ValueError):
-                return Response(
-                    {"detail": "Job not found."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
+                score = Decimal(params["min_match_score"])
+                if not score.is_finite() or not 0 <= score <= 100:
+                    raise ValueError()
+            except (InvalidOperation, ValueError):
+                raise ValidationError({"min_match_score": "Use a number from 0 to 100."})
+            qs = qs.filter(current_assessment__status="SUCCEEDED", current_assessment__match_score__gte=score)
+        if "eligible_for_interview" in params:
+            if params["eligible_for_interview"] not in ("true", "false"):
+                raise ValidationError({"eligible_for_interview": "Use true or false."})
+            ready = models.Q(status__in=["SHORTLISTED", "SCREENED"], interviews__isnull=True)
+            qs = qs.filter(ready) if params["eligible_for_interview"] == "true" else qs.exclude(ready)
+        ordering = params.get("ordering", "-created_at")
+        mapping = {"created_at": "created_at", "-created_at": "-created_at", "match_score": "current_assessment__match_score", "-match_score": "-current_assessment__match_score"}
+        if ordering not in mapping:
+            raise ValidationError({"ordering": "Invalid ordering."})
+        return qs.order_by(mapping[ordering], "pk")
 
-            if (
-                recruiter_profile is None
-                or job.recruiter.pk != recruiter_profile.pk
-            ):
-                raise PermissionDenied(
-                    "You do not have permission to view applications for this job."
-                )
+    @action(detail=False, methods=["get"])
+    def summary(self, request):
+        qs = self.get_queryset()
+        return Response({
+            "total": qs.count(),
+            "by_status": dict(qs.order_by().values("status").annotate(n=models.Count("pk")).values_list("status", "n")),
+            "by_processing_status": dict(qs.order_by().values("current_assessment__status").annotate(n=models.Count("pk")).values_list("current_assessment__status", "n")),
+        })
 
-        return super().list(request, *args, **kwargs)
+    def _screening_action(self, request, target):
+        from .screening import transition
+        obj = self.get_object()
+        payload = ScreeningActionSerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        app = transition(obj.pk, target, actor=request.user, **payload.validated_data)
+        return Response(ApplicationDetailSerializer(app, context={"request": request}).data)
+
+    @extend_schema(request=ScreeningActionSerializer, responses={200: ApplicationDetailSerializer})
+    @action(detail=True, methods=["post"])
+    def shortlist(self, request, pk=None):
+        return self._screening_action(request, "SHORTLISTED")
+
+    @extend_schema(request=ScreeningActionSerializer, responses={200: ApplicationDetailSerializer})
+    @action(detail=True, methods=["post"])
+    def reject(self, request, pk=None):
+        return self._screening_action(request, "REJECTED")
+
+    @extend_schema(request=ScreeningRetrySerializer, responses={202: ApplicationDetailSerializer})
+    @action(detail=True, methods=["post"], url_path="retry-screening")
+    def retry_screening(self, request, pk=None):
+        return self._restart_screening(request, rescreen=False)
+
+    @extend_schema(request=ScreeningRetrySerializer, responses={202: ApplicationDetailSerializer})
+    @action(detail=True, methods=["post"])
+    def rescreen(self, request, pk=None):
+        return self._restart_screening(request, rescreen=True)
+
+    def _restart_screening(self, request, *, rescreen):
+        from datetime import timedelta
+        from rest_framework.exceptions import Throttled
+        from .screening import ACTIVE_STAGES, ScreeningConflict, create_assessment
+        obj = self.get_object()
+        payload = ScreeningRetrySerializer(data=request.data)
+        payload.is_valid(raise_exception=True)
+        data = payload.validated_data
+        with transaction.atomic():
+            app = Application.objects.select_for_update().get(pk=obj.pk)
+            current = app.current_assessment
+            if app.status not in ("APPLIED", "UNDER_REVIEW"):
+                raise ScreeningConflict("This application cannot be reprocessed.")
+            if current and current.status in ACTIVE_STAGES:
+                # A replay of the immediately preceding request returns that same work.
+                if data["expected_version"] not in (app.version, app.version - 1):
+                    raise ScreeningConflict()
+                return Response(ApplicationDetailSerializer(app, context={"request": request}).data, status=202)
+            if data["expected_version"] != app.version:
+                raise ScreeningConflict()
+            if not current or (rescreen and (app.status != "UNDER_REVIEW" or current.status != "SUCCEEDED")) or (not rescreen and current.status != "FAILED"):
+                raise ScreeningConflict("This action does not match the current assessment state.")
+            if current.recovery_action == "CONTACT_SUPPORT":
+                from django.conf import settings
+                if not settings.GEMINI_API_KEY:
+                    raise ValidationError("Resume processing is not configured. Contact support before retrying.")
+            if app.assessments.filter(created_at__gte=timezone.now() - timedelta(minutes=10)).count() >= 4:
+                raise Throttled(wait=600, detail="Too many screening attempts. Try again later.")
+            replacement = data.get("resume_id")
+            if replacement:
+                if rescreen or request.user.role != User.Role.CANDIDATE or not data.get("consent_given"):
+                    raise ValidationError("Only the candidate can replace a failed resume with processing consent.")
+                resume = get_object_or_404(Resume, pk=replacement, candidate_id=app.candidate_id)
+                app.resume = resume
+                app.save(update_fields=["resume"])
+            if current.recovery_action == "REPLACE_RESUME" and not replacement:
+                raise ValidationError({"resume_id": "Upload a readable replacement resume first."})
+            create_assessment(app.pk, use_current_policy=rescreen)
+            app.refresh_from_db()
+        return Response(ApplicationDetailSerializer(app, context={"request": request}).data, status=202)
 
     # ── Advance action — forward-only lifecycle ────────────────
 
@@ -886,8 +945,9 @@ class ApplicationViewSet(
         tags=["Applications"],
         summary="Advance application status",
         description=(
-            "Handles APPLIED → SCREENED and INTERVIEWED → DECISION. "
-            "SCREENED → INTERVIEWED occurs only through POST /api/interviews/."
+            "Screening transitions require expected_version and a reason for overrides/rejection. "
+            "Prefer the dedicated shortlist/reject endpoints. INTERVIEWED → DECISION remains supported. "
+            "Scheduling occurs only through POST /api/interviews/."
         ),
         request=ApplicationAdvanceSerializer,
         responses={
@@ -905,32 +965,16 @@ class ApplicationViewSet(
     )
     def advance(self, request: Request, pk: str | None = None) -> Response:
         application = self.get_object()
-
-        # Object-level check: recruiter must own the job
-        recruiter_profile = getattr(request.user, "recruiter_profile", None)
-        if (
-            recruiter_profile is None
-            or application.job.recruiter_id != recruiter_profile.pk
-        ):
-            raise PermissionDenied(
-                "You do not have permission to advance this application."
-            )
-
-        serializer = ApplicationAdvanceSerializer(
-            data=request.data,
-            context={"request": request, "application": application},
-        )
+        target = request.data.get("status")
+        if target in ("SHORTLISTED", "SCREENED", "REJECTED"):
+            return self._screening_action(request, "SHORTLISTED" if target == "SCREENED" else target)
+        # Preserve the legacy downstream decision contract for the later interview phase.
+        serializer = ApplicationAdvanceSerializer(data=request.data, context={"application": application})
         serializer.is_valid(raise_exception=True)
-
-        new_status = serializer.validated_data["status"]
-
-        application.status = new_status
+        application.status = serializer.validated_data["status"]
         application.save(update_fields=["status", "updated_at"])
+        return Response(ApplicationDetailSerializer(application, context={"request": request}).data)
 
-        return Response(
-            ApplicationDetailSerializer(application, context={"request": request}).data,
-            status=status.HTTP_200_OK,
-        )
 
 
 # ═══════════════════════════════════════════════════════════════

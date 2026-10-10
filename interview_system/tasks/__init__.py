@@ -13,6 +13,7 @@ from .interviewing import (
 )
 from .notifications import send_notification
 from .parsing import compute_match_score, parse_resume
+from .screening import process_assessment, recover_stalled_assessments
 
 __all__ = (
     "parse_resume",

@@ -213,6 +213,12 @@ CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_TASK_ALWAYS_EAGER = os.getenv("CELERY_TASK_ALWAYS_EAGER", "False").lower() in ("true", "1", "yes")
+CELERY_BEAT_SCHEDULE = {
+    "recover-application-screening": {
+        "task": "interview_system.tasks.screening.recover_stalled_assessments",
+        "schedule": 15.0,
+    },
+}
 CELERY_TASK_EAGER_PROPAGATES = os.getenv("CELERY_TASK_EAGER_PROPAGATES", "True").lower() in ("true", "1", "yes")
 
 
