@@ -63,3 +63,12 @@ interview_system/tests/
 
 # ── Temporary / AI scratch files ─────────────────────────────
 tmp_genai/
+
+# -- Celery Beat schedule (auto-generated runtime state) --
+celerybeat-schedule.bak
+celerybeat-schedule.dat
+celerybeat-schedule.dir
+celerybeat-schedule
+
+# -- Temporary test / scratch files --
+interview_system/test_screening.py

@@ -1,7 +1,7 @@
 """Phase 6 candidate scoring task.
 
 Scoring writes a CandidateScore only. Application status is controlled solely
-by the recruiter-driven application workflow.
+by the screening and recruiter decision workflow.
 """
 
 from __future__ import annotations
@@ -75,17 +75,23 @@ def _behavioral_signal(application_id: str) -> dict | None:
 )
 def generate_candidate_score(self, application_id: str) -> dict:
     """Score an application and persist the result without changing its status."""
-    app = Application.objects.select_related("resume", "candidate").get(pk=application_id)
-    parsed = ParsedResume.objects.filter(resume_id=app.resume_id).first()
-    # A failed resume must never reuse a score left by an earlier attempt.
-    match_score = (
-        None if app.resume.status == Resume.Status.FAILED
-        else parsed.match_score if parsed is not None else None
-    )
-    if match_score is None and app.resume.status != Resume.Status.FAILED:
-        raise ScoringInputNotReady(
-            f"Phase 5 match is not ready for application {application_id}."
+    app = Application.objects.select_related("resume", "candidate", "current_assessment").get(pk=application_id)
+    assessment = app.current_assessment
+    if assessment is not None:
+        if assessment.status != "SUCCEEDED" or assessment.match_score is None:
+            raise ScoringInputNotReady("Application screening must succeed before final scoring.")
+        match_score = float(assessment.match_score)
+    else:
+        # Only historical applications without an assessment use the legacy signal.
+        parsed = ParsedResume.objects.filter(resume_id=app.resume_id).first()
+        match_score = (
+            None if app.resume.status == Resume.Status.FAILED
+            else parsed.match_score if parsed is not None else None
         )
+        if match_score is None and app.resume.status != Resume.Status.FAILED:
+            raise ScoringInputNotReady(
+                f"Match is not ready for application {application_id}."
+            )
 
     try:
         rubric = ScoringRubric.objects.get(active=True)

@@ -245,6 +245,11 @@ class Job(models.Model):
         max_length=10, choices=Status.choices, default=Status.DRAFT
     )
     deadline = models.DateField(null=True, blank=True)
+    screening_threshold = models.DecimalField(max_digits=5, decimal_places=2, default=60, validators=[MinValueValidator(0), MaxValueValidator(100)])
+    auto_shortlist_enabled = models.BooleanField(default=True)
+    non_pass_policy = models.CharField(max_length=10, choices=[("REVIEW", "Hold for review"), ("REJECT", "Reject definite failures")], default="REVIEW")
+    screening_policy_version = models.PositiveIntegerField(default=1)
+    screening_criteria = models.JSONField(default=dict, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -253,6 +258,7 @@ class Job(models.Model):
         verbose_name = "job"
         verbose_name_plural = "jobs"
         ordering = ["-created_at"]
+        constraints = [models.CheckConstraint(condition=models.Q(screening_threshold__gte=0, screening_threshold__lte=100), name="job_screening_threshold_range")]
         indexes = [
             models.Index(fields=["status"], name="idx_job_status"),
             models.Index(fields=["job_type"], name="idx_job_type"),
@@ -340,6 +346,10 @@ class Resume(models.Model):
         help_text="STORED until submitted; application processing is PENDING → PARSED or FAILED.",
     )
     processing_error = models.TextField(blank=True, default="")
+    parse_claim = models.UUIDField(null=True, blank=True)
+    parse_lease_until = models.DateTimeField(null=True, blank=True)
+    content_hash = models.CharField(max_length=64, blank=True)
+    parser_version = models.CharField(max_length=100, blank=True)
     uploaded_at = models.DateTimeField(auto_now_add=True)
 
     MAX_FILE_SIZE_MB = 5
@@ -371,6 +381,9 @@ class Application(models.Model):
     class Status(models.TextChoices):
         APPLIED = "APPLIED", "Applied"
         SCREENED = "SCREENED", "Screened"
+        UNDER_REVIEW = "UNDER_REVIEW", "Under review"
+        SHORTLISTED = "SHORTLISTED", "Shortlisted"
+        REJECTED = "REJECTED", "Rejected"
         INTERVIEWED = "INTERVIEWED", "Interviewed"
         DECISION = "DECISION", "Decision"
 
@@ -385,8 +398,10 @@ class Application(models.Model):
         Resume, on_delete=models.PROTECT, related_name="applications"
     )
     status = models.CharField(
-        max_length=12, choices=Status.choices, default=Status.APPLIED
+        max_length=24, choices=Status.choices, default=Status.APPLIED
     )
+    version = models.PositiveIntegerField(default=1)
+    current_assessment = models.ForeignKey("ApplicationAssessment", null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -415,6 +430,56 @@ class Application(models.Model):
 # ═══════════════════════════════════════════════════════════════
 #  ParsedResume
 # ═══════════════════════════════════════════════════════════════
+
+class ApplicationAssessment(models.Model):
+    """Immutable inputs and versioned job-relative screening results."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    application = models.ForeignKey(Application, on_delete=models.CASCADE, related_name="assessments")
+    resume = models.ForeignKey(Resume, on_delete=models.PROTECT)
+    revision = models.PositiveIntegerField()
+    policy = models.JSONField(default=dict)
+    status = models.CharField(max_length=16, default="QUEUED", choices=[(s, s.title()) for s in ("QUEUED", "PARSING", "MATCHING", "SCREENING", "SUCCEEDED", "FAILED")])
+    match_score = models.DecimalField(max_digits=5, decimal_places=2, null=True, blank=True)
+    matched_skills = models.JSONField(default=list)
+    missing_skills = models.JSONField(default=list)
+    criteria_results = models.JSONField(default=list)
+    eligibility = models.CharField(max_length=12, blank=True)
+    outcome = models.CharField(max_length=24, blank=True)
+    reasons = models.JSONField(default=list)
+    error_code = models.CharField(max_length=48, blank=True)
+    error_message = models.CharField(max_length=300, blank=True)
+    recovery_action = models.CharField(max_length=32, blank=True)
+    attempts = models.PositiveIntegerField(default=0)
+    claim_token = models.UUIDField(null=True, blank=True)
+    lease_until = models.DateTimeField(null=True, blank=True)
+    next_attempt_at = models.DateTimeField(default=timezone.now)
+    resume_hash = models.CharField(max_length=64, blank=True)
+    parser_version = models.CharField(max_length=64, default="gemini-v1")
+    matcher_version = models.CharField(max_length=100, blank=True)
+    apply_decision = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    completed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=["application", "revision"], name="unique_assessment_revision"),
+            models.CheckConstraint(condition=models.Q(match_score__isnull=True) | models.Q(match_score__gte=0, match_score__lte=100), name="assessment_score_range"),
+        ]
+        indexes = [models.Index(fields=["status", "next_attempt_at"])]
+
+
+class ScreeningEvent(models.Model):
+    application = models.ForeignKey(Application, on_delete=models.CASCADE, related_name="screening_events")
+    assessment = models.ForeignKey(ApplicationAssessment, null=True, on_delete=models.SET_NULL)
+    actor = models.ForeignKey(User, null=True, on_delete=models.SET_NULL)
+    source = models.CharField(max_length=20)
+    from_status = models.CharField(max_length=24)
+    to_status = models.CharField(max_length=24)
+    reason = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
 
 class ParsedResume(models.Model):
     """

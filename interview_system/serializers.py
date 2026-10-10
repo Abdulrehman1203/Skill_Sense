@@ -15,6 +15,7 @@ from rest_framework import serializers
 
 from .models import (
     Application,
+    ApplicationAssessment,
     CandidateProfile,
     Interview,
     Job,
@@ -304,6 +305,8 @@ class JobSerializer(serializers.ModelSerializer):
             "job_skills",
             "match_score",
             "average_match_score",
+            "screening_threshold", "auto_shortlist_enabled", "non_pass_policy",
+            "screening_policy_version", "screening_criteria",
         ]
         read_only_fields = [
             "id",
@@ -319,16 +322,16 @@ class JobSerializer(serializers.ModelSerializer):
         candidate = getattr(request.user, "candidate_profile", None)
         if not candidate:
             return None
-        app = obj.applications.filter(candidate=candidate).first()
-        if app and hasattr(app, "resume") and hasattr(app.resume, "parsed_data"):
-            return app.resume.parsed_data.match_score
+        app = obj.applications.select_related("current_assessment").filter(candidate=candidate).first()
+        if app and app.current_assessment and app.current_assessment.status == "SUCCEEDED" and app.current_assessment.match_score is not None:
+            return float(app.current_assessment.match_score)
         return None
 
     def get_average_match_score(self, obj: Job) -> float | None:
         from django.db.models import Avg
         avg = obj.applications.filter(
-            resume__parsed_data__match_score__isnull=False
-        ).aggregate(avg=Avg("resume__parsed_data__match_score"))["avg"]
+            current_assessment__status="SUCCEEDED"
+        ).aggregate(avg=Avg("current_assessment__match_score"))["avg"]
         return round(avg, 2) if avg is not None else None
 
     def validate_skills_required(
@@ -370,6 +373,20 @@ class JobCreateUpdateSerializer(serializers.ModelSerializer):
     )
     deadline = serializers.DateField(required=True)
 
+    def validate_screening_criteria(self, value):
+        if not isinstance(value, dict) or set(value) - {"minimum_experience_years", "education_levels", "certifications", "manual_review_required"}:
+            raise serializers.ValidationError("Use minimum_experience_years, education_levels, certifications, and manual_review_required only.")
+        years = value.get("minimum_experience_years")
+        if years is not None and (isinstance(years, bool) or not isinstance(years, (float, int)) or not math.isfinite(years) or not 0 <= years <= 80):
+            raise serializers.ValidationError("Minimum experience must be a number from 0 to 80.")
+        for key in ("education_levels", "certifications"):
+            items = value.get(key, [])
+            if not isinstance(items, list) or len(items) > 30 or any(not isinstance(s, str) or not s.strip() or len(s) > 150 for s in items):
+                raise serializers.ValidationError(f"{key} must contain up to 30 nonempty strings.")
+        if "manual_review_required" in value and not isinstance(value["manual_review_required"], bool):
+            raise serializers.ValidationError("manual_review_required must be boolean.")
+        return value
+
     class Meta:  # type: ignore
         model = Job
         fields = [
@@ -382,6 +399,7 @@ class JobCreateUpdateSerializer(serializers.ModelSerializer):
             "job_type",
             "experience_level",
             "deadline",
+            "screening_threshold", "auto_shortlist_enabled", "non_pass_policy", "screening_criteria",
         ]
 
     def validate_skills_required(self, value: list[str]) -> list[str]:
@@ -418,6 +436,10 @@ class JobCreateUpdateSerializer(serializers.ModelSerializer):
 
     @transaction.atomic
     def update(self, instance: Job, validated_data: dict[str, Any]) -> Job:
+        from .screening import POLICY_FIELDS
+        instance = Job.objects.select_for_update().get(pk=instance.pk)
+        if any(name in validated_data and validated_data[name] != getattr(instance, name) for name in POLICY_FIELDS):
+            instance.screening_policy_version += 1
         skills = validated_data.get("skills_required", None)
         job = super().update(instance, validated_data)
         if skills is not None:
@@ -475,6 +497,8 @@ class ApplicationCreateSerializer(serializers.Serializer):
             raise serializers.ValidationError(
                 "This job is not accepting applications."
             )
+        if job.deadline and job.deadline < timezone.localdate():
+            raise serializers.ValidationError("The application deadline has passed.")
         return job
 
     def validate_consent_given(self, value: bool) -> bool:
@@ -539,6 +563,12 @@ class ApplicationCreateSerializer(serializers.Serializer):
         resume = validated_data.get("resume")
 
         with transaction.atomic():
+            job = Job.objects.select_for_update().get(pk=job.pk)
+            if job.status != Job.Status.ACTIVE or (job.deadline and job.deadline < timezone.localdate()):
+                raise serializers.ValidationError({"job": "This job is no longer accepting applications."})
+            if Application.objects.filter(candidate=candidate_profile, job=job).exists():
+                from .screening import ScreeningConflict
+                raise ScreeningConflict("You have already applied to this job.")
             if resume_file:
                 resume = Resume.objects.create(
                     candidate=candidate_profile,
@@ -551,6 +581,7 @@ class ApplicationCreateSerializer(serializers.Serializer):
                 resume=resume,
                 status=Application.Status.APPLIED,
             )
+            application.refresh_from_db()
         return application
 
     def to_representation(self, instance: Application) -> dict[str, Any]:
@@ -561,46 +592,82 @@ class ApplicationCreateSerializer(serializers.Serializer):
         return ApplicationDetailSerializer(instance, context=self.context).data
 
 
+class AssessmentSerializer(serializers.ModelSerializer):
+    threshold = serializers.SerializerMethodField()
+    policy_version = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ApplicationAssessment
+        fields = ["id", "revision", "status", "match_score", "matched_skills", "missing_skills",
+                  "criteria_results", "eligibility", "outcome", "reasons", "threshold", "policy_version",
+                  "error_code", "error_message", "recovery_action", "attempts", "created_at", "completed_at"]
+        read_only_fields = fields
+
+    def get_threshold(self, obj):
+        return obj.policy.get("screening_threshold")
+
+    def get_policy_version(self, obj):
+        return obj.policy.get("version")
+
+
 class ApplicationListSerializer(serializers.ModelSerializer):
-    """
-    Lightweight read-only serializer for listing applications.
-    Shows job title for display convenience without nesting the full Job object.
-    """
-
     job_title = serializers.CharField(source="job.title", read_only=True)
-
-    class Meta:  # type: ignore
-        model = Application
-        fields = ["id", "job", "job_title", "status", "created_at"]
-        read_only_fields = list(fields)
-
-
-class ApplicationDetailSerializer(serializers.ModelSerializer):
-    """
-    Full read-only serializer for retrieving a single application.
-    Includes candidate info, job title, resume ID, and timestamps.
-    """
-
-    job_title = serializers.CharField(source="job.title", read_only=True)
-    candidate_email = serializers.EmailField(
-        source="candidate.user.email", read_only=True
-    )
+    candidate_email = serializers.EmailField(source="candidate.user.email", read_only=True)
+    candidate_name = serializers.SerializerMethodField()
     resume_id = serializers.UUIDField(source="resume.pk", read_only=True)
+    assessment = AssessmentSerializer(source="current_assessment", read_only=True)
+    match_score = serializers.SerializerMethodField()
+    allowed_actions = serializers.SerializerMethodField()
+    eligible_for_interview = serializers.SerializerMethodField()
 
-    class Meta:  # type: ignore
+    class Meta:
         model = Application
-        fields = [
-            "id",
-            "candidate",
-            "candidate_email",
-            "job",
-            "job_title",
-            "resume_id",
-            "status",
-            "created_at",
-            "updated_at",
-        ]
-        read_only_fields = list(fields)
+        fields = ["id", "candidate", "candidate_email", "candidate_name", "job", "job_title", "resume_id",
+                  "status", "version", "assessment", "match_score", "allowed_actions", "eligible_for_interview",
+                  "created_at", "updated_at"]
+        read_only_fields = fields
+
+    def get_candidate_name(self, obj):
+        user = obj.candidate.user
+        return f"{user.first_name} {user.last_name}".strip() or user.email
+
+    def get_match_score(self, obj):
+        a = obj.current_assessment
+        return a.match_score if a and a.status == "SUCCEEDED" else None
+
+    def get_allowed_actions(self, obj):
+        from .screening import permitted_actions
+        request = self.context.get("request")
+        return permitted_actions(obj, request.user) if request else []
+
+    def get_eligible_for_interview(self, obj):
+        return obj.status in ("SHORTLISTED", "SCREENED") and not obj.interviews.all()
+
+
+class ApplicationDetailSerializer(ApplicationListSerializer):
+    history = serializers.SerializerMethodField()
+
+    class Meta(ApplicationListSerializer.Meta):
+        fields = ApplicationListSerializer.Meta.fields + ["history"]
+        read_only_fields = fields
+
+    def get_history(self, obj):
+        request = self.context.get("request")
+        if not request or request.user.role != User.Role.RECRUITER:
+            return []
+        return list(obj.screening_events.order_by("-created_at").values(
+            "source", "from_status", "to_status", "reason", "created_at", "assessment_id")[:50])
+
+
+class ScreeningActionSerializer(serializers.Serializer):
+    expected_version = serializers.IntegerField(min_value=1)
+    reason = serializers.CharField(required=False, default="", allow_blank=True, max_length=2000)
+
+
+class ScreeningRetrySerializer(serializers.Serializer):
+    expected_version = serializers.IntegerField(min_value=1)
+    resume_id = serializers.UUIDField(required=False)
+    consent_given = serializers.BooleanField(required=False, default=False)
 
 
 class ApplicationAdvanceSerializer(serializers.Serializer):
@@ -804,7 +871,8 @@ class ResumeListSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
     def validate_file(self, value: Any) -> Any:
-        if self.instance and Application.objects.filter(resume=self.instance).exists():
+        if self.instance and (Application.objects.filter(resume=self.instance).exists() or
+                              ApplicationAssessment.objects.filter(resume=self.instance).exists()):
             raise serializers.ValidationError(
                 "A resume submitted with an application cannot be replaced."
             )

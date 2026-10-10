@@ -1,24 +1,11 @@
-"""
-Parsing and Match Scoring Celery tasks (Phase 5).
-
-Contains parse_resume and compute_match_score with:
-- Text extraction (pdfplumber / python-docx / OCR fallback)
-- Gemini API parsing with schema validation and Redis response caching
-- SBERT cosine similarity matching with independent Redis embedding caching
-- Exception handling (ExtractionError → non-retryable FAILED, GeminiParseError → autoretry)
-- Failure-state persistence (Resume.status = FAILED on exhausted retries)
-"""
+"""Compatibility tasks for resume-library parsing and application assessment dispatch."""
 
 from __future__ import annotations
 
 import logging
 
-from typing import Any, cast
-
 from celery import shared_task
 
-from ..integrations.gemini_client import GeminiParseError
-from ..resumes.extraction import ExtractionError
 
 logger = logging.getLogger(__name__)
 
@@ -48,88 +35,18 @@ def _mark_resume_failed(resume_id: str, reason: str) -> None:
     retry_backoff_max=600,
 )
 def compute_match_score(self, resume_id: str) -> dict:
-    """
-    Compute job-relative match score and skills breakdown via SBERT.
-
-    Steps:
-      1. Load ParsedResume + linked Job
-      2. ai.matching.sbert.match(raw_text, job_text, job_skills)
-      3. Write match_score, matched_skills, missing_skills to ParsedResume
-      4. Chain → generate_candidate_score.delay(application_id)
-    """
-    from ..models import Application, ParsedResume
-
-    logger.info(
-        "compute_match_score executing for resume_id=%s (attempt %d)",
-        resume_id,
-        self.request.retries + 1,
-    )
-
-    try:
-        parsed_resume = ParsedResume.objects.select_related("resume").get(
-            resume_id=resume_id
-        )
-    except ParsedResume.DoesNotExist:
-        logger.error("ParsedResume for resume_id=%s not found", resume_id)
-        _mark_resume_failed(resume_id, "Parsed resume data is missing.")
-        raise
-
-    app = Application.objects.select_related("job").filter(resume_id=resume_id).first()
-    if not app:
-        logger.error("No Application found for resume_id=%s", resume_id)
-        _mark_resume_failed(resume_id, "No linked application found for matching.")
-        return {"error": "No linked application found", "status": "FAILED"}
-
-    job = app.job
-    job_text = f"{job.title}\n{job.description}\n{job.requirements}"
-    job_skills = list(job.skills_required) if job.skills_required else []
-
-    # SBERT matching
-    from ai.matching.sbert import match as sbert_match
-
-    try:
-        match_result = sbert_match(
-            resume_text=parsed_resume.raw_text,
-            job_text=job_text,
-            job_skills=job_skills,
-        )
-    except Exception as exc:
-        transient = isinstance(exc, (OSError, TimeoutError, ConnectionError, RuntimeError))
-        if transient and self.request.retries < self.max_retries:
-            logger.warning("Matching failed for resume %s; retrying: %s", resume_id, exc)
-            raise self.retry(exc=exc, countdown=min(2 ** self.request.retries, 600))
-        reason = f"Matching failed: {type(exc).__name__}: {exc}"
-        _mark_resume_failed(resume_id, reason)
-        parsed_resume.match_score = None
-        parsed_resume.matched_skills = []
-        parsed_resume.missing_skills = []
-        parsed_resume.save(update_fields=["match_score", "matched_skills", "missing_skills"])
-        raise
-
-    # Persist match results (score on 0-100 scale)
-    parsed_resume.match_score = round(match_result["similarity"] * 100, 2)
-    parsed_resume.matched_skills = match_result["matched_skills"]
-    parsed_resume.missing_skills = match_result["missing_skills"]
-    parsed_resume.save(
-        update_fields=["match_score", "matched_skills", "missing_skills"]
-    )
-
-    logger.info(
-        "compute_match_score completed for resume_id=%s, score=%.2f",
-        resume_id,
-        parsed_resume.match_score,
-    )
-
-    # Chain → Phase 6 scoring task
-    from .scoring_tasks import generate_candidate_score
-
-    cast(Any, generate_candidate_score).delay(application_id=str(app.id))
-
-    return {
-        "match_score": parsed_resume.match_score,
-        "matched_skills": match_result["matched_skills"],
-        "missing_skills": match_result["missing_skills"],
-    }
+    """Compatibility producer: fan out to application-owned assessments."""
+    from ..models import Application
+    from ..screening import create_assessment, dispatch
+    count = 0
+    for app in Application.objects.filter(resume_id=resume_id):
+        assessment = app.current_assessment
+        if assessment is None:
+            assessment = create_assessment(app.pk, apply_decision=app.status in ("APPLIED", "UNDER_REVIEW"))
+        else:
+            dispatch(assessment.pk)
+        count += 1
+    return {"applications": count}
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -137,103 +54,24 @@ def compute_match_score(self, resume_id: str) -> dict:
 # ═══════════════════════════════════════════════════════════════
 
 
-@shared_task(
-    bind=True,
-    autoretry_for=(GeminiParseError,),
-    retry_backoff=True,
-    retry_backoff_max=600,
-    max_retries=3,
-)
+@shared_task(bind=True, max_retries=3, ignore_result=True)
 def parse_resume(self, resume_id: str) -> dict:
-    """
-    Parse a resume file and persist structured data into ParsedResume.
-
-    Steps:
-      1. Load Resume row
-      2. extract_text(resume.file) → raw_text
-      3. Check Gemini parse cache / call gemini_client.parse_resume_text(raw_text)
-      4. Persist ParsedResume row & set Resume.status = PARSED
-      5. Chain → compute_match_score.delay(resume_id)
-
-    Failure semantics:
-      - ExtractionError: Non-retryable (corrupt file). Immediately sets Resume.status = FAILED.
-      - GeminiParseError: Retried up to 3× with exponential backoff.
-        On exhaustion, sets Resume.status = FAILED and stops the chain.
-    """
-    from ..models import ParsedResume, Resume
-
-    logger.info(
-        "parse_resume executing for resume_id=%s (attempt %d/%d)",
-        resume_id,
-        self.request.retries + 1,
-        self.max_retries + 1,
-    )
-
-    # 1. Load Resume
+    """Resume-library compatibility task using the same parse lease as assessments."""
+    from .screening import parsed_resume, ParseBusy, ScreeningFailure
     try:
-        resume = Resume.objects.get(pk=resume_id)
-    except Resume.DoesNotExist:
-        logger.error("Resume %s not found during parse_resume execution", resume_id)
-        raise
-
-    # 2. Extract text (non-retryable failure on corrupt / unsupported format)
-    try:
-        from ..resumes.extraction import extract_text
-
-        raw_text = extract_text(resume.file)
-        if raw_text:
-            raw_text = raw_text.replace('\x00', '')
-    except ExtractionError as exc:
-        logger.error("Text extraction failed permanently for resume %s: %s", resume_id, exc)
-        _mark_resume_failed(resume_id, f"Text extraction failed: {exc}")
-        return {"error": str(exc), "status": "FAILED"}
-
-    # 3. Parse via Gemini (wrapped behind cache check)
-    from ai.matching.cache import get_cached_gemini_parse, set_cached_gemini_parse
-    from ..integrations.gemini_client import parse_resume_text
-
-    parsed_data = get_cached_gemini_parse(raw_text)
-    if parsed_data is None:
-        try:
-            parsed_data = parse_resume_text(raw_text)
-            set_cached_gemini_parse(raw_text, parsed_data)
-        except GeminiParseError:
-            if self.request.retries >= self.max_retries:
-                _mark_resume_failed(resume_id, "Gemini parsing failed after retries.")
-            raise
-
-    # 4. Persist ParsedResume row
-    parsed_obj, _ = ParsedResume.objects.update_or_create(
-        resume=resume,
-        defaults={
-            "skills": parsed_data["skills"],
-            "education": parsed_data["education"],
-            "experience": parsed_data["experience"],
-            "certifications": parsed_data["certifications"],
-            "raw_text": raw_text,
-        },
-    )
-
-    resume.status = Resume.Status.PARSED
-    resume.processing_error = ""
-    resume.save(update_fields=["status", "processing_error"])
-
-    logger.info(
-        "parse_resume completed for resume_id=%s, ParsedResume pk=%s",
-        resume_id,
-        parsed_obj.pk,
-    )
-
-    # 5. Chain → compute_match_score
-    from ..models import Application
-    if Application.objects.filter(resume_id=resume_id).exists():
-        cast(Any, compute_match_score).delay(resume_id=resume_id)
-
-    return {
-        "skills": parsed_data["skills"],
-        "education": parsed_data["education"],
-        "experience": parsed_data["experience"],
-        "certifications": parsed_data["certifications"],
-        "raw_text": raw_text[:200],
-    }
-
+        parsed, _, _ = parsed_resume(resume_id)
+    except ParseBusy:
+        raise self.retry(countdown=15, max_retries=40)
+    except ScreeningFailure as exc:
+        if exc.transient and self.request.retries < 3:
+            raise self.retry(countdown=min(300, 15 * 2 ** self.request.retries)) from None
+        _mark_resume_failed(resume_id, exc.message)
+        return {"status": "FAILED", "error": exc.code}
+    except Exception:
+        if self.request.retries < 3:
+            raise self.retry(countdown=30) from None
+        _mark_resume_failed(resume_id, "Resume processing failed. Retry or upload a readable document.")
+        return {"status": "FAILED", "error": "PARSER_UNAVAILABLE"}
+    compute_match_score.run(resume_id=resume_id)
+    return {"status": "PARSED", "skills": parsed.skills, "education": parsed.education,
+            "experience": parsed.experience, "certifications": parsed.certifications}
