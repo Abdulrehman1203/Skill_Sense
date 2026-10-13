@@ -374,8 +374,8 @@ class JobCreateUpdateSerializer(serializers.ModelSerializer):
     deadline = serializers.DateField(required=True)
 
     def validate_screening_criteria(self, value):
-        if not isinstance(value, dict) or set(value) - {"minimum_experience_years", "education_levels", "certifications", "manual_review_required"}:
-            raise serializers.ValidationError("Use minimum_experience_years, education_levels, certifications, and manual_review_required only.")
+        if not isinstance(value, dict):
+            raise serializers.ValidationError("Screening criteria must be a dictionary.")
         years = value.get("minimum_experience_years")
         if years is not None and (isinstance(years, bool) or not isinstance(years, (float, int)) or not math.isfinite(years) or not 0 <= years <= 80):
             raise serializers.ValidationError("Minimum experience must be a number from 0 to 80.")
@@ -486,6 +486,7 @@ class ApplicationCreateSerializer(serializers.Serializer):
     resume_file = serializers.FileField(required=False)
     resume_id = serializers.UUIDField(required=False)
     consent_given = serializers.BooleanField()
+    cover_note = serializers.CharField(required=False, allow_blank=True, max_length=5000)
 
     def validate_job(self, value: Any) -> Job:
         """Resolve UUID to Job instance and verify it's accepting applications."""
@@ -579,6 +580,7 @@ class ApplicationCreateSerializer(serializers.Serializer):
                 candidate=candidate_profile,
                 job=job,
                 resume=resume,
+                cover_note=validated_data.get("cover_note", ""),
                 status=Application.Status.APPLIED,
             )
             application.refresh_from_db()
@@ -648,7 +650,7 @@ class ApplicationDetailSerializer(ApplicationListSerializer):
     history = serializers.SerializerMethodField()
 
     class Meta(ApplicationListSerializer.Meta):
-        fields = ApplicationListSerializer.Meta.fields + ["history"]
+        fields = ApplicationListSerializer.Meta.fields + ["cover_note", "history"]
         read_only_fields = fields
 
     def get_history(self, obj):
@@ -805,6 +807,10 @@ class ResumeDetailSerializer(serializers.Serializer):
     """
 
     id = serializers.UUIDField(read_only=True)
+    filename = serializers.SerializerMethodField()
+    file_url = serializers.SerializerMethodField()
+    file_size = serializers.SerializerMethodField()
+    uploaded_at = serializers.DateTimeField(read_only=True)
     status = serializers.CharField(read_only=True)
     processing_error = serializers.CharField(read_only=True)
     skills = serializers.SerializerMethodField()
@@ -814,6 +820,28 @@ class ResumeDetailSerializer(serializers.Serializer):
     match_score = serializers.SerializerMethodField()
     matched_skills = serializers.SerializerMethodField()
     missing_skills = serializers.SerializerMethodField()
+
+    def get_filename(self, obj: Resume) -> str | None:
+        if obj.original_filename:
+            return obj.original_filename
+        if obj.file:
+            import os
+            return os.path.basename(obj.file.name)
+        return None
+
+    def get_file_url(self, obj: Resume) -> str | None:
+        if not obj.file:
+            return None
+        request = self.context.get("request")
+        return request.build_absolute_uri(obj.file.url) if request else obj.file.url
+
+    def get_file_size(self, obj: Resume) -> int | None:
+        if not obj.file:
+            return None
+        try:
+            return obj.file.size
+        except (OSError, ValueError):
+            return None
 
     def _get_parsed(self, obj: Resume) -> "ParsedResume | Any | None":
         """Cached accessor for the related ParsedResume."""

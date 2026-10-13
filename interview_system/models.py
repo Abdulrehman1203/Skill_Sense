@@ -397,6 +397,7 @@ class Application(models.Model):
     resume = models.ForeignKey(
         Resume, on_delete=models.PROTECT, related_name="applications"
     )
+    cover_note = models.TextField(blank=True, default="")
     status = models.CharField(
         max_length=24, choices=Status.choices, default=Status.APPLIED
     )

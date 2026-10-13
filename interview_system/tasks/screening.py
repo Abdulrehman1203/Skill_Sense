@@ -11,7 +11,7 @@ from django.conf import settings
 from django.db import transaction
 from django.db.models import F, Q
 from django.utils import timezone
-from ..models import Application, ApplicationAssessment, ParsedResume, Resume, ScreeningEvent
+from ..models import Application, ApplicationAssessment, ParsedResume, Resume
 from ..screening import ACTIVE_STAGES, dispatch, evaluate
 
 logger = logging.getLogger(__name__)
@@ -127,12 +127,7 @@ def process_assessment(assessment_id):
             current.claim_token = None
             current.error_code = current.error_message = current.recovery_action = ""
             current.save()
-            if current.apply_decision and app.status in ("APPLIED", "UNDER_REVIEW"):
-                old = app.status
-                app.status, app.version = outcome, app.version + 1
-                app.save(update_fields=["status", "version", "updated_at"])
-                ScreeningEvent.objects.create(application=app, assessment=current, source="AUTOMATIC",
-                                              from_status=old, to_status=outcome, reason=", ".join(reasons))
+            # Screening records a recommendation; only recruiter actions change the stage.
     except ParseBusy:
         claimed.update(status="QUEUED", attempts=F("attempts") - 1, claim_token=None, lease_until=None,
                        next_attempt_at=timezone.now() + timedelta(seconds=15))
