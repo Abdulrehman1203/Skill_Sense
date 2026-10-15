@@ -116,9 +116,8 @@ def generate_candidate_score(self, application_id: str) -> dict:
     )
     logger.info("Candidate score persisted for application_id=%s", application_id)
 
-    # The Phase 4.5 notification stub takes a User id and an event dictionary.
-    # CandidateProfile uses User as its primary key, so candidate_id is that id.
-    from .notifications import send_notification
+    # Keep the final chain position, but notify the job owner by explicit User ID.
+    from ..notifications import queue_notification
 
-    send_notification.delay(str(app.candidate_id), event={"type": "score_ready"})
+    queue_notification(app.job.recruiter.user_id, "score_ready")
     return result

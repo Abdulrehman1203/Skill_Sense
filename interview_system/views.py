@@ -24,6 +24,8 @@ from rest_framework.views import APIView
 from rest_framework.viewsets import GenericViewSet, ModelViewSet
 
 from .integrations import retell_client
+from .audit import record_audit
+from .models import AuditLogEntry, CandidateScore, FrameAnalysis, IntegrityThresholds, Notification
 from .models import InterviewSession
 from .models import Application, CandidateProfile, Interview, Job, JobSkill, RecruiterProfile, Resume, ScoringRubric, User
 from .permissions import IsAdmin, IsApplicationAccessible, IsCandidate, IsJobOwner, IsRecruiter, IsResumeAccessible
@@ -34,6 +36,15 @@ from .serializers import (
     ApplicationCreateSerializer,
     ApplicationDetailSerializer,
     ApplicationListSerializer,
+    ApplicationRankingSerializer,
+    AuditLogSerializer,
+    IntegrityThresholdsSerializer,
+    NotificationSerializer,
+    NotificationListQuerySerializer,
+    NotificationUnreadCountSerializer,
+    NotificationMarkReadSerializer,
+    CandidateScoreQuerySerializer,
+    CandidateScoreResponseSerializer,
     CandidateProfileSerializer,
     StartVoiceSessionResponseSerializer,
     InterviewCreateSerializer,
@@ -60,6 +71,151 @@ class StandardResultsPagination(PageNumberPagination):
     page_size = 20
     page_size_query_param = "page_size"
     max_page_size = 100
+
+
+@extend_schema_view(get=extend_schema(
+    tags=["Notifications"], summary="List your notifications",
+    parameters=[NotificationListQuerySerializer],
+))
+class NotificationListView(generics.ListAPIView):
+    permission_classes = [IsAuthenticated]
+    serializer_class = NotificationSerializer
+    pagination_class = StandardResultsPagination
+    queryset = Notification.objects.none()
+
+    def get_queryset(self):
+        if getattr(self, "swagger_fake_view", False):
+            return self.queryset
+        params = self.request.query_params
+        if set(params) - {"is_read", "page", "page_size", "format"}:
+            raise ValidationError({"filters": "Unsupported notification filter."})
+        query = NotificationListQuerySerializer(data={"is_read": params["is_read"]} if "is_read" in params else {})
+        query.is_valid(raise_exception=True)
+        notifications = Notification.objects.filter(user=self.request.user)
+        if "is_read" in query.validated_data:
+            notifications = notifications.filter(is_read=query.validated_data["is_read"] == "true")
+        return notifications.order_by("-created_at", "-pk")
+
+
+class NotificationUnreadCountView(APIView):
+    permission_classes = [IsAuthenticated]
+
+    @extend_schema(tags=["Notifications"], summary="Count your unread notifications",
+                   responses={200: NotificationUnreadCountSerializer})
+    def get(self, request):
+        return Response({"unread_count": Notification.objects.filter(user=request.user, is_read=False).count()})
+
+
+class NotificationMarkReadView(APIView):
+    permission_classes = [IsAuthenticated]
+    http_method_names = ["patch", "options"]
+
+    @extend_schema(tags=["Notifications"], summary="Mark your notification as read",
+                   request=NotificationMarkReadSerializer,
+                   responses={200: NotificationSerializer, 400: OpenApiResponse(description="Only is_read: true is accepted."),
+                              404: OpenApiResponse(description="Notification not found.")})
+    def patch(self, request, pk):
+        notification = get_object_or_404(Notification.objects.filter(user=request.user), pk=pk)
+        serializer = NotificationMarkReadSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        if not notification.is_read:
+            Notification.objects.filter(pk=notification.pk, user=request.user, is_read=False).update(is_read=True)
+            notification.is_read = True
+        return Response(NotificationSerializer(notification).data)
+
+
+class AuditLogView(generics.ListAPIView):
+    permission_classes = [IsAuthenticated, IsAdmin]
+    serializer_class = AuditLogSerializer
+    pagination_class = StandardResultsPagination
+    queryset = AuditLogEntry.objects.order_by("-created_at", "-pk")
+
+
+class AdminAnalyticsView(APIView):
+    permission_classes = [IsAuthenticated, IsAdmin]
+
+    def get(self, request):
+        counts = dict(Application.objects.order_by().values("status").annotate(n=models.Count("pk")).values_list("status", "n"))
+        interviews = Interview.objects.aggregate(
+            done=models.Count("pk", filter=models.Q(status=Interview.Status.DONE)),
+            started=models.Count("pk", filter=models.Q(status__in=[Interview.Status.LIVE, Interview.Status.DONE])),
+        )
+        return Response({
+            "applications_by_status": {value: counts.get(value, 0) for value in Application.Status.values},
+            "average_score": CandidateScore.objects.aggregate(value=models.Avg("final_score"))["value"],
+            "interview_completion_rate": interviews["done"] / interviews["started"] if interviews["started"] else 0.0,
+        })
+
+
+class IntegrityThresholdsView(APIView):
+    permission_classes = [IsAuthenticated, IsAdmin]
+
+    @extend_schema(responses=IntegrityThresholdsSerializer)
+    def get(self, request):
+        from .integrity import thresholds
+        return Response(IntegrityThresholdsSerializer(thresholds()).data)
+
+    @extend_schema(request=IntegrityThresholdsSerializer, responses=IntegrityThresholdsSerializer)
+    def patch(self, request):
+        serializer = IntegrityThresholdsSerializer(data=request.data, partial=True)
+        serializer.is_valid(raise_exception=True)
+        with transaction.atomic():
+            limits, _ = IntegrityThresholds.objects.get_or_create(pk=1)
+            limits = IntegrityThresholds.objects.select_for_update().get(pk=1)
+            changed = [key for key, value in serializer.validated_data.items() if getattr(limits, key) != value]
+            for key in changed:
+                setattr(limits, key, serializer.validated_data[key])
+            if changed:
+                limits.save(update_fields=changed)
+                record_audit(actor=request.user, action="integrity_thresholds.updated", target=limits, changed_fields=changed)
+        return Response(IntegrityThresholdsSerializer(limits).data)
+
+
+class CandidateScoreView(APIView):
+    permission_classes = [IsAuthenticated, IsRecruiter]
+
+    @extend_schema(
+        tags=["Candidates"], parameters=[CandidateScoreQuerySerializer],
+        responses={200: CandidateScoreResponseSerializer},
+    )
+    def get(self, request, pk):
+        get_object_or_404(CandidateProfile, pk=pk)
+        query = CandidateScoreQuerySerializer(data=request.query_params)
+        query.is_valid(raise_exception=True)
+        applications = Application.objects.filter(
+            candidate_id=pk, job__recruiter__user=request.user,
+        ).select_related("score")
+        job_id = query.validated_data.get("job")
+        if job_id is not None:
+            job = get_object_or_404(Job, pk=job_id)
+            if job.recruiter_id != request.user.pk:
+                raise PermissionDenied("This job is not accessible.")
+            applications = applications.filter(job_id=job_id)
+        visible = list(applications.order_by("pk")[:2])
+        if not visible:
+            raise PermissionDenied("This candidate has no application accessible to you.")
+        if len(visible) > 1:
+            raise ValidationError({"job": "Multiple applications are accessible. Provide ?job={id}."})
+        score = getattr(visible[0], "score", None)
+        data = score if score is not None else {
+            "final_score": None,
+            "breakdown": {"match": None, "interview": None, "behavioral": None},
+            "explanation": "Score not ready.",
+        }
+        return Response(CandidateScoreResponseSerializer(data).data)
+
+
+class JobRankingView(generics.ListAPIView):
+    permission_classes = [IsAuthenticated, IsRecruiter, IsJobOwner]
+    serializer_class = ApplicationRankingSerializer
+    pagination_class = StandardResultsPagination
+
+    def get_queryset(self):
+        job = get_object_or_404(Job.objects.select_related("recruiter__user"), pk=self.kwargs["pk"])
+        self.check_object_permissions(self.request, job)
+        return Application.objects.filter(job=job).select_related(
+            "candidate__user", "score",
+        ).order_by(models.F("score__final_score").desc(nulls_last=True), "created_at", "pk")
 
 
 @extend_schema_view(
@@ -276,6 +432,8 @@ class InterviewViewSet(
             transaction.on_commit(
                 lambda interview_id=str(interview.pk): _generate.delay(interview_id)
             )
+            from .notifications import queue_notification
+            queue_notification(application.candidate.user_id, "interview_scheduled")
             # Snapshot before dispatch, including in eager development mode.
             result = InterviewSerializer(interview, context={"request": request}).data
 
@@ -292,6 +450,12 @@ class ScoringRubricViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, Gener
     serializer_class = ScoringRubricSerializer
     permission_classes = [IsAuthenticated, IsAdmin]
 
+    def perform_create(self, serializer):
+        with transaction.atomic():
+            rubric = serializer.save()
+            record_audit(actor=self.request.user, action="rubric.created", target=rubric,
+                         changed_fields=["weight_match", "weight_interview", "weight_behavioral"])
+
     @action(detail=True, methods=["post"])
     def activate(self, request: Request, pk: str | None = None) -> Response:
         with transaction.atomic():
@@ -304,6 +468,8 @@ class ScoringRubricViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, Gener
                 raise NotFound("Scoring rubric not found.")
             ScoringRubric.objects.filter(active=True).exclude(pk=target.pk).update(active=False)
             ScoringRubric.objects.filter(pk=target.pk).update(active=True)
+            if not target.active:
+                record_audit(actor=request.user, action="rubric.activated", target=target, changed_fields=["active"])
             target.active = True
         return Response(self.get_serializer(target).data, status=status.HTTP_200_OK)
 
@@ -338,7 +504,19 @@ class LoginRoleView(APIView):
     """Authenticate a prospective app session before frontend activation."""
 
     permission_classes = [IsAuthenticated]
+    serializer_class = UserResponseSerializer
 
+    @extend_schema(
+        tags=["Auth — User"],
+        summary="Authenticate and return user role and profile",
+        description="Returns the profile and role of the currently authenticated Clerk user.",
+        responses={
+            200: OpenApiResponse(
+                response=UserResponseSerializer,
+                description="Authenticated user role and profile.",
+            ),
+        },
+    )
     def get(self, request: Request) -> Response:
         return Response(UserResponseSerializer(request.user).data)
 
@@ -417,12 +595,18 @@ class MeView(APIView):
     patch=extend_schema(
         tags=["Recruiter Profile"],
         summary="Update recruiter profile (partial)",
-        description="Partial update of the self-owned recruiter profile.",
+        description=(
+            "Partial update of the self-owned recruiter profile. Upload a personal photo "
+            "as multipart/form-data field profile_image (up to 10 MB). Clerk stores the "
+            "image; the response returns its URL in user.profile_image_url. "
+            "company_logo is a separate company image."
+        ),
         responses={
             200: RecruiterProfileSerializer,
             400: OpenApiResponse(description="Invalid field input."),
             401: OpenApiResponse(description="Missing, invalid, or expired Clerk JWT."),
             403: OpenApiResponse(description="User is not a recruiter."),
+            502: OpenApiResponse(description="Clerk could not save the profile picture."),
         },
     ),
 )
@@ -435,6 +619,16 @@ class RecruiterProfileView(generics.RetrieveUpdateAPIView):
 
     permission_classes = [IsAuthenticated, IsRecruiter]
     serializer_class = RecruiterProfileSerializer
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def update(self, request, *args, **kwargs):
+        unknown_files = set(request.FILES) - {"profile_image", "company_logo"}
+        if unknown_files:
+            raise ValidationError({
+                name: "Unknown upload field. Use profile_image for a personal photo."
+                for name in unknown_files
+            })
+        return super().update(request, *args, **kwargs)
 
     def get_object(self) -> RecruiterProfile:
         profile = getattr(self.request.user, "recruiter_profile", None)
@@ -777,6 +971,7 @@ class ApplicationViewSet(
         PATCH  /api/applications/{id}/advance/   — IsRecruiter + job-owner
     """
 
+    queryset = Application.objects.none()
     pagination_class = StandardResultsPagination
     parser_classes = [MultiPartParser, FormParser, JSONParser]
 
@@ -809,7 +1004,21 @@ class ApplicationViewSet(
         from decimal import Decimal, InvalidOperation
         from uuid import UUID
         user = cast(User, self.request.user)
-        qs = Application.objects.select_related("job", "resume", "candidate__user", "current_assessment").prefetch_related("interviews").order_by("-created_at", "-pk")
+        interviews = Interview.objects.select_related("session__behavioral_analysis").annotate(
+            has_behavioral_frames=models.Exists(FrameAnalysis.objects.filter(session__interview_id=models.OuterRef("pk"))),
+        ).order_by("-created_at", "-pk")
+        qs = Application.objects.select_related("job", "resume", "candidate__user", "current_assessment").prefetch_related(
+            models.Prefetch("interviews", queryset=interviews),
+        ).annotate(
+            integrity_look_away_limit=models.functions.Coalesce(
+                models.Subquery(IntegrityThresholds.objects.filter(pk=1).values("look_away_limit")[:1]),
+                models.Value(IntegrityThresholds().look_away_limit),
+            ),
+            integrity_flag_limit=models.functions.Coalesce(
+                models.Subquery(IntegrityThresholds.objects.filter(pk=1).values("integrity_flag_limit")[:1]),
+                models.Value(IntegrityThresholds().integrity_flag_limit),
+            ),
+        ).order_by("-created_at", "-pk")
         if user.role == User.Role.CANDIDATE:
             qs = qs.filter(candidate__user=user)
         elif user.role == User.Role.RECRUITER:
@@ -875,7 +1084,10 @@ class ApplicationViewSet(
         obj = self.get_object()
         payload = ScreeningActionSerializer(data=request.data)
         payload.is_valid(raise_exception=True)
-        app = transition(obj.pk, target, actor=request.user, **payload.validated_data)
+        with transaction.atomic():
+            app = transition(obj.pk, target, actor=request.user, **payload.validated_data)
+            from .notifications import queue_notification
+            queue_notification(app.candidate.user_id, "application_status_changed")
         return Response(ApplicationDetailSerializer(app, context={"request": request}).data)
 
     @extend_schema(request=ScreeningActionSerializer, responses={200: ApplicationDetailSerializer})
@@ -971,8 +1183,11 @@ class ApplicationViewSet(
         # Preserve the legacy downstream decision contract for the later interview phase.
         serializer = ApplicationAdvanceSerializer(data=request.data, context={"application": application})
         serializer.is_valid(raise_exception=True)
-        application.status = serializer.validated_data["status"]
-        application.save(update_fields=["status", "updated_at"])
+        with transaction.atomic():
+            application.status = serializer.validated_data["status"]
+            application.save(update_fields=["status", "updated_at"])
+            from .notifications import queue_notification
+            queue_notification(application.candidate.user_id, "application_status_changed")
         return Response(ApplicationDetailSerializer(application, context={"request": request}).data)
 
 

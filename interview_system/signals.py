@@ -35,5 +35,7 @@ def enqueue_resume_parsing(
 
     from .screening import create_assessment
     create_assessment(instance.pk)
+    from .notifications import queue_notification
+    queue_notification(instance.job.recruiter.user_id, "application_received")
 
 

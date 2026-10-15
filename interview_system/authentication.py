@@ -198,14 +198,14 @@ class ClerkJWTAuthentication(BaseAuthentication):
                 raise AuthenticationFailed("Signing key not found in Clerk JWKS.")
 
             decode_options: dict[str, Any] = {"verify_aud": False}
-            if getattr(settings, "DEBUG", False):
-                decode_options["verify_exp"] = False
 
             payload = jwt.decode(
                 token,
                 key=signing_key.key,
                 algorithms=["RS256"],
                 options=decode_options,
+                # Allow small issuer/server clock differences, including iat/nbf.
+                leeway=5,
             )
             return payload
 

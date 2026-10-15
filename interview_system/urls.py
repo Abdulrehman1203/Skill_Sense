@@ -10,13 +10,21 @@ from rest_framework.routers import DefaultRouter
 
 from .views import (
     ApplicationViewSet,
+    AuditLogView,
+    AdminAnalyticsView,
+    IntegrityThresholdsView,
     CandidateProfileView,
+    CandidateScoreView,
     CandidateResumeViewSet,
     JobSkillViewSet,
     JobViewSet,
+    JobRankingView,
     InterviewViewSet,
     LoginRoleView,
     MeView,
+    NotificationListView,
+    NotificationUnreadCountView,
+    NotificationMarkReadView,
     RecruiterProfileView,
     ResumeDetailView,
     ScoringRubricViewSet,
@@ -43,6 +51,12 @@ job_skill_detail = JobSkillViewSet.as_view(
 )
 
 urlpatterns = [
+    path("notifications/", NotificationListView.as_view(), name="notification-list"),
+    path("notifications/unread-count/", NotificationUnreadCountView.as_view(), name="notification-unread-count"),
+    path("notifications/<uuid:pk>/", NotificationMarkReadView.as_view(), name="notification-mark-read"),
+    path("admin/audit-log/", AuditLogView.as_view(), name="admin-audit-log"),
+    path("admin/analytics/", AdminAnalyticsView.as_view(), name="admin-analytics"),
+    path("admin/integrity-thresholds/", IntegrityThresholdsView.as_view(), name="admin-integrity-thresholds"),
     path("webhooks/retell/call-ended/", RetellCallEndedView.as_view(), name="retell-call-ended"),
     # Manual endpoints
     path("auth/clerk/webhook/", ClerkWebhookView.as_view(), name="clerk-webhook"),
@@ -52,6 +66,8 @@ urlpatterns = [
     # Profile endpoints
     path("recruiters/profile/", RecruiterProfileView.as_view(), name="recruiter-profile"),
     path("candidates/profile/", CandidateProfileView.as_view(), name="candidate-profile"),
+    path("candidates/<uuid:pk>/score/", CandidateScoreView.as_view(), name="candidate-score"),
+    path("jobs/<uuid:pk>/ranking/", JobRankingView.as_view(), name="job-ranking"),
 
     # Nested job skills
     path("jobs/<uuid:job_pk>/skills/", job_skill_list, name="job-skill-list"),

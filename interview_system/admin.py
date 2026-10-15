@@ -6,6 +6,9 @@ with sensible column displays, filters, and inlines.
 """
 
 from django.contrib import admin
+from django.db import transaction
+
+from .audit import admin_actor, record_audit
 
 from .models import (
     Application,
@@ -67,9 +70,34 @@ class ResponseInline(admin.TabularInline):
 
 # ── User Admin ───────────────────────────────────────────────
 
+class AuditedAdminMixin(admin.ModelAdmin):
+    audit_fields = ()
+
+    def save_model(self, request, obj, form, change):
+        with transaction.atomic():
+            previous = type(obj).objects.select_for_update().get(pk=obj.pk) if change else None
+            changed = [name for name in self.audit_fields if previous is not None and getattr(previous, name) != getattr(obj, name)]
+            if isinstance(obj, ScoringRubric):
+                action = "rubric.created" if previous is None else (
+                    "rubric.activated" if "active" in changed and obj.active else "rubric.updated" if changed else None
+                )
+                if previous is None:
+                    changed = list(self.audit_fields)
+            elif isinstance(obj, User):
+                action = ("account.activated" if obj.is_active else "account.deactivated") if changed else None
+            else:
+                action = "job.status_changed" if changed else None
+            actor = admin_actor(request.user) if action else None
+            super().save_model(request, obj, form, change)
+            if action:
+                record_audit(actor=actor, action=action, target=obj, changed_fields=changed)
+
+
 @admin.register(User)
-class UserAdmin(admin.ModelAdmin):
+class UserAdmin(AuditedAdminMixin, admin.ModelAdmin):
     """Admin view for the Clerk-based User record."""
+
+    audit_fields = ("is_active",)
 
     list_display = ("email", "clerk_id", "role", "is_active", "created_at", "updated_at")
     list_filter = ("role", "is_active")
@@ -104,7 +132,8 @@ class CandidateProfileAdmin(admin.ModelAdmin):
 # ── Job Admin ────────────────────────────────────────────────
 
 @admin.register(Job)
-class JobAdmin(admin.ModelAdmin):
+class JobAdmin(AuditedAdminMixin, admin.ModelAdmin):
+    audit_fields = ("status",)
     list_display = ("title", "recruiter", "status", "job_type", "experience_level", "created_at")
     list_filter = ("status", "job_type", "experience_level")
     search_fields = ("title", "skills_required")
@@ -182,7 +211,8 @@ class FrameAnalysisAdmin(admin.ModelAdmin):
 
 
 @admin.register(ScoringRubric)
-class ScoringRubricAdmin(admin.ModelAdmin):
+class ScoringRubricAdmin(AuditedAdminMixin, admin.ModelAdmin):
+    audit_fields = ("weight_match", "weight_interview", "weight_behavioral", "active")
     list_display = ("name", "weight_match", "weight_interview", "weight_behavioral", "active")
     list_filter = ("active",)
 
@@ -205,3 +235,14 @@ class AuditLogEntryAdmin(admin.ModelAdmin):
     list_display = ("actor", "action", "target_type", "target_id", "created_at")
     list_filter = ("action", "target_type")
     search_fields = ("target_id",)
+    readonly_fields = tuple(field.name for field in AuditLogEntry._meta.fields)
+    actions = None
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False

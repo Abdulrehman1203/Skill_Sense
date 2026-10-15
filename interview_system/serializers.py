@@ -16,6 +16,9 @@ from rest_framework import serializers
 from .models import (
     Application,
     ApplicationAssessment,
+    AuditLogEntry,
+    IntegrityThresholds,
+    Notification,
     CandidateProfile,
     Interview,
     Job,
@@ -83,6 +86,7 @@ try:
     _extend_image_field = extend_schema_field(OpenApiTypes.STR)
 except ImportError:
     def _extend_image_field(cls): return cls
+    def extend_schema_field(field): return lambda f: f
 
 
 @_extend_image_field
@@ -121,6 +125,10 @@ class RecruiterProfileSerializer(serializers.ModelSerializer):
 
     user = UserSummarySerializer(read_only=True)
     company_logo = ImageOrURLField(source="*", required=False, allow_null=True)
+    profile_image = serializers.ImageField(
+        required=False, write_only=True,
+        help_text="Personal profile photo uploaded to Clerk. Returned as user.profile_image_url.",
+    )
     company_size = serializers.ChoiceField(
         choices=[
             ("1-10", "1-10"),
@@ -140,6 +148,7 @@ class RecruiterProfileSerializer(serializers.ModelSerializer):
             "phone",
             "company_name",
             "company_logo",
+            "profile_image",
             "industry",
             "position",
             "company_size",
@@ -150,6 +159,23 @@ class RecruiterProfileSerializer(serializers.ModelSerializer):
         if value is not None and not value.strip():
             raise serializers.ValidationError("Company name cannot be blank.")
         return value.strip() if value else ""
+
+    def validate_profile_image(self, value):
+        if value.size > 10 * 1024 * 1024:
+            raise serializers.ValidationError("Profile picture must be 10 MB or smaller.")
+        return value
+
+    def update(self, instance, validated_data):
+        from .profile_images import upload_profile_image
+
+        image = validated_data.pop("profile_image", None)
+        image_url = upload_profile_image(instance.user, image) if image is not None else None
+        with transaction.atomic():
+            instance = super().update(instance, validated_data)
+            if image_url is not None:
+                instance.user.profile_image_url = image_url
+                instance.user.save(update_fields=["profile_image_url", "updated_at"])
+        return instance
 
     def validate_phone(self, value: str) -> str:
         return validate_phone_format(value)
@@ -605,14 +631,17 @@ class AssessmentSerializer(serializers.ModelSerializer):
                   "error_code", "error_message", "recovery_action", "attempts", "created_at", "completed_at"]
         read_only_fields = fields
 
-    def get_threshold(self, obj):
+    @extend_schema_field(serializers.FloatField(allow_null=True))
+    def get_threshold(self, obj) -> float | None:
         return obj.policy.get("screening_threshold")
 
-    def get_policy_version(self, obj):
+    @extend_schema_field(serializers.CharField(allow_null=True))
+    def get_policy_version(self, obj) -> str | None:
         return obj.policy.get("version")
 
 
 class ApplicationListSerializer(serializers.ModelSerializer):
+    integrity_review = serializers.SerializerMethodField()
     job_title = serializers.CharField(source="job.title", read_only=True)
     candidate_email = serializers.EmailField(source="candidate.user.email", read_only=True)
     candidate_name = serializers.SerializerMethodField()
@@ -626,24 +655,127 @@ class ApplicationListSerializer(serializers.ModelSerializer):
         model = Application
         fields = ["id", "candidate", "candidate_email", "candidate_name", "job", "job_title", "resume_id",
                   "status", "version", "assessment", "match_score", "allowed_actions", "eligible_for_interview",
-                  "created_at", "updated_at"]
+                  "created_at", "updated_at", "integrity_review"]
         read_only_fields = fields
 
-    def get_candidate_name(self, obj):
+    def get_integrity_review(self, obj):
+        request = self.context.get("request")
+        if not request or request.user.role != User.Role.RECRUITER:
+            return None
+        from .integrity import review_context, thresholds
+        if "integrity_thresholds" not in self.context:
+            self.context["integrity_thresholds"] = (
+                IntegrityThresholds(look_away_limit=obj.integrity_look_away_limit,
+                                    integrity_flag_limit=obj.integrity_flag_limit)
+                if hasattr(obj, "integrity_look_away_limit") else thresholds()
+            )
+        return review_context(obj, self.context["integrity_thresholds"])
+
+    @extend_schema_field(serializers.CharField())
+    def get_candidate_name(self, obj) -> str:
         user = obj.candidate.user
         return f"{user.first_name} {user.last_name}".strip() or user.email
 
-    def get_match_score(self, obj):
+    @extend_schema_field(serializers.FloatField(allow_null=True))
+    def get_match_score(self, obj) -> float | None:
         a = obj.current_assessment
         return a.match_score if a and a.status == "SUCCEEDED" else None
 
-    def get_allowed_actions(self, obj):
+    @extend_schema_field(serializers.ListField(child=serializers.CharField()))
+    def get_allowed_actions(self, obj) -> list[str]:
         from .screening import permitted_actions
         request = self.context.get("request")
         return permitted_actions(obj, request.user) if request else []
 
-    def get_eligible_for_interview(self, obj):
+    @extend_schema_field(serializers.BooleanField())
+    def get_eligible_for_interview(self, obj) -> bool:
         return obj.status in ("SHORTLISTED", "SCREENED") and not obj.interviews.all()
+
+
+class NotificationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Notification
+        fields = ["id", "type", "message", "is_read", "created_at"]
+        read_only_fields = fields
+
+
+class NotificationListQuerySerializer(serializers.Serializer):
+    is_read = serializers.ChoiceField(choices=["true", "false"], required=False)
+
+
+class NotificationUnreadCountSerializer(serializers.Serializer):
+    unread_count = serializers.IntegerField(min_value=0, read_only=True)
+
+
+class NotificationMarkReadSerializer(serializers.Serializer):
+    is_read = serializers.BooleanField(required=True)
+
+    def validate_is_read(self, value):
+        if self.initial_data.get("is_read") is not True:
+            raise serializers.ValidationError("Use the JSON boolean true to mark a notification as read.")
+        return value
+
+    def validate(self, attrs):
+        if set(self.initial_data) - {"is_read"}:
+            raise serializers.ValidationError("Only is_read may be updated.")
+        return attrs
+
+
+class AuditLogSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AuditLogEntry
+        fields = ["actor", "action", "target_type", "target_id", "metadata", "created_at"]
+        read_only_fields = fields
+
+
+class StrictNonNegativeIntegerField(serializers.IntegerField):
+    def to_internal_value(self, data):
+        if type(data) is not int:
+            self.fail("invalid")
+        return super().to_internal_value(data)
+
+
+class IntegrityThresholdsSerializer(serializers.ModelSerializer):
+    look_away_limit = StrictNonNegativeIntegerField(min_value=0, max_value=2147483647, required=False)
+    integrity_flag_limit = StrictNonNegativeIntegerField(min_value=0, max_value=2147483647, required=False)
+
+    class Meta:
+        model = IntegrityThresholds
+        fields = ["look_away_limit", "integrity_flag_limit"]
+
+    def validate(self, attrs):
+        if set(self.initial_data) - set(self.fields):
+            raise serializers.ValidationError("Unknown threshold field.")
+        return attrs
+
+
+class ScoreBreakdownSerializer(serializers.Serializer):
+    match = serializers.FloatField(allow_null=True, default=None, read_only=True)
+    interview = serializers.FloatField(allow_null=True, default=None, read_only=True)
+    behavioral = serializers.FloatField(allow_null=True, default=None, read_only=True)
+
+
+class CandidateScoreResponseSerializer(serializers.Serializer):
+    final_score = serializers.FloatField(allow_null=True, read_only=True)
+    breakdown = ScoreBreakdownSerializer(read_only=True)
+    explanation = serializers.CharField(read_only=True)
+
+
+class CandidateScoreQuerySerializer(serializers.Serializer):
+    job = serializers.UUIDField(required=False)
+
+
+class ApplicationRankingSerializer(ApplicationListSerializer):
+    """Reuse the candidate identity fields already visible in application lists."""
+
+    final_score = serializers.FloatField(
+        source="score.final_score", allow_null=True, default=None, read_only=True,
+    )
+
+    class Meta:
+        model = Application
+        fields = ["id", "candidate", "candidate_email", "candidate_name", "final_score"]
+        read_only_fields = fields
 
 
 class ApplicationDetailSerializer(ApplicationListSerializer):
@@ -653,7 +785,8 @@ class ApplicationDetailSerializer(ApplicationListSerializer):
         fields = ApplicationListSerializer.Meta.fields + ["cover_note", "history"]
         read_only_fields = fields
 
-    def get_history(self, obj):
+    @extend_schema_field(serializers.ListField(child=serializers.DictField()))
+    def get_history(self, obj) -> list[dict]:
         request = self.context.get("request")
         if not request or request.user.role != User.Role.RECRUITER:
             return []

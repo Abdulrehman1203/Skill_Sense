@@ -24,4 +24,6 @@ __all__ = (
     "aggregate_behavioral",
     "generate_candidate_score",
     "send_notification",
+    "process_assessment",
+    "recover_stalled_assessments",
 )
