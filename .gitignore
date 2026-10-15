@@ -57,9 +57,13 @@ secrets.json
 .coverage
 htmlcov/
 .pytest_cache/
+tests/
+**/tests/
+test_*.py
+*_test.py
 
 review/
-interview_system/tests/
+docs/
 
 # ── Temporary / AI scratch files ─────────────────────────────
 tmp_genai/
@@ -69,6 +73,3 @@ celerybeat-schedule.bak
 celerybeat-schedule.dat
 celerybeat-schedule.dir
 celerybeat-schedule
-
-# -- Temporary test / scratch files --
-interview_system/test_screening.py

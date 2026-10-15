@@ -829,6 +829,18 @@ class Notification(models.Model):
 #  AuditLogEntry
 # ═══════════════════════════════════════════════════════════════
 
+class IntegrityThresholds(models.Model):
+    """Display-only configuration; the database permits only singleton key 1."""
+
+    id = models.PositiveSmallIntegerField(primary_key=True, default=1, editable=False)
+    look_away_limit = models.PositiveIntegerField(default=5)
+    integrity_flag_limit = models.PositiveIntegerField(default=1)
+
+    class Meta:
+        db_table = "integrity_thresholds"
+        constraints = [models.CheckConstraint(condition=models.Q(id=1), name="integrity_thresholds_singleton")]
+
+
 class AuditLogEntry(models.Model):
     """Immutable audit trail entry for system/user actions."""
 
