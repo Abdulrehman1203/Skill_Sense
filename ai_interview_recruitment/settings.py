@@ -235,6 +235,11 @@ CHANNEL_LAYERS = {'default': {
 }}
 INTERVIEW_ANALYSIS_WS_ALLOWED_ORIGINS = [s.strip() for s in os.getenv('INTERVIEW_ANALYSIS_WS_ALLOWED_ORIGINS',
     'http://localhost:3000,http://localhost:50893,http://localhost:50894,http://127.0.0.1:50893,http://127.0.0.1:50894').split(',') if s.strip()]
+# Flutter assigns a random browser port unless --web-port is supplied.
+# The middleware also requires DEBUG, so a production overlay cannot enable this.
+INTERVIEW_ANALYSIS_WS_ALLOW_DEV_LOOPBACK_PORTS = os.getenv(
+    'INTERVIEW_ANALYSIS_WS_ALLOW_DEV_LOOPBACK_PORTS', 'True'
+).lower() in ('true', '1', 'yes')
 INTERVIEW_ANALYSIS_MAX_MESSAGE_BYTES = 307200
 INTERVIEW_ANALYSIS_MAX_JPEG_BYTES = 204800
 INTERVIEW_ANALYSIS_MAX_PIXELS = 921600
