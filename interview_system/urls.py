@@ -31,6 +31,8 @@ from .views import (
 )
 from .webhook_views import ClerkWebhookView
 from .retell_webhook import RetellCallEndedView
+from .socket_ticket_views import SocketTicketView
+from .video_views import FinishVideoView
 
 app_name = "interview_system"
 
@@ -50,7 +52,14 @@ job_skill_detail = JobSkillViewSet.as_view(
     {"get": "retrieve", "put": "update", "patch": "partial_update", "delete": "destroy"}
 )
 
+from .analysis_views import AnalysisStatusView, BehavioralReportView, AnalysisSnapshotView
+
 urlpatterns = [
+    path("interview-sessions/<uuid:pk>/analysis-status/", AnalysisStatusView.as_view(), name="analysis-status"),
+    path("interview-sessions/<uuid:pk>/behavioral-analysis/", BehavioralReportView.as_view(), name="behavioral-analysis"),
+    path("interview-sessions/<uuid:pk>/analysis-snapshot/", AnalysisSnapshotView.as_view(), name="analysis-snapshot"),
+    path("interview-sessions/<uuid:pk>/finish-video/", FinishVideoView.as_view(), name="finish-video"),
+    path("interview-sessions/<uuid:pk>/ws-ticket/", SocketTicketView.as_view(), name="ws-ticket"),
     path("notifications/", NotificationListView.as_view(), name="notification-list"),
     path("notifications/unread-count/", NotificationUnreadCountView.as_view(), name="notification-unread-count"),
     path("notifications/<uuid:pk>/", NotificationMarkReadView.as_view(), name="notification-mark-read"),

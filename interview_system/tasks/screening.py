@@ -1,6 +1,6 @@
 """Durable, repeatable application screening. Beat recovers unpublished/expired work."""
 from datetime import timedelta
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 import hashlib
 import logging
 import random
@@ -106,10 +106,13 @@ def process_assessment(assessment_id):
             return
         from ai.matching.sbert import match
         policy = assessment.policy
-        result = match(parsed.raw_text, "\n".join(policy[k] for k in ("title", "description", "requirements")), policy["skills_required"])
-        score = Decimal(str(result["similarity"] * 100)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        if not score.is_finite() or not 0 <= score <= 100:
-            raise ValueError("Invalid matcher score")
+        try:
+            result = match(parsed.raw_text, "\n".join(policy[k] for k in ("title", "description", "requirements")), policy["skills_required"])
+            score = Decimal(str(result["similarity"] * 100)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            if not score.is_finite() or not 0 <= score <= 100:
+                raise ValueError("Invalid matcher score")
+        except (ValueError, TypeError, KeyError, InvalidOperation):
+            raise ScreeningFailure("MATCHER_INVALID_RESULT", "Matching returned invalid evidence. Contact support before retrying.", "RETRY") from None
         if not claimed.update(status="SCREENING"):
             return
         criteria, eligibility, outcome, reasons = evaluate(policy, parsed, score)

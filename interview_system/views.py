@@ -24,6 +24,7 @@ from rest_framework.views import APIView
 from rest_framework.viewsets import GenericViewSet, ModelViewSet
 
 from .integrations import retell_client
+from .voice_views import VoiceInterviewMixin
 from .audit import record_audit
 from .models import AuditLogEntry, CandidateScore, FrameAnalysis, IntegrityThresholds, Notification
 from .models import InterviewSession
@@ -38,6 +39,7 @@ from .serializers import (
     ApplicationListSerializer,
     ApplicationRankingSerializer,
     AuditLogSerializer,
+    AdminAnalyticsSerializer,
     IntegrityThresholdsSerializer,
     NotificationSerializer,
     NotificationListQuerySerializer,
@@ -134,6 +136,7 @@ class AuditLogView(generics.ListAPIView):
 class AdminAnalyticsView(APIView):
     permission_classes = [IsAuthenticated, IsAdmin]
 
+    @extend_schema(responses=AdminAnalyticsSerializer)
     def get(self, request):
         counts = dict(Application.objects.order_by().values("status").annotate(n=models.Count("pk")).values_list("status", "n"))
         interviews = Interview.objects.aggregate(
@@ -223,6 +226,7 @@ class JobRankingView(generics.ListAPIView):
     retrieve=extend_schema(tags=["Interviews"], summary="Retrieve an interview"),
 )
 class InterviewViewSet(
+    VoiceInterviewMixin,
     mixins.CreateModelMixin,
     mixins.ListModelMixin,
     mixins.RetrieveModelMixin,
@@ -235,7 +239,7 @@ class InterviewViewSet(
     pagination_class = StandardResultsPagination
 
     def get_permissions(self) -> list[Any]:
-        if self.action in ("list", "retrieve"):
+        if self.action in ("list", "retrieve", "start_voice_session", "voice_session", "end_voice_session", "sync_voice_session"):
             return [IsAuthenticated()]
         return [IsAuthenticated(), IsRecruiter()]
 
@@ -262,74 +266,6 @@ class InterviewViewSet(
         return Interview.objects.none()
 
     @extend_schema(
-        tags=["Interviews"],
-        summary="Start a live interview session",
-        request=None,
-        responses={
-            201: StartVoiceSessionResponseSerializer,
-            400: OpenApiResponse(description="Interview is not SCHEDULED, has no approved questions, or already has a session."),
-            403: OpenApiResponse(description="Recruiter does not own the linked job."),
-            404: OpenApiResponse(description="Interview does not exist."),
-        },
-    )
-    @action(detail=True, methods=["post"], url_path="start-voice-session")
-    def start_voice_session(self, request, pk=None):
-        with transaction.atomic():
-            # Use the same parent lock as question review/generation. A second
-            # start waits, then sees LIVE instead of creating another session.
-            # Deliberately do not use the owner-filtered get_queryset(): this
-            # action requires 403 for an existing interview owned by someone else.
-            interview = get_object_or_404(
-                Interview.objects.select_for_update(), pk=pk,
-            )
-            if interview.application.job.recruiter.user_id != request.user.pk:
-                raise PermissionDenied("You do not own this interview's linked job.")
-            if interview.status != Interview.Status.SCHEDULED:
-                raise ValidationError({
-                    "status": (
-                        "Interview must be SCHEDULED to start a voice session; "
-                        f"current status is '{interview.status}'."
-                    ),
-                })
-            approved_questions = list(
-                interview.questions.select_for_update().filter(approved=True)
-                .order_by("created_at", "pk")
-            )
-            # FR-22: unapproved questions never satisfy the gate or reach Retell.
-            if not approved_questions:
-                raise ValidationError({
-                    "questions": "At least one approved question is required to start the interview.",
-                })
-            if InterviewSession.objects.filter(interview=interview).exists():
-                raise ValidationError({"session": "This interview already has a session."})
-            session = InterviewSession.objects.create(
-                interview=interview, started_at=timezone.now(),
-            )
-            interview.retell_session_id = None
-            try:
-                interview.retell_session_id = retell_client.create_session(
-                    interview, approved_questions,
-                )
-            except retell_client.RetellUnavailableError as exc:
-                # Expected external failure is caught INSIDE atomic: the local
-                # session and LIVE status must still commit for recruiter-led
-                # questions and Phase 8 analysis. DB/programming errors propagate.
-                # Step 1 guarantees sanitized exception messages; never log a
-                # request, response, credentials, or provider exception traceback.
-                logger.warning(
-                    "Retell session creation failed; proceeding without voice: "
-                    "interview_id=%s interview_session_id=%s reason=%s",
-                    interview.pk, session.pk, str(exc),
-                )
-            interview.status = Interview.Status.LIVE
-            interview.save(update_fields=["status", "retell_session_id", "updated_at"])
-            result = StartVoiceSessionResponseSerializer({
-                "interview_session_id": session.pk,
-                "retell_session_id": interview.retell_session_id,
-            }).data
-        return Response(result, status=status.HTTP_201_CREATED)
-
-    @extend_schema(
         methods=["GET"], responses={200: InterviewQuestionSerializer(many=True)},
     )
     @extend_schema(
@@ -348,6 +284,8 @@ class InterviewViewSet(
             # Share this parent lock with generation, serializing changes to
             # the question set without locking throughout a Gemini request.
             interview = get_object_or_404(self.get_queryset().select_for_update(), pk=pk)
+            if interview.status != Interview.Status.SCHEDULED:
+                raise ValidationError({"questions": "Questions cannot change after an interview starts."})
             serializer = InterviewQuestionsPatchSerializer(data=request.data)
             serializer.is_valid(raise_exception=True)
             items = serializer.validated_data["questions"]
@@ -747,7 +685,7 @@ class JobViewSet(ModelViewSet):
         return JobSerializer
 
     def get_permissions(self) -> list[Any]:
-        if self.action in ("list", "retrieve"):
+        if self.action in ("list", "retrieve", "start_voice_session", "voice_session", "end_voice_session", "sync_voice_session"):
             return [IsAuthenticated()]
         if self.action == "create":
             return [IsAuthenticated(), IsRecruiter()]
@@ -853,7 +791,7 @@ class JobSkillViewSet(ModelViewSet):
     serializer_class = JobSkillSerializer
 
     def get_queryset(self):
-        if self.action in ("list", "retrieve"):
+        if self.action in ("list", "retrieve", "start_voice_session", "voice_session", "end_voice_session", "sync_voice_session"):
             user = self.request.user
             visible_jobs = Job.objects.filter(status=Job.Status.ACTIVE)
             if user and user.is_authenticated and getattr(user, "role", None) == User.Role.RECRUITER:
@@ -866,7 +804,7 @@ class JobSkillViewSet(ModelViewSet):
         return JobSkill.objects.filter(job=job)
 
     def get_permissions(self) -> list[Any]:
-        if self.action in ("list", "retrieve"):
+        if self.action in ("list", "retrieve", "start_voice_session", "voice_session", "end_voice_session", "sync_voice_session"):
             return [AllowAny()]
         return [IsAuthenticated(), IsRecruiter(), IsJobOwner()]
 

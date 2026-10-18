@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "synthetic_only": true,
+  "accuracy_validation": "outstanding",
+  "environment": {
+    "python": "3.12.7",
+    "platform": "Windows-11-10.0.26300-SP0",
+    "processor": "Intel64 Family 6 Model 141 Stepping 1, GenuineIntel",
+    "device": "cpu",
+    "packages": {
+      "mediapipe": "0.10.21",
+      "onnxruntime": "1.20.1",
+      "numpy": "1.26.4",
+      "opencv-contrib-python": "4.11.0.86"
+    }
+  },
+  "model_version": "mp1-64184e229b26-y8nonnx-6f987f27fdd4",
+  "config_version": "config-v1-ab14d086e77d7811",
+  "cold_load_and_warmup_seconds": 2.1749,
+  "rss_baseline_bytes": 26402816,
+  "sampled_process_peak_rss_bytes": 232910848,
+  "latency_ms": {
+    "dark": {
+      "count": 5,
+      "median": 12.8597,
+      "max": 13.6423
+    },
+    "flat": {
+      "count": 5,
+      "median": 12.8052,
+      "max": 13.2453
+    },
+    "noise": {
+      "count": 5,
+      "median": 111.1721,
+      "max": 117.7785
+    }
+  },
+  "gpu_measurement": "not_performed",
+  "hardware_name": "Intel Core i5-11400H, 6 cores / 12 logical processors",
+  "scope_note": "Real model execution on synthetic pixels only; no consented real clips supplied. No accuracy, GPU, production RSS budget or deployment claim."
+}

@@ -1,0 +1,11 @@
+# Dedicated private primary; never share this process with broker/cache/channels.
+# Loopback template: for a remote service configure TLS/ACL before exposure.
+bind 127.0.0.1
+protected-mode yes
+port 6381
+save ""
+appendonly no
+maxmemory 128mb
+maxmemory-policy noeviction
+# No replicaof, replicas, backup agent, volume snapshot or image-bearing logs.
+# ACL credentials belong in a separate secret file; never commit them here.

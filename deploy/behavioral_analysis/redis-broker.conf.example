@@ -1,0 +1,11 @@
+# Separate broker primary; capacity proposal, not measured production sizing.
+bind 127.0.0.1
+protected-mode yes
+port 6380
+save ""
+appendonly yes
+appendfsync everysec
+maxmemory 256mb
+maxmemory-policy noeviction
+# Durable PostgreSQL recovery owns InterviewAnalysis jobs; AOF can lose the last second.
+# Other application tasks need their own recovery review. Never share payloads.

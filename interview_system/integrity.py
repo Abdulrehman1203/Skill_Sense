@@ -14,6 +14,9 @@ def review_context(application, limits):
         analysis = getattr(session, "behavioral_analysis", None)
         if analysis is None or not getattr(interview, "has_behavioral_frames", False):
             continue
+        if analysis.report_schema_version != 0:
+            # B6 observation episodes are not adjudicated integrity findings.
+            continue
         # Conservative exclusion of both known historical Phase 4.5 signatures.
         if not analysis.integrity_flags and (
             (analysis.attention_pct == 94.5 and analysis.look_away_count == 2)

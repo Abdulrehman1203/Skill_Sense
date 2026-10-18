@@ -14,8 +14,14 @@ from .interviewing import (
 from .notifications import send_notification
 from .parsing import compute_match_score, parse_resume
 from .screening import process_assessment, recover_stalled_assessments
+from .retell import process_retell_event, recover_retell
+from .video import recover_video
+from .vision import process_frame, warm_vision
 
 __all__ = (
+    "process_frame",
+    "warm_vision",
+    "recover_video",
     "parse_resume",
     "compute_match_score",
     "schedule_interview",

@@ -46,14 +46,17 @@ def _interview_signal(application_id: str) -> float | None:
 
 
 def _behavioral_signal(application_id: str) -> dict | None:
-    """Read Phase 8 aggregate data if a linked analysis is available."""
+    """Read Interview Analysis aggregate data if a linked analysis is available."""
     try:
         analysis_model = apps.get_model("interview_system", "BehavioralAnalysis")
     except LookupError:
         return None
     analysis = (
         analysis_model.objects
-        .filter(session__interview__application_id=application_id, attention_pct__isnull=False)
+        # B6 reports are observations, not validated scoring signals. Preserve
+        # legacy policy/rows; never opt B6 in by a coincidental numeric value.
+        .filter(session__interview__application_id=application_id, attention_pct__isnull=False,
+                report_schema_version=0)
         .order_by("-created_at", "-pk")
         .first()
     )

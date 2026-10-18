@@ -151,7 +151,7 @@ class ClerkWebhookView(APIView):
 
         first_name = data.get("first_name") or ""
         last_name = data.get("last_name") or ""
-        image_url = data.get("image_url") or ""
+        image_url = (data.get("image_url") or "") if data.get("has_image") is True else ""
 
         unsafe_metadata = data.get("unsafe_metadata") or {}
         public_metadata = data.get("public_metadata") or {}
@@ -176,11 +176,12 @@ class ClerkWebhookView(APIView):
                     created = False
             else:
                 # Same clerk_id, just an update or replay
-                existing_user.is_active = True
+                # Provisioning is not a local administrator's reactivation
+                # decision. Replayed create events must preserve deactivation.
                 existing_user.first_name = first_name
                 existing_user.last_name = last_name
                 existing_user.profile_image_url = image_url
-                existing_user.save()
+                existing_user.save(update_fields=["first_name", "last_name", "profile_image_url"])
                 user = existing_user
                 created = False
         else:
@@ -231,9 +232,9 @@ class ClerkWebhookView(APIView):
         user.email = email
         user.first_name = data.get("first_name") or ""
         user.last_name = data.get("last_name") or ""
-        user.profile_image_url = data.get("image_url") or user.profile_image_url
+        user.profile_image_url = (data.get("image_url") or "") if data.get("has_image") is True else ""
         # Never authorize a role change from user-editable Clerk metadata.
-        user.save()
+        user.save(update_fields=["email", "first_name", "last_name", "profile_image_url"])
 
         unsafe_metadata = data.get("unsafe_metadata") or {}
         public_metadata = data.get("public_metadata") or {}
@@ -260,7 +261,7 @@ class ClerkWebhookView(APIView):
         try:
             user = User.objects.get(clerk_id=clerk_id)
             user.is_active = False
-            user.save()
+            user.save(update_fields=["is_active"])
             logger.info("Clerk Webhook: Deactivated user record for clerk_id=%s.", clerk_id)
         except User.DoesNotExist:
             logger.info("user.deleted received for non-existent clerk_id=%s.", clerk_id)
