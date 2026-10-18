@@ -1,5 +1,6 @@
 # ── Environment ──────────────────────────────────────────────
 .env
+/.refactor-backup/
 .env.*
 !.env.example
 
@@ -15,6 +16,10 @@ build/
 
 # ── Virtual environments ─────────────────────────────────────
 .venv/
+.venv-vision/
+.venv-vision-runtime/
+vision-artifacts/
+vision-reports/
 venv/
 env/
 ENV/
@@ -37,6 +42,8 @@ media/
 # ── Logs ─────────────────────────────────────────────────────
 *.log
 logs/
+.interview-analysis-b7-load-*.json
+.interview_analysis-b7-load-*.json
 
 # ── OS artifacts ─────────────────────────────────────────────
 .DS_Store
@@ -55,15 +62,46 @@ secrets.json
 
 # ── Coverage / Test artifacts ────────────────────────────────
 .coverage
+.coverage.*
 htmlcov/
 .pytest_cache/
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
 tests/
 **/tests/
 test_*.py
+**/test_*.py
 *_test.py
+**/*_test.py
+tests.py
+**/tests.py
 
 review/
 docs/
+!docs/
+docs/*
+!docs/retell_backend.md
+!docs/interview_analysis_shared_contract.md
+!docs/interview_analysis_naming.md
+!docs/socket_authentication_handoff.md
+!docs/video_lifecycle_handoff.md
+!docs/frame_transport_handoff.md
+!docs/vision_scheduling_handoff.md
+!docs/vision_pipeline_handoff.md
+!docs/vision_cpu_benchmark.json
+!docs/behavioral_reporting_handoff.md
+!docs/behavioral_analysis_operator_guide.md
+!docs/behavioral_analysis_acceptance.json
+!docs/test_fix_2026_10_18.md
+!docs/test_audit_2026_10_18/
+docs/test_audit_2026_10_18/*
+!docs/test_audit_2026_10_18/run_backend.py
+!docs/test_audit_2026_10_18/capture_fix_sources.py
+!docs/test_audit_2026_10_18/finalize_fix_report.py
+!docs/test_audit_2026_10_18/run_browser_auth_smoke.py
 
 # ── Temporary / AI scratch files ─────────────────────────────
 tmp_genai/

@@ -24,6 +24,7 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # application code accesses them only through integrations/retell_client.py.
 RETELL_API_KEY = os.getenv("RETELL_API_KEY", "")
 RETELL_AGENT_ID = os.getenv("RETELL_AGENT_ID", "")
+RETELL_CREDENTIAL_ENCRYPTION_KEY = os.getenv("RETELL_CREDENTIAL_ENCRYPTION_KEY", "")
 
 
 # Quick-start development settings - unsuitable for production
@@ -181,12 +182,76 @@ CLERK_PUBLISHABLE_KEY = os.getenv("NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY", "")
 CLERK_SECRET_KEY = os.getenv("CLERK_SECRET_KEY", "")
 CLERK_JWKS_URL = os.getenv("CLERK_JWKS_URL", "https://stunning-slug-13.clerk.accounts.dev/.well-known/jwks.json")
 CLERK_WEBHOOK_SECRET = os.getenv("CLERK_WEBHOOK_SECRET", "")
+CLERK_ISSUER = os.getenv("CLERK_ISSUER", CLERK_JWKS_URL.removesuffix("/.well-known/jwks.json"))
+CLERK_AUTHORIZED_PARTIES = [p.strip() for p in os.getenv("CLERK_AUTHORIZED_PARTIES", "").split(",") if p.strip()]
+
+# Ticket TTL controls redemption only; the credential exp always caps the lease.
+INTERVIEW_ANALYSIS_TICKET_TTL_SECONDS = int(os.getenv("INTERVIEW_ANALYSIS_TICKET_TTL_SECONDS", "30"))
+INTERVIEW_ANALYSIS_SOCKET_LEASE_SECONDS = int(os.getenv("INTERVIEW_ANALYSIS_SOCKET_LEASE_SECONDS", "60"))
+INTERVIEW_ANALYSIS_AUTH_CHECK_SECONDS = int(os.getenv("INTERVIEW_ANALYSIS_AUTH_CHECK_SECONDS", "5"))
+INTERVIEW_ANALYSIS_MAX_OUTSTANDING_TICKETS = int(os.getenv("INTERVIEW_ANALYSIS_MAX_OUTSTANDING_TICKETS", "4"))
+INTERVIEW_ANALYSIS_CONNECTION_LEASE_SECONDS = int(os.getenv("INTERVIEW_ANALYSIS_CONNECTION_LEASE_SECONDS", "15"))
+INTERVIEW_ANALYSIS_RECONNECT_GRACE_SECONDS = int(os.getenv("INTERVIEW_ANALYSIS_RECONNECT_GRACE_SECONDS", "30"))
+INTERVIEW_ANALYSIS_VIDEO_INACTIVITY_SECONDS = int(os.getenv("INTERVIEW_ANALYSIS_VIDEO_INACTIVITY_SECONDS", "30"))
+INTERVIEW_ANALYSIS_MAX_VIDEO_SECONDS = int(os.getenv("INTERVIEW_ANALYSIS_MAX_VIDEO_SECONDS", "3600"))
+INTERVIEW_ANALYSIS_VIDEO_RECOVERY_SECONDS = int(os.getenv("INTERVIEW_ANALYSIS_VIDEO_RECOVERY_SECONDS", "5"))
+INTERVIEW_ANALYSIS_VIDEO_RECOVERY_BATCH = int(os.getenv("INTERVIEW_ANALYSIS_VIDEO_RECOVERY_BATCH", "100"))
+INTERVIEW_ANALYSIS_REPORT_RECOVERY_BATCH = max(1, min(100, int(os.getenv('INTERVIEW_ANALYSIS_REPORT_RECOVERY_BATCH', '10'))))
+INTERVIEW_ANALYSIS_GLOBAL_FRAME_CAP = int(os.getenv("INTERVIEW_ANALYSIS_GLOBAL_FRAME_CAP", "32"))
+INTERVIEW_ANALYSIS_FRAME_DEADLINE_SECONDS = int(os.getenv("INTERVIEW_ANALYSIS_FRAME_DEADLINE_SECONDS", "60"))
+INTERVIEW_ANALYSIS_FRAME_CLAIM_SECONDS = int(os.getenv("INTERVIEW_ANALYSIS_FRAME_CLAIM_SECONDS", "30"))
+INTERVIEW_ANALYSIS_MAX_SESSION_FRAMES = int(os.getenv('INTERVIEW_ANALYSIS_MAX_SESSION_FRAMES', '10800'))
+# B4 plumbing is opt-in until B5 implements real local inference.
+INTERVIEW_ANALYSIS_VISION_ENABLED = os.getenv('INTERVIEW_ANALYSIS_VISION_ENABLED', 'False').lower() in ('true', '1', 'yes')
+INTERVIEW_ANALYSIS_MODEL_DIRECTORY = os.getenv('INTERVIEW_ANALYSIS_MODEL_DIRECTORY', str(BASE_DIR / 'vision-artifacts'))
+INTERVIEW_ANALYSIS_MAX_FACES = int(os.getenv('INTERVIEW_ANALYSIS_MAX_FACES', '3'))
+INTERVIEW_ANALYSIS_PAYLOAD_REDIS_URL = os.getenv('INTERVIEW_ANALYSIS_PAYLOAD_REDIS_URL', 'redis://127.0.0.1:6379/14')
+INTERVIEW_ANALYSIS_PAYLOAD_PREFIX = os.getenv('INTERVIEW_ANALYSIS_PAYLOAD_PREFIX', 'skillsense.analysis.private')
+INTERVIEW_ANALYSIS_PAYLOAD_CAP = int(os.getenv('INTERVIEW_ANALYSIS_PAYLOAD_CAP', '64'))
+INTERVIEW_ANALYSIS_VISION_QUEUE = os.getenv('INTERVIEW_ANALYSIS_VISION_QUEUE', 'interview.analysis.vision')
+INTERVIEW_ANALYSIS_VISION_QUEUE_CAP = int(os.getenv('INTERVIEW_ANALYSIS_VISION_QUEUE_CAP', '128'))
+INTERVIEW_ANALYSIS_VISION_QUEUE_TTL_SECONDS = 120
+INTERVIEW_ANALYSIS_PUBLICATION_ATTEMPTS = 3
+INTERVIEW_ANALYSIS_PUBLICATION_LEASE_SECONDS = 10
+INTERVIEW_ANALYSIS_WORKER_ATTEMPTS = 2
+INTERVIEW_ANALYSIS_FINALIZATION_CLAIM_SECONDS = int(os.getenv("INTERVIEW_ANALYSIS_FINALIZATION_CLAIM_SECONDS", "30"))
 
 
 
 # ── Redis Cache ──────────────────────────────────────────────
 
 REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/1")
+
+# Interview Analysis: no implicit in-memory fallback in application configuration.
+ASGI_APPLICATION = 'ai_interview_recruitment.asgi.application'
+INTERVIEW_ANALYSIS_REDIS_URL = os.getenv('INTERVIEW_ANALYSIS_REDIS_URL', REDIS_URL)
+INTERVIEW_ANALYSIS_REDIS_PREFIX = os.getenv('INTERVIEW_ANALYSIS_REDIS_PREFIX', 'skillsense.analysis.guard')
+INTERVIEW_ANALYSIS_CHANNEL_PREFIX = os.getenv('INTERVIEW_ANALYSIS_CHANNEL_PREFIX', 'skillsense.analysis.channels')
+CHANNEL_LAYERS = {'default': {
+    'BACKEND': 'channels_redis.core.RedisChannelLayer',
+    'CONFIG': {'hosts': [{'address': INTERVIEW_ANALYSIS_REDIS_URL, 'socket_connect_timeout': 1}],
+               'prefix': INTERVIEW_ANALYSIS_CHANNEL_PREFIX, 'capacity': 16, 'expiry': 10,
+               'group_expiry': 120, 'serializer_format': 'json'},
+}}
+INTERVIEW_ANALYSIS_WS_ALLOWED_ORIGINS = [s.strip() for s in os.getenv('INTERVIEW_ANALYSIS_WS_ALLOWED_ORIGINS',
+    'http://localhost:3000,http://localhost:50893,http://localhost:50894,http://127.0.0.1:50893,http://127.0.0.1:50894').split(',') if s.strip()]
+INTERVIEW_ANALYSIS_MAX_MESSAGE_BYTES = 307200
+INTERVIEW_ANALYSIS_MAX_JPEG_BYTES = 204800
+INTERVIEW_ANALYSIS_MAX_PIXELS = 921600
+INTERVIEW_ANALYSIS_MAX_WIDTH = 1280
+INTERVIEW_ANALYSIS_MAX_HEIGHT = 1280
+INTERVIEW_ANALYSIS_FRAME_FPS = 3
+INTERVIEW_ANALYSIS_USER_FRAME_FPS = 6
+INTERVIEW_ANALYSIS_SESSION_MESSAGE_RATE = 20
+INTERVIEW_ANALYSIS_USER_MESSAGE_RATE = 30
+INTERVIEW_ANALYSIS_MAX_USER_SOCKETS = int(os.getenv('INTERVIEW_ANALYSIS_MAX_USER_SOCKETS', '4'))
+INTERVIEW_ANALYSIS_MAX_SESSION_OBSERVERS = int(os.getenv('INTERVIEW_ANALYSIS_MAX_SESSION_OBSERVERS', '4'))
+INTERVIEW_ANALYSIS_MAX_SOCKETS = int(os.getenv('INTERVIEW_ANALYSIS_MAX_SOCKETS', '64'))
+INTERVIEW_ANALYSIS_GUARD_LEASE_SECONDS = 15
+INTERVIEW_ANALYSIS_IO_TIMEOUT_SECONDS = float(os.getenv('INTERVIEW_ANALYSIS_IO_TIMEOUT_SECONDS', '2'))
+INTERVIEW_ANALYSIS_DECODE_WORKERS = int(os.getenv('INTERVIEW_ANALYSIS_DECODE_WORKERS', '2'))
+INTERVIEW_ANALYSIS_DECODE_TIMEOUT_SECONDS = 2
+INTERVIEW_ANALYSIS_ASGI_INPUT_MESSAGES = 2
 
 def _get_dev_cache_config():
     redis_url = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/1")
@@ -218,18 +283,39 @@ CACHES = {
 
 # ── Celery (async task queue) ────────────────────────────────
 CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", REDIS_URL)
+CELERY_BROKER_TRANSPORT = 'interview_system.vision_transport:Transport'
+CELERY_BROKER_CONNECTION_TIMEOUT = 1
+CELERY_BROKER_TRANSPORT_OPTIONS = {'socket_timeout': 1, 'socket_connect_timeout': 1}
+CELERY_TASK_ROUTES = {'interview_system.tasks.vision.process_frame': {
+    'queue': INTERVIEW_ANALYSIS_VISION_QUEUE, 'routing_key': INTERVIEW_ANALYSIS_VISION_QUEUE, 'priority': 0},
+    'interview_system.tasks.vision.warm_vision': {
+    'queue': INTERVIEW_ANALYSIS_VISION_QUEUE, 'routing_key': INTERVIEW_ANALYSIS_VISION_QUEUE, 'priority': 0}}
 CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", REDIS_URL)
 CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_TASK_ALWAYS_EAGER = os.getenv("CELERY_TASK_ALWAYS_EAGER", "False").lower() in ("true", "1", "yes")
 CELERY_BEAT_SCHEDULE = {
+    "recover-interview-analysis-video": {
+        "task": "interview_system.tasks.video.recover_video",
+        "schedule": max(1, INTERVIEW_ANALYSIS_VIDEO_RECOVERY_SECONDS),
+        "options": {"expires": max(1, INTERVIEW_ANALYSIS_VIDEO_RECOVERY_SECONDS)},
+    },
+    "recover-retell-interviews": {
+        "task": "interview_system.tasks.retell.recover_retell",
+        "schedule": 60.0,
+    },
     "recover-application-screening": {
         "task": "interview_system.tasks.screening.recover_stalled_assessments",
         "schedule": 15.0,
     },
 }
 CELERY_TASK_EAGER_PROPAGATES = os.getenv("CELERY_TASK_EAGER_PROPAGATES", "True").lower() in ("true", "1", "yes")
+if INTERVIEW_ANALYSIS_VISION_ENABLED:
+    CELERY_BEAT_SCHEDULE['warm-interview-analysis-vision'] = {
+        'task': 'interview_system.tasks.vision.warm_vision', 'schedule': 5,
+        'options': {'queue': INTERVIEW_ANALYSIS_VISION_QUEUE, 'routing_key': INTERVIEW_ANALYSIS_VISION_QUEUE,
+                    'priority': 0, 'expires': 5, 'retry': False}}
 
 
 # ── Gemini AI ────────────────────────────────────────────────

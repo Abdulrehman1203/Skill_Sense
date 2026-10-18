@@ -57,7 +57,11 @@ def process_retell_transcript(self, payload: dict) -> dict:
                 session.transcript = transcript
                 session.audio_ended_at = ended
                 session.save(update_fields=['transcript', 'audio_ended_at'])
-            finish_if_ready(interview, session)
+            if session.lifecycle_version == 1 and session.video_required:
+                from ..video_lifecycle import seal_video_locked
+                seal_video_locked(interview, session, 'audio_ended')
+            else:
+                finish_if_ready(interview, session)
         return {'status': 'processed', 'session_id': str(session.pk)}
     except (OperationalError, InterfaceError, SoftTimeLimitExceeded):
         retry = self.request.retries

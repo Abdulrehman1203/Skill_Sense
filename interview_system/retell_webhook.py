@@ -1,19 +1,16 @@
 """Verify raw bytes before parsing; enqueue only authenticated, validated events."""
 import json
 import logging
-import time
-from datetime import datetime, timezone as datetime_timezone
 
 from django.utils import timezone
 from drf_spectacular.utils import extend_schema, OpenApiResponse
-from kombu.exceptions import OperationalError as BrokerError
 from rest_framework import serializers
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .integrations.retell_client import verify_webhook_signature
-from .tasks.interview_tasks import process_retell_transcript
+from .voice import accept_event, normalize_call
 
 logger = logging.getLogger(__name__)
 
@@ -39,10 +36,11 @@ class RetellCallEndedView(APIView):
 
     @extend_schema(
         request=RetellTranscriptSerializer, auth=[],
-        responses={202: OpenApiResponse(description='Verified event queued.'),
+        responses={204: OpenApiResponse(description='Verified unused lifecycle event acknowledged.'),
+                   202: OpenApiResponse(description='Verified event durably saved for processing.'),
                    401: OpenApiResponse(description='Invalid or expired signature.'),
                    400: OpenApiResponse(description='Invalid verified payload.'),
-                   503: OpenApiResponse(description='Queue unavailable; sender should retry.')},
+                   500: OpenApiResponse(description='Event could not be persisted; sender should retry.')},
     )
     def post(self, request):
         raw = request.body  # Raw bytes are required for HMAC, never parsed here.
@@ -59,32 +57,20 @@ class RetellCallEndedView(APIView):
             return Response({'detail': 'Invalid JSON.'}, status=400)
         # Accept the documented application contract and Retell's native envelope.
         if isinstance(payload, dict) and 'event' in payload:
-            if payload.get('event') != 'call_ended':
+            # Retell's dashboard test sends call_started regardless of the
+            # configured event filter. These events need no transcript work.
+            if payload.get('event') == 'call_started':
+                return Response(status=204)
+            if payload.get('event') not in ('call_ended', 'call_analyzed'):
                 return Response({'detail': 'Unsupported event.'}, status=400)
-            call = payload.get('call')
-            if not isinstance(call, dict):
-                return Response({'detail': 'Invalid call.'}, status=400)
-            timestamp = call.get('end_timestamp')
-            if type(timestamp) not in (int, float):
-                return Response({'detail': 'Invalid end timestamp.'}, status=400)
-            try:
-                ended = datetime.fromtimestamp(timestamp / 1000, datetime_timezone.utc).isoformat()
-            except (ValueError, OverflowError, OSError):
-                return Response({'detail': 'Invalid end timestamp.'}, status=400)
-            payload = {'retell_session_id': call.get('call_id'),
-                       'transcript': call.get('transcript'), 'ended_at': ended}
+            event = payload['event']
+            payload = normalize_call(payload.get('call'))
+        else:
+            event = 'call_ended'
         serializer = RetellTranscriptSerializer(data=payload)
         serializer.is_valid(raise_exception=True)
-        payload = dict(serializer.validated_data)
+        extras = {key: payload[key] for key in ('status', 'disconnection_reason', 'transcript_object', 'recording_url', 'analysis') if key in payload}
+        payload = {**serializer.validated_data, **extras}
         payload['ended_at'] = payload['ended_at'].isoformat()
-        try:
-            process_retell_transcript.apply_async(
-                args=[payload], expires=19,
-                headers={'retell_deadline': time.time() + 19},
-                argsrepr='(<redacted Retell transcript>,)',
-                retry=False,  # Return 503 promptly; provider delivery can retry.
-            )
-        except (BrokerError, OSError):
-            logger.error('Verified Retell webhook could not be enqueued.')
-            return Response({'detail': 'Queue unavailable.'}, status=503)
-        return Response({'status': 'queued'}, status=202)
+        accept_event(payload, event)
+        return Response({'status': 'accepted'}, status=202)

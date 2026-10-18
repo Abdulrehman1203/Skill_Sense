@@ -10,7 +10,7 @@ Model Loading Strategy:
 - The SentenceTransformer model is loaded on the first invocation of ``match()``
   (never at module import time).
 - Explicit CPU device placement (``device="cpu"``) to preserve GPU memory for
-  Phase 8 vision inference models (SDD §9).
+  Interview Analysis vision inference models (SDD §9).
 
 Skill Matching Strategy:
 - Accepts ``job_skills: list[str] | None = None`` representing required skills.

@@ -15,6 +15,7 @@ from typing import Any
 from django.conf import settings
 from django.core.cache import cache
 from django.db import IntegrityError
+from django.views.decorators.debug import sensitive_variables
 import jwt
 from jwt.exceptions import ExpiredSignatureError, InvalidTokenError, PyJWKSetError
 import requests
@@ -45,6 +46,7 @@ class ClerkJWTAuthentication(BaseAuthentication):
     def authenticate_header(self, request: Any) -> str:
         return "Bearer"
 
+    @sensitive_variables('auth_header', 'raw_token')
     def authenticate(self, request: Any) -> tuple[User, dict[str, Any]] | None:
         auth_header = get_authorization_header(request).split()
 
@@ -56,9 +58,13 @@ class ClerkJWTAuthentication(BaseAuthentication):
         elif len(auth_header) > 2:
             raise AuthenticationFailed("Invalid bearer header. Token contains spaces.")
 
-        raw_token = auth_header[1].decode("utf-8")
+        try:
+            raw_token = auth_header[1].decode("ascii")
+        except UnicodeDecodeError:
+            raise AuthenticationFailed("Invalid bearer header.") from None
         return self.authenticate_credentials(raw_token)
 
+    @sensitive_variables('raw_token', 'payload')
     def authenticate_credentials(self, raw_token: str) -> tuple[User, dict[str, Any]]:
         jwks_data = self._get_jwks()
         if not jwks_data:
@@ -164,6 +170,7 @@ class ClerkJWTAuthentication(BaseAuthentication):
                 pass
             return None
 
+    @sensitive_variables('token', 'payload')
     def _verify_token(self, token: str, jwks_data: dict[str, Any]) -> dict[str, Any]:
         """
         Verify the JWT RS256 signature and expiration against the provided JWKS data.
@@ -185,7 +192,7 @@ class ClerkJWTAuthentication(BaseAuthentication):
 
             # If key not found, attempt forced JWKS refresh once (handles key rotation)
             if not signing_key:
-                logger.info("Key ID %s not found in cached JWKS. Forcing JWKS refresh...", kid)
+                logger.info("Signing key not found in cached JWKS. Refreshing keys.")
                 fresh_jwks = self._get_jwks(force_refresh=True)
                 if fresh_jwks:
                     jwks_set = jwt.PyJWKSet.from_dict(fresh_jwks)
@@ -197,30 +204,40 @@ class ClerkJWTAuthentication(BaseAuthentication):
             if not signing_key:
                 raise AuthenticationFailed("Signing key not found in Clerk JWKS.")
 
-            decode_options: dict[str, Any] = {"verify_aud": False}
+            decode_options: dict[str, Any] = {"verify_aud": False, "require": ["exp", "sub", "iss"]}
 
             payload = jwt.decode(
                 token,
                 key=signing_key.key,
                 algorithms=["RS256"],
                 options=decode_options,
+                issuer=settings.CLERK_ISSUER,
                 # Allow small issuer/server clock differences, including iat/nbf.
                 leeway=5,
             )
+            # Enforce exact issuer equality independently of version-specific
+            # PyJWT issuer/sequence handling; cryptographic verification stays above.
+            if payload.get("iss") != settings.CLERK_ISSUER:
+                raise AuthenticationFailed("Invalid issuer.")
+            parties = getattr(settings, "CLERK_AUTHORIZED_PARTIES", [])
+            if parties and payload.get("azp") not in parties:
+                raise AuthenticationFailed("Invalid authorized party.")
+            if payload.get("sts") == "pending":
+                raise AuthenticationFailed("Session is pending.")
             return payload
 
         except ExpiredSignatureError:
             raise AuthenticationFailed("Token has expired.")
-        except PyJWKSetError as e:
-            logger.error("PyJWKSet verification error: %s", e)
+        except PyJWKSetError:
+            logger.error("Clerk verification key format error.")
             raise AuthenticationFailed("Invalid token signature or key format.")
-        except InvalidTokenError as e:
-            logger.warning("Invalid token presented: %s", e)
-            raise AuthenticationFailed(f"Invalid token: {str(e)}")
+        except InvalidTokenError:
+            logger.warning("Invalid Clerk credential presented.")
+            raise AuthenticationFailed("Invalid token.") from None
         except AuthenticationFailed:
             raise
-        except Exception as e:
-            logger.error("Unexpected error verifying token: %s", e)
+        except Exception:
+            logger.error("Unexpected Clerk verification failure.")
             raise AuthenticationFailed("Token verification failed.")
 
 

@@ -74,6 +74,11 @@ class UserUpdateSerializer(serializers.ModelSerializer):
 class UserSummarySerializer(serializers.ModelSerializer):
     """Read-only summary of user identity details included in profile responses."""
 
+    profile_image_url = serializers.SerializerMethodField()
+
+    def get_profile_image_url(self, obj) -> str | None:
+        return obj.profile_image_url or None
+
     class Meta:  # type: ignore
         model = User
         fields = ["id", "email", "first_name", "last_name", "profile_image_url", "role", "created_at"]
@@ -402,6 +407,8 @@ class JobCreateUpdateSerializer(serializers.ModelSerializer):
     def validate_screening_criteria(self, value):
         if not isinstance(value, dict):
             raise serializers.ValidationError("Screening criteria must be a dictionary.")
+        if set(value) - {"minimum_experience_years", "education_levels", "certifications", "manual_review_required"}:
+            raise serializers.ValidationError("Unsupported screening criteria.")
         years = value.get("minimum_experience_years")
         if years is not None and (isinstance(years, bool) or not isinstance(years, (float, int)) or not math.isfinite(years) or not 0 <= years <= 80):
             raise serializers.ValidationError("Minimum experience must be a number from 0 to 80.")
@@ -658,6 +665,7 @@ class ApplicationListSerializer(serializers.ModelSerializer):
                   "created_at", "updated_at", "integrity_review"]
         read_only_fields = fields
 
+    @extend_schema_field(serializers.DictField(allow_null=True))
     def get_integrity_review(self, obj):
         request = self.context.get("request")
         if not request or request.user.role != User.Role.RECRUITER:
@@ -726,6 +734,12 @@ class AuditLogSerializer(serializers.ModelSerializer):
         model = AuditLogEntry
         fields = ["actor", "action", "target_type", "target_id", "metadata", "created_at"]
         read_only_fields = fields
+
+
+class AdminAnalyticsSerializer(serializers.Serializer):
+    applications_by_status = serializers.DictField(child=serializers.IntegerField(min_value=0), read_only=True)
+    average_score = serializers.FloatField(allow_null=True, read_only=True)
+    interview_completion_rate = serializers.FloatField(min_value=0, max_value=1, read_only=True)
 
 
 class StrictNonNegativeIntegerField(serializers.IntegerField):
@@ -821,7 +835,7 @@ class ApplicationAdvanceSerializer(serializers.Serializer):
         application: Application = self.context["application"]
         current = application.status
 
-        if current == Application.Status.SCREENED:
+        if current in (Application.Status.SCREENED, Application.Status.SHORTLISTED):
             raise serializers.ValidationError(
                 "SCREENED applications become INTERVIEWED only when an "
                 "interview is scheduled through POST /api/interviews/."
@@ -854,16 +868,22 @@ class ApplicationAdvanceSerializer(serializers.Serializer):
 
 
 class StartVoiceSessionResponseSerializer(serializers.Serializer):
-    """A local session always starts, even when Retell is unavailable."""
+    """Private, short-lived browser credentials for an owned interview."""
 
     interview_session_id = serializers.UUIDField(
         read_only=True,
-        help_text="Local session ID used for the Phase 8 /analysis/{interview_session_id}/ WebSocket.",
+        help_text="Local interview session ID.",
     )
     retell_session_id = serializers.CharField(
         read_only=True, allow_null=True,
-        help_text="Retell call ID; null when voice creation failed and the interview proceeds without Retell.",
+        help_text="Retell call ID. Failed voice creation returns 503 and no join credentials.",
     )
+
+    call_id = serializers.CharField(read_only=True)
+    access_token = serializers.CharField(read_only=True)
+    transport = serializers.CharField(read_only=True)
+    ice_servers = serializers.ListField(read_only=True)
+    expires_at = serializers.IntegerField(read_only=True)
 
 
 class InterviewCreateSerializer(serializers.Serializer):

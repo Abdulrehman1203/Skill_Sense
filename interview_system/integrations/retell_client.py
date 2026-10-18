@@ -10,8 +10,8 @@ order, one at a time, awaiting each answer. Metadata alone does not drive the ag
 Questions must be an ordered iterable of approved Question objects (or mappings
 with text, category, approved, and interview_id), belonging to this interview.
 
-The returned string is Retell's call_id, not a browser access token. Browser join
-credentials returned by Retell are deliberately not exposed by this Step 1 contract.
+create_session preserves the legacy call-ID contract. create_web_call returns
+validated browser credentials for the authenticated join endpoint.
 No models are saved, no tasks scheduled, and no raw provider errors are logged.
 
 API reference: https://docs.retellai.com/api-references/create-web-call
@@ -27,7 +27,7 @@ from collections.abc import Mapping
 import requests
 from django.conf import settings
 
-__all__ = ["create_session", "RetellUnavailableError"]
+__all__ = ["create_session", "create_web_call", "get_call", "stop_call", "RetellUnavailableError"]
 
 _CREATE_WEB_CALL_URL = "https://api.retellai.com/v3/create-web-call"
 # Requests timeouts bound connection and socket inactivity, not total wall time.
@@ -50,6 +50,10 @@ def _configuration(name: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise RetellUnavailableError("Retell integration is not configured.")
     return value.strip()
+
+
+class RetellCreationUncertainError(RetellUnavailableError):
+    """The provider may have created a call; reconcile before creating another."""
 
 
 def _field(obj, name):
@@ -86,13 +90,8 @@ def _question_context(interview, questions) -> tuple[str, str]:
     return interview_id, json.dumps(script, ensure_ascii=False)
 
 
-def create_session(interview, questions) -> str:
-    """Create one Retell voice session for the supplied approved question set.
-
-    Returns a non-empty call_id string. Expected failures raise
-    RetellUnavailableError, never None. To degrade, catch only that exception.
-    The call is mockable at requests.post; no HTTP client is captured at import.
-    """
+def _create_call(interview, questions) -> dict:
+    """Create a call and validate its ID without logging provider responses."""
     api_key = _configuration("RETELL_API_KEY")
     agent_id = _configuration("RETELL_AGENT_ID")
     interview_id, context = _question_context(interview, questions)
@@ -112,22 +111,125 @@ def create_session(interview, questions) -> str:
             allow_redirects=False,
         )
     except requests.RequestException:
-        raise RetellUnavailableError("Retell session request failed.") from None
+        raise RetellCreationUncertainError("Retell session request outcome is unknown.") from None
 
     try:
         # Reject redirects as well as 4xx/5xx. Never forward auth to another URL.
         if not 200 <= response.status_code < 300:
+            if response.status_code >= 500:
+                raise RetellCreationUncertainError('Retell session request outcome is unknown.')
             raise RetellUnavailableError("Retell rejected session creation.")
         try:
             data = response.json()
         except ValueError:
-            raise RetellUnavailableError("Retell returned an invalid response.") from None
+            raise RetellCreationUncertainError("Retell returned an invalid response.") from None
         call_id = data.get("call_id") if isinstance(data, dict) else None
         if not isinstance(call_id, str) or not call_id.strip():
-            raise RetellUnavailableError("Retell returned an invalid session ID.")
-        return call_id
+            raise RetellCreationUncertainError("Retell returned an invalid session ID.")
+        return data
     finally:
         response.close()
+
+
+def create_session(interview, questions) -> str:
+    return _create_call(interview, questions)['call_id']
+
+
+def create_web_call(interview, questions) -> dict:
+    import time
+    data = _create_call(interview, questions)
+    if (not isinstance(data.get('access_token'), str) or not data['access_token'].strip()
+            or data.get('transport') != 'gateway'
+            or not isinstance(data.get('ice_servers'), list)
+            or any(not isinstance(server, dict) or not server.get('urls') for server in data['ice_servers'])
+            or type(data.get('expires_at')) is not int
+            or data['expires_at'] <= int(time.time() * 1000)):
+        raise RetellCreationUncertainError('Retell returned invalid browser credentials.')
+    return {key: data[key] for key in ('call_id', 'access_token', 'transport', 'ice_servers', 'expires_at')}
+
+
+def _call_request(method, operation, call_id):
+    from urllib.parse import quote
+    try:
+        response = requests.request(
+            method, f'https://api.retellai.com/v2/{operation}/{quote(call_id, safe="")}',
+            headers={'Authorization': f'Bearer {_configuration("RETELL_API_KEY")}'},
+            timeout=_REQUEST_TIMEOUT, allow_redirects=False,
+        )
+    except requests.RequestException:
+        raise RetellUnavailableError('Retell call request failed.') from None
+    try:
+        if not 200 <= response.status_code < 300:
+            raise RetellUnavailableError('Retell rejected the call request.')
+        if operation == 'stop-call':
+            return None
+        try:
+            data = response.json()
+        except ValueError:
+            raise RetellUnavailableError('Retell returned an invalid call.') from None
+        if not isinstance(data, dict) or data.get('call_id') != call_id:
+            raise RetellUnavailableError('Retell returned an invalid call.')
+        return data
+    finally:
+        response.close()
+
+
+def get_call(call_id):
+    return _call_request('GET', 'get-call', call_id)
+
+
+def stop_call(call_id):
+    return _call_request('POST', 'stop-call', call_id)
+
+
+def find_interview_calls(interview_id):
+    """Reconcile an uncertain create using server-supplied metadata."""
+    try:
+        response = requests.post(
+            'https://api.retellai.com/v3/list-calls',
+            headers={'Authorization': f'Bearer {_configuration("RETELL_API_KEY")}'},
+            json={'filter_criteria': {'metadata': [{'type': 'string', 'key': 'interview_id', 'value': str(interview_id)}]},
+                  'sort_order': 'descending', 'limit': 100},
+            timeout=_REQUEST_TIMEOUT, allow_redirects=False,
+        )
+    except requests.RequestException:
+        raise RetellUnavailableError('Retell reconciliation failed.') from None
+    try:
+        if response.status_code != 200:
+            raise RetellUnavailableError('Retell reconciliation failed.')
+        try:
+            data = response.json()
+        except ValueError:
+            raise RetellUnavailableError('Retell reconciliation failed.') from None
+        if not isinstance(data, dict) or not isinstance(data.get('items'), list):
+            raise RetellUnavailableError('Retell reconciliation failed.')
+        return [item for item in data['items'] if isinstance(item, dict)
+                and item.get('agent_id') == _configuration('RETELL_AGENT_ID')
+                and isinstance(item.get('metadata'), dict)
+                and item['metadata'].get('interview_id') == str(interview_id)
+                and isinstance(item.get('call_id'), str) and item['call_id']]
+    finally:
+        response.close()
+
+
+def _credential_cipher():
+    import base64
+    import hashlib
+    from cryptography.fernet import Fernet
+    secret = getattr(settings, 'RETELL_CREDENTIAL_ENCRYPTION_KEY', '') or settings.SECRET_KEY
+    return Fernet(base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest()))
+
+
+def encrypt_credentials(data):
+    return _credential_cipher().encrypt(json.dumps(data).encode()).decode()
+
+
+def decrypt_credentials(value):
+    from cryptography.fernet import InvalidToken
+    try:
+        return json.loads(_credential_cipher().decrypt(value.encode()))
+    except (InvalidToken, ValueError, TypeError):
+        raise RetellUnavailableError('Stored call credentials are unavailable.') from None
 
 
 def verify_webhook_signature(body: bytes, signature: str) -> bool:

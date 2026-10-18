@@ -627,6 +627,7 @@ class TemplateQuestion(models.Model):
 # ═══════════════════════════════════════════════════════════════
 
 class InterviewSession(models.Model):
+    vision_calibration = models.JSONField(default=dict, blank=True)
     """The live/recorded session tied 1:1 to an interview."""
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -637,14 +638,58 @@ class InterviewSession(models.Model):
     ended_at = models.DateTimeField(null=True, blank=True)
     audio_ended_at = models.DateTimeField(
         null=True, blank=True,
-        help_text='Retell audio completion; ended_at is reserved for video disconnect.',
+        help_text='Verified Retell audio completion; ended_at records sealed video completion (or audio-only completion).',
     )
     transcript = models.TextField(blank=True)
+    video_required = models.BooleanField(default=True)
+    creation_uncertain = models.BooleanField(default=False)
+    # Migration leaves pre-B2 rows at version 0; only new sessions default to B2.
+    lifecycle_version = models.PositiveSmallIntegerField(default=1)
+    video_state = models.CharField(max_length=16, default='not_started', choices=[(s, s) for s in
+        ('not_started', 'active', 'disconnected', 'finalizing', 'ended')])
+    connection_state = models.CharField(max_length=16, default='not_connected', choices=[(s, s) for s in
+        ('not_connected', 'connected', 'disconnected', 'closed')])
+    analysis_state = models.CharField(max_length=16, default='pending', choices=[(s, s) for s in
+        ('pending', 'processing', 'finalizing', 'complete', 'partial', 'failed')])
+    analysis_failure_reason = models.CharField(max_length=32, blank=True, choices=[
+        ('no_usable_evidence', 'No usable evidence'), ('pipeline_failed', 'Pipeline failed')])
+    connection_generation = models.UUIDField(null=True, blank=True)
+    connection_lease_until = models.DateTimeField(null=True, blank=True)
+    connection_auth_expires_at = models.DateTimeField(null=True, blank=True)
+    reconnect_deadline = models.DateTimeField(null=True, blank=True)
+    video_activated_at = models.DateTimeField(null=True, blank=True)
+    video_deadline = models.DateTimeField(null=True, blank=True)
+    last_frame_at = models.DateTimeField(null=True, blank=True)
+    last_sequence = models.PositiveBigIntegerField(null=True, blank=True)
+    admission_sealed_at = models.DateTimeField(null=True, blank=True)
+    sealed_admission_count = models.PositiveBigIntegerField(null=True, blank=True)
+    finish_reason = models.CharField(max_length=24, blank=True, choices=[(s, s) for s in
+        ('candidate_finished', 'audio_ended', 'reconnect_timeout', 'inactivity_timeout', 'duration_limit', 'service_failure')])
+    received_count = models.PositiveBigIntegerField(default=0)
+    admitted_count = models.PositiveBigIntegerField(default=0)
+    dropped_count = models.PositiveBigIntegerField(default=0)
+    analysis_ready_at = models.DateTimeField(null=True, blank=True)
+    analysis_finalized_at = models.DateTimeField(null=True, blank=True)
+    analysis_revision = models.PositiveBigIntegerField(default=0)
+    analysis_source_revision = models.PositiveBigIntegerField(default=0)
+    report_dirty = models.BooleanField(default=True)
+    report_due_at = models.DateTimeField(default=timezone.now)
+    finalization_token = models.UUIDField(null=True, blank=True)
+    finalization_lease_until = models.DateTimeField(null=True, blank=True)
+    recovery_due_at = models.DateTimeField(default=timezone.now, db_index=True)
 
     class Meta:
         db_table = "interview_sessions"
         verbose_name = "interview session"
         verbose_name_plural = "interview sessions"
+        indexes = [models.Index(fields=['report_due_at'], condition=models.Q(
+            report_dirty=True, lifecycle_version=1, video_required=True), name='analysis_report_due')]
+        constraints = [
+            models.CheckConstraint(condition=models.Q(received_count=models.F('admitted_count') + models.F('dropped_count')),
+                                   name='video_received_accounted'),
+            models.CheckConstraint(condition=(models.Q(admission_sealed_at__isnull=True, sealed_admission_count__isnull=True)
+                | models.Q(admission_sealed_at__isnull=False, sealed_admission_count__isnull=False)), name='video_seal_boundary_pair'),
+        ]
 
     def __str__(self):
         return f"Session({self.interview})"
@@ -653,6 +698,58 @@ class InterviewSession(models.Model):
 # ═══════════════════════════════════════════════════════════════
 #  Response
 # ═══════════════════════════════════════════════════════════════
+
+class SocketTicket(models.Model):
+    """Ephemeral connection credentials, never application identities or raw JWTs."""
+
+    digest = models.CharField(primary_key=True, max_length=64, editable=False)
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
+    session = models.ForeignKey(InterviewSession, on_delete=models.CASCADE)
+    purpose = models.CharField(max_length=9, choices=[('publisher', 'Publisher'), ('observer', 'Observer')])
+    clerk_session_id = models.CharField(max_length=255, blank=True)
+    clerk_subject = models.CharField(max_length=255)
+    credential_expires_at = models.DateTimeField()
+    expires_at = models.DateTimeField(db_index=True)
+    consumed_at = models.DateTimeField(null=True)
+
+    class Meta:
+        db_table = 'socket_tickets'
+
+
+class RetellCall(models.Model):
+    """One provider call attempt; browser credentials are encrypted at rest."""
+
+    call_id = models.CharField(max_length=255, primary_key=True)
+    session = models.ForeignKey(InterviewSession, on_delete=models.CASCADE, related_name='voice_calls')
+    credentials = models.TextField(blank=True)
+    expires_at = models.BigIntegerField(null=True, blank=True)
+    status = models.CharField(max_length=32, default='registered')
+    disconnection_reason = models.CharField(max_length=255, blank=True)
+    transcript = models.TextField(blank=True)
+    transcript_object = models.JSONField(default=list, blank=True)
+    recording_url = models.URLField(max_length=2048, blank=True)
+    analysis = models.JSONField(default=dict, blank=True)
+    ended_at = models.DateTimeField(null=True, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    last_checked_at = models.DateTimeField(null=True, blank=True)
+
+
+class RetellWebhookEvent(models.Model):
+    """Durable inbox; broker messages contain only this row's ID."""
+
+    call_id = models.CharField(max_length=255)
+    event = models.CharField(max_length=32, default='call_ended')
+    payload = models.JSONField(default=dict)
+    received_at = models.DateTimeField(auto_now_add=True)
+    processed_at = models.DateTimeField(null=True, blank=True)
+    attempts = models.PositiveIntegerField(default=0)
+    next_attempt_at = models.DateTimeField(default=timezone.now)
+    last_error = models.CharField(max_length=100, blank=True)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['call_id', 'event'], name='retell_event_once')]
+        indexes = [models.Index(fields=['processed_at', 'next_attempt_at'], name='retell_inbox_pending')]
+
 
 class Response(models.Model):
     """A candidate's answer to a question within a session."""
@@ -692,9 +789,22 @@ class BehavioralAnalysis(models.Model):
         InterviewSession, on_delete=models.CASCADE, related_name="behavioral_analysis"
     )
     attention_pct = models.FloatField(null=True, blank=True)
-    look_away_count = models.PositiveIntegerField(default=0)
+    look_away_count = models.PositiveIntegerField(default=0, null=True, blank=True)
     integrity_flags = models.JSONField(default=list)
     emotion_summary = models.JSONField(default=dict)
+    # Blank/zero provenance is legacy or unavailable, never evidence of real ML.
+    pipeline_version = models.CharField(max_length=100, blank=True)
+    model_version = models.CharField(max_length=100, blank=True)
+    rules_version = models.CharField(max_length=100, blank=True)
+    revision = models.PositiveBigIntegerField(default=0)
+    finalized_at = models.DateTimeField(null=True, blank=True)
+    sealed_admission_count = models.PositiveBigIntegerField(null=True, blank=True)
+    coverage = models.JSONField(default=dict)
+    report_schema_version = models.PositiveSmallIntegerField(default=0)
+    report = models.JSONField(default=dict, blank=True)
+    source_revision = models.PositiveBigIntegerField(default=0)
+    notified_revision = models.PositiveBigIntegerField(default=0)
+    notify_after = models.DateTimeField(null=True, blank=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -710,6 +820,58 @@ class BehavioralAnalysis(models.Model):
 #  FrameAnalysis
 # ═══════════════════════════════════════════════════════════════
 
+class FrameAdmissionGate(models.Model):
+    """Single global capacity lock. Lock before any interview/session rows."""
+    id = models.PositiveSmallIntegerField(primary_key=True, default=1, editable=False)
+
+    class Meta:
+        constraints = [models.CheckConstraint(condition=models.Q(pk=1), name='frame_gate_singleton')]
+
+
+class FrameJob(models.Model):
+    """Admitted metadata only. Pending jobs are not FrameAnalysis observations."""
+    class State(models.TextChoices):
+        PENDING = 'pending'
+        PROCESSING = 'processing'
+        PROCESSED = 'processed'
+        SUPERSEDED = 'superseded'
+        FAILED = 'failed'
+        EXPIRED = 'expired'
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    session = models.ForeignKey(InterviewSession, on_delete=models.CASCADE, related_name='frame_jobs')
+    generation = models.UUIDField()
+    sequence = models.PositiveBigIntegerField()
+    admission_number = models.PositiveBigIntegerField()
+    capture_ts = models.FloatField()
+    received_at = models.DateTimeField(default=timezone.now)
+    expires_at = models.DateTimeField()
+    state = models.CharField(max_length=12, choices=State.choices, default=State.PENDING)
+    claim_token = models.UUIDField(null=True, blank=True)
+    claim_expires_at = models.DateTimeField(null=True, blank=True)
+    attempts = models.PositiveIntegerField(default=0)
+    terminal_at = models.DateTimeField(null=True, blank=True)
+    terminal_reason = models.CharField(max_length=32, blank=True)
+    payload_ready = models.BooleanField(default=False)
+    publication_token = models.UUIDField(null=True, blank=True)
+    publication_attempts = models.PositiveSmallIntegerField(default=0)
+    publication_due_at = models.DateTimeField(default=timezone.now)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['session', 'generation', 'sequence'], name='frame_identity_once'),
+            models.UniqueConstraint(fields=['session', 'admission_number'], name='frame_admission_once'),
+            models.UniqueConstraint(fields=['session'], condition=models.Q(state='pending'), name='one_pending_frame'),
+            models.UniqueConstraint(fields=['session'], condition=models.Q(state='processing'), name='one_processing_frame'),
+            models.CheckConstraint(condition=(models.Q(state__in=['pending', 'processing'], terminal_at__isnull=True)
+                | models.Q(state__in=['processed', 'superseded', 'failed', 'expired'], terminal_at__isnull=False)),
+                name='frame_terminal_time'),
+            models.CheckConstraint(condition=(~models.Q(state='processing')
+                | models.Q(claim_token__isnull=False, claim_expires_at__isnull=False)), name='frame_processing_claim'),
+        ]
+        indexes = [models.Index(fields=['state', 'expires_at'], name='frame_job_expiry')]
+
+
 class FrameAnalysis(models.Model):
     """Per-frame analysis captured during a session (many per session)."""
 
@@ -719,9 +881,14 @@ class FrameAnalysis(models.Model):
     )
     ts = models.DateTimeField()
     gaze_direction = models.CharField(max_length=50, blank=True)
-    face_count = models.PositiveIntegerField(default=0)
+    face_count = models.PositiveIntegerField(default=0, null=True, blank=True)
     detected_objects = models.JSONField(default=list)
     emotion = models.CharField(max_length=50, null=True, blank=True)
+    job = models.OneToOneField(FrameJob, null=True, blank=True, on_delete=models.PROTECT, related_name='observation')
+    pipeline_version = models.CharField(max_length=100, blank=True)
+    model_version = models.CharField(max_length=100, blank=True)
+    rules_version = models.CharField(max_length=100, blank=True)
+    vision_details = models.JSONField(default=dict, blank=True)
 
     class Meta:
         db_table = "frame_analyses"

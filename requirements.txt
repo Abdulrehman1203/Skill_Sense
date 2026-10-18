@@ -20,10 +20,12 @@ requests==2.32.3                  # HTTP library for fetching JWKS
 
 # ── Async / WebSocket (ASGI) ─────────────────────────────────
 channels==4.3.2                   # WebSocket & async support
+channels-redis==4.3.0              # Production channel layer (bounded notifications, not frame jobs)
 daphne==4.2.2                     # ASGI server (HTTP + WS)
 
 # ── Task Queue ───────────────────────────────────────────────
 celery==5.6.3                     # Distributed task queue
+kombu==5.6.2                      # B4 bounded Redis transport hooks are version-sensitive
 redis==8.0.1                      # Redis client (broker + cache)
 
 # ── Phase 5: Resume Intelligence & Matching ──────────────────
@@ -41,6 +43,7 @@ django-storages==1.14.4           # S3 storage backend (non-dev)
 boto3==1.36.26                    # AWS SDK for S3
 
 # ── Dev / Typing ─────────────────────────────────────────────
+websockets==16.1.1                # B3 localhost wire-test client; no inference/production frame adapter
 django-stubs==5.2.0               # Type stubs for Django ORM
 django-stubs-ext==6.0.6           # Type stub extensions for Django 5/6
 djangorestframework-stubs==3.16.0 # Type stubs for DRF

@@ -1,0 +1,309 @@
+{
+  "schema_version": 1,
+  "recorded_local_date": "2026-10-18",
+  "timezone": "Asia/Karachi",
+  "acceptance": "NOT_READY",
+  "external_deployment_performed": false,
+  "application_migrations_applied": false,
+  "hardware": {
+    "platform": "Windows-11-10.0.26300-SP0",
+    "python": "3.12.7",
+    "cpu": "Intel Core i5-11400H",
+    "physical_cores": 6,
+    "logical_processors": 12,
+    "ram_bytes": 16948453376,
+    "gpu": "NVIDIA GeForce RTX 3050 Laptop GPU",
+    "gpu_vram_mib": 4096,
+    "gpu_driver": "617.14",
+    "inspection_gpu_used_mib": 0,
+    "gpu_inference_verified": false,
+    "available_onnx_providers": [
+      "AzureExecutionProvider",
+      "CPUExecutionProvider"
+    ]
+  },
+  "health": {
+    "database": true,
+    "migrations_current": false,
+    "payload_policy_compliant": false,
+    "ready": false,
+    "redis": {
+      "broker": {
+        "eviction": "noeviction",
+        "maxmemory_bytes": 8589934592,
+        "policy_verified": true,
+        "reachable": true
+      },
+      "channels": {
+        "eviction": "noeviction",
+        "maxmemory_bytes": 8589934592,
+        "policy_verified": true,
+        "reachable": true
+      },
+      "payload": {
+        "eviction": "noeviction",
+        "isolated_instance": false,
+        "maxmemory_bytes": 8589934592,
+        "no_replicas": true,
+        "nonpersistent": false,
+        "policy_verified": true,
+        "reachable": true
+      }
+    },
+    "vision_enabled": false,
+    "vision_ready": false
+  },
+  "offline_model_load": [
+    {
+      "schema_version": 1,
+      "scope": "offline_real_models_synthetic_pixels_only",
+      "accuracy_validation": "outstanding",
+      "platform": "Windows-11-10.0.26300-SP0",
+      "device": "CPUExecutionProvider",
+      "precision": "YOLO ONNX FP32; MediaPipe pinned task internal precision not profiled",
+      "model_version": "mp1-64184e229b26-y8nonnx-6f987f27fdd4",
+      "config_version": "config-v1-ab14d086e77d7811",
+      "resolution": [
+        640,
+        480
+      ],
+      "jpeg_bytes": 157359,
+      "sessions": 1,
+      "fps_per_session": 3,
+      "offering_seconds": 20,
+      "elapsed_including_drain_seconds": 19.792,
+      "cold_load_warmup_seconds": 2.128,
+      "offered": 60,
+      "processed": 60,
+      "superseded": 0,
+      "failed": 0,
+      "offered_per_second": 3.0,
+      "processed_per_second": 3.032,
+      "max_pending": 1,
+      "pending_bound": 1,
+      "oldest_selected_age_seconds": 0.002,
+      "processing_ms": {
+        "count": 60,
+        "p50": 118.103,
+        "p95": 126.861
+      },
+      "end_to_end_ms": {
+        "count": 60,
+        "p50": 119.304,
+        "p95": 127.431
+      },
+      "processed_per_simulated_session": [
+        60
+      ],
+      "fairness_min_over_max": 1.0,
+      "rss_baseline_bytes": 41222144,
+      "sampled_peak_rss_bytes": 228298752,
+      "cpu_one_core_percent": 86.68,
+      "gpu_vram_bytes": null,
+      "cleanup_failures": null,
+      "general_queue_latency_ms": null,
+      "budget": {
+        "end_to_end_p95_ms": 500,
+        "max_loss_fraction": 0.05
+      },
+      "meets_offline_budget": true
+    },
+    {
+      "schema_version": 1,
+      "scope": "offline_real_models_synthetic_pixels_only",
+      "accuracy_validation": "outstanding",
+      "platform": "Windows-11-10.0.26300-SP0",
+      "device": "CPUExecutionProvider",
+      "precision": "YOLO ONNX FP32; MediaPipe pinned task internal precision not profiled",
+      "model_version": "mp1-64184e229b26-y8nonnx-6f987f27fdd4",
+      "config_version": "config-v1-ab14d086e77d7811",
+      "resolution": [
+        640,
+        480
+      ],
+      "jpeg_bytes": 157359,
+      "sessions": 2,
+      "fps_per_session": 3,
+      "offering_seconds": 20,
+      "elapsed_including_drain_seconds": 19.902,
+      "cold_load_warmup_seconds": 2.041,
+      "offered": 120,
+      "processed": 120,
+      "superseded": 0,
+      "failed": 0,
+      "offered_per_second": 6.0,
+      "processed_per_second": 6.03,
+      "max_pending": 2,
+      "pending_bound": 2,
+      "oldest_selected_age_seconds": 0.139,
+      "processing_ms": {
+        "count": 120,
+        "p50": 116.008,
+        "p95": 126.922
+      },
+      "end_to_end_ms": {
+        "count": 120,
+        "p50": 182.424,
+        "p95": 250.073
+      },
+      "processed_per_simulated_session": [
+        60,
+        60
+      ],
+      "fairness_min_over_max": 1.0,
+      "rss_baseline_bytes": 40787968,
+      "sampled_peak_rss_bytes": 225673216,
+      "cpu_one_core_percent": 153.72,
+      "gpu_vram_bytes": null,
+      "cleanup_failures": null,
+      "general_queue_latency_ms": null,
+      "budget": {
+        "end_to_end_p95_ms": 500,
+        "max_loss_fraction": 0.05
+      },
+      "meets_offline_budget": true
+    },
+    {
+      "schema_version": 1,
+      "scope": "offline_real_models_synthetic_pixels_only",
+      "accuracy_validation": "outstanding",
+      "platform": "Windows-11-10.0.26300-SP0",
+      "device": "CPUExecutionProvider",
+      "precision": "YOLO ONNX FP32; MediaPipe pinned task internal precision not profiled",
+      "model_version": "mp1-64184e229b26-y8nonnx-6f987f27fdd4",
+      "config_version": "config-v1-ab14d086e77d7811",
+      "resolution": [
+        640,
+        480
+      ],
+      "jpeg_bytes": 157359,
+      "sessions": 4,
+      "fps_per_session": 3,
+      "offering_seconds": 20,
+      "elapsed_including_drain_seconds": 20.23,
+      "cold_load_warmup_seconds": 1.991,
+      "offered": 240,
+      "processed": 180,
+      "superseded": 60,
+      "failed": 0,
+      "offered_per_second": 12.0,
+      "processed_per_second": 8.898,
+      "max_pending": 4,
+      "pending_bound": 4,
+      "oldest_selected_age_seconds": 0.435,
+      "processing_ms": {
+        "count": 180,
+        "p50": 111.943,
+        "p95": 114.471
+      },
+      "end_to_end_ms": {
+        "count": 180,
+        "p50": 288.091,
+        "p95": 427.092
+      },
+      "processed_per_simulated_session": [
+        45,
+        45,
+        45,
+        45
+      ],
+      "fairness_min_over_max": 1.0,
+      "rss_baseline_bytes": 40714240,
+      "sampled_peak_rss_bytes": 225673216,
+      "cpu_one_core_percent": 200.04,
+      "gpu_vram_bytes": null,
+      "cleanup_failures": null,
+      "general_queue_latency_ms": null,
+      "budget": {
+        "end_to_end_p95_ms": 500,
+        "max_loss_fraction": 0.05
+      },
+      "meets_offline_budget": false
+    }
+  ],
+  "backend_tests": {
+    "command_labels": "See operator guide",
+    "tests": 299,
+    "seconds": 158.228,
+    "result": "OK",
+    "exit_code": 0,
+    "note": "289 existing regression tests plus first 10 B7 tests; Windows test-only solo broker worker, not Linux prefork acceptance"
+  },
+  "final_b7_tests": {
+    "tests": 15,
+    "seconds": 6.454,
+    "result": "OK",
+    "exit_code": 0
+  },
+  "test_only_isolated_redis_queue_probe": {
+    "count": 10,
+    "p50_ms": 2.775,
+    "p95_ms": 9.878,
+    "scope": "real Redis with Windows embedded solo test worker; no production general-queue load, provider, GPU or ML claim"
+  },
+  "frontend_tests": {
+    "command": "flutter test --reporter expanded",
+    "passed": 155,
+    "skipped": 1,
+    "failed": 27,
+    "reported_elapsed": "00:43",
+    "exit_code": 1,
+    "failures": [
+      "D:/Programming/FYP/Skill_Sense_frontend/test/candidate_profile_overflow_test.dart: Profile & Settings has no overflow at 1024px",
+      "D:/Programming/FYP/Skill_Sense_frontend/test/candidate_resume_layout_test.dart: resume cards fit wide and narrow canvases with long filenames",
+      "D:/Programming/FYP/Skill_Sense_frontend/test/candidate_report_record_test.dart: report renders only fields from the requested records",
+      "D:/Programming/FYP/Skill_Sense_frontend/test/candidate_resume_layout_test.dart: empty resume panel and upload copy fit requested widths",
+      "D:/Programming/FYP/Skill_Sense_frontend/test/candidate_report_record_test.dart: late first report cannot replace a different selected record",
+      "D:/Programming/FYP/Skill_Sense_frontend/test/candidate_profile_overflow_test.dart: Profile & Settings has no overflow at 900px",
+      "D:/Programming/FYP/Skill_Sense_frontend/test/candidate_report_record_test.dart: missing or mismatched record does not show a report",
+      "D:/Programming/FYP/Skill_Sense_frontend/test/candidate_report_record_test.dart: mobile report stacks cards and uses resume skills",
+      "D:/Programming/FYP/Skill_Sense_frontend/test/candidate_profile_overflow_test.dart: long profile values truncate beside actions",
+      "D:/Programming/FYP/Skill_Sense_frontend/test/create_role_advanced_inputs_test.dart: reference layout, preview, salary, skills, threshold and mix respond live",
+      "D:/Programming/FYP/Skill_Sense_frontend/test/candidate_profile_overflow_test.dart: mobile profile frame fits 900px viewport",
+      "D:/Programming/FYP/Skill_Sense_frontend/test/create_role_requirements_test.dart: 390px layout shows requirements and sticky actions",
+      "D:/Programming/FYP/Skill_Sense_frontend/test/iteration2_workflow_test.dart: recruiter scoring controls are labelled preview with no save action",
+      "D:/Programming/FYP/Skill_Sense_frontend/test/create_role_requirements_test.dart: 360px form updates progress, skills and salary without overflow",
+      "D:/Programming/FYP/Skill_Sense_frontend/test/create_role_advanced_inputs_test.dart: validation highlights missing fields; complete role publishes through API",
+      "D:/Programming/FYP/Skill_Sense_frontend/test/job_navigation_and_docx_test.dart: missing named-route job ID shows recovery, not a job detail",
+      "D:/Programming/FYP/Skill_Sense_frontend/test/create_role_advanced_inputs_test.dart: 640px stacks sections and aside, toggles theme, and saves a local draft",
+      "D:/Programming/FYP/Skill_Sense_frontend/test/create_role_advanced_inputs_test.dart: iOS closing date opens the native picker",
+      "D:/Programming/FYP/Skill_Sense_frontend/test/rankings_layout_test.dart: rankings podium fits its content at desktop width",
+      "D:/Programming/FYP/Skill_Sense_frontend/test/screen_navigation_race_test.dart: mobile applications drawer reaches another candidate section",
+      "D:/Programming/FYP/Skill_Sense_frontend/test/schedule_interview_api_test.dart: shared shell renders one recruiter nav beside schedule canvas",
+      "D:/Programming/FYP/Skill_Sense_frontend/test/schedule_interview_api_test.dart: mobile shell has one drawer nav and one schedule dock",
+      "D:/Programming/FYP/Skill_Sense_frontend/test/sign_out_failure_test.dart: failed Clerk sign-out keeps the verified screen and shows error",
+      "D:/Programming/FYP/Skill_Sense_frontend/test/schedule_interview_api_test.dart: 403 scheduling error is shown under the candidate row",
+      "D:/Programming/FYP/Skill_Sense_frontend/test/sign_out_navigation_test.dart: sign-out waits for Clerk before leaving the protected screen",
+      "D:/Programming/FYP/Skill_Sense_frontend/test/schedule_interview_api_test.dart: 400 scheduling validation stays inline with the row",
+      "D:/Programming/FYP/Skill_Sense_frontend/test/recruiter_navigation_test.dart: Create Role reflows as the recruiter rail animates"
+    ],
+    "source_modified": false,
+    "phase8_client_implemented": false
+  },
+  "static_checks": {
+    "django_check": "no issues",
+    "migration_consistency": "No changes detected",
+    "diff_check": "passed; LF/CRLF advisories only",
+    "production_overlay_deploy_check": {
+      "test_environment_only": true,
+      "warnings": 5,
+      "notes": [
+        "2 drf-spectacular type-hint warnings",
+        "1 admin serializer schema warning",
+        "HSTS includeSubDomains and preload intentionally not enabled without domain-wide approval"
+      ]
+    }
+  },
+  "unmet": [
+    "Target Linux prefork/container process model and recovery under real restarts/outages",
+    "GPU provider compatibility/inference/VRAM load",
+    "Consented staged real-clip accuracy",
+    "Camera/browser/TLS/proxy and all upstream log redaction",
+    "Live approved Clerk/Retell test-account/provider acceptance",
+    "Frontend Phase8 capture/calibration/ticket/lease/report integration",
+    "Full-stack 3FPS concurrent sessions and general-queue contention/fairness/CPU-process-tree memory",
+    "Pending migrations and isolated nonpersistent payload Redis",
+    "Approved derived retention/deletion/legal-hold policy",
+    "27 Flutter regression failures"
+  ]
+}
