@@ -205,6 +205,19 @@ class CandidateProfileSerializer(serializers.ModelSerializer):
     """
 
     user = UserSummarySerializer(read_only=True)
+    completion_percentage = serializers.SerializerMethodField()
+
+    def get_completion_percentage(self, profile) -> int:
+        # Derive completion from the saved profile and its own user's fields.
+        text_fields = (
+            profile.user.first_name, profile.user.last_name, profile.user.email,
+            profile.phone, profile.location, profile.headline,
+            profile.linkedin_url, profile.portfolio_url,
+        )
+        completed = sum(bool((value or "").strip()) for value in text_fields)
+        completed += profile.years_experience is not None and profile.years_experience >= 0
+        return round(completed / 9 * 100)
+
     headline = serializers.CharField(
         max_length=150,
         required=False,
@@ -234,6 +247,7 @@ class CandidateProfileSerializer(serializers.ModelSerializer):
             "portfolio_url",
             "years_experience",
             "headline",
+            "completion_percentage",
         ]
         read_only_fields = ["user"]
 
@@ -314,6 +328,7 @@ class JobSerializer(serializers.ModelSerializer):
 
     match_score = serializers.SerializerMethodField()
     average_match_score = serializers.SerializerMethodField()
+    has_applied = serializers.BooleanField(read_only=True, default=False)
 
     class Meta:  # type: ignore
         model = Job
@@ -336,6 +351,7 @@ class JobSerializer(serializers.ModelSerializer):
             "job_skills",
             "match_score",
             "average_match_score",
+            "has_applied",
             "screening_threshold", "auto_shortlist_enabled", "non_pass_policy",
             "screening_policy_version", "screening_criteria",
         ]
@@ -407,7 +423,10 @@ class JobCreateUpdateSerializer(serializers.ModelSerializer):
     def validate_screening_criteria(self, value):
         if not isinstance(value, dict):
             raise serializers.ValidationError("Screening criteria must be a dictionary.")
-        if set(value) - {"minimum_experience_years", "education_levels", "certifications", "manual_review_required"}:
+        if set(value) - {
+            "minimum_experience_years", "education_levels", "certifications",
+            "manual_review_required", "question_mix", "skill_weights",
+        }:
             raise serializers.ValidationError("Unsupported screening criteria.")
         years = value.get("minimum_experience_years")
         if years is not None and (isinstance(years, bool) or not isinstance(years, (float, int)) or not math.isfinite(years) or not 0 <= years <= 80):
@@ -418,6 +437,32 @@ class JobCreateUpdateSerializer(serializers.ModelSerializer):
                 raise serializers.ValidationError(f"{key} must contain up to 30 nonempty strings.")
         if "manual_review_required" in value and not isinstance(value["manual_review_required"], bool):
             raise serializers.ValidationError("manual_review_required must be boolean.")
+        if "question_mix" in value:
+            mix = value["question_mix"]
+            if (
+                not isinstance(mix, dict)
+                or set(mix) - {"technical", "behavioral", "situational"}
+                or any(type(count) is not int or not 0 <= count <= 12 for count in mix.values())
+                or sum(mix.values()) > 12
+            ):
+                raise serializers.ValidationError(
+                    "Question mix must contain whole-number counts totaling at most 12 "
+                    "for technical, behavioral, and situational questions."
+                )
+        if "skill_weights" in value:
+            weights = value["skill_weights"]
+            if (
+                not isinstance(weights, dict)
+                or len(weights) > 20
+                or any(
+                    not isinstance(name, str) or not name.strip() or len(name) > 100
+                    or type(weight) is not int or not 1 <= weight <= 3
+                    for name, weight in weights.items()
+                )
+            ):
+                raise serializers.ValidationError(
+                    "Skill weights must contain up to 20 named skills with whole-number weights from 1 to 3."
+                )
         return value
 
     class Meta:  # type: ignore
@@ -650,8 +695,12 @@ class AssessmentSerializer(serializers.ModelSerializer):
 class ApplicationListSerializer(serializers.ModelSerializer):
     integrity_review = serializers.SerializerMethodField()
     job_title = serializers.CharField(source="job.title", read_only=True)
+    job_company = serializers.CharField(source="job.recruiter.company_name", read_only=True)
     candidate_email = serializers.EmailField(source="candidate.user.email", read_only=True)
     candidate_name = serializers.SerializerMethodField()
+    candidate_profile_image_url = serializers.CharField(
+        source="candidate.user.profile_image_url", read_only=True, allow_null=True,
+    )
     resume_id = serializers.UUIDField(source="resume.pk", read_only=True)
     assessment = AssessmentSerializer(source="current_assessment", read_only=True)
     match_score = serializers.SerializerMethodField()
@@ -660,7 +709,7 @@ class ApplicationListSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Application
-        fields = ["id", "candidate", "candidate_email", "candidate_name", "job", "job_title", "resume_id",
+        fields = ["id", "candidate", "candidate_email", "candidate_name", "candidate_profile_image_url", "job", "job_title", "job_company", "resume_id",
                   "status", "version", "assessment", "match_score", "allowed_actions", "eligible_for_interview",
                   "created_at", "updated_at", "integrity_review"]
         read_only_fields = fields

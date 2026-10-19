@@ -677,7 +677,12 @@ class JobViewSet(ModelViewSet):
                 )
             return Job.objects.filter(recruiter=recruiter_profile)
 
-        return Job.objects.filter(status=Job.Status.ACTIVE)
+        candidate = getattr(user, "candidate_profile", None)
+        return Job.objects.filter(status=Job.Status.ACTIVE).annotate(
+            has_applied=models.Exists(
+                Application.objects.filter(candidate=candidate, job_id=models.OuterRef("pk"))
+            ),
+        )
 
     def get_serializer_class(self):
         if self.action in ("create", "update", "partial_update"):
@@ -945,7 +950,7 @@ class ApplicationViewSet(
         interviews = Interview.objects.select_related("session__behavioral_analysis").annotate(
             has_behavioral_frames=models.Exists(FrameAnalysis.objects.filter(session__interview_id=models.OuterRef("pk"))),
         ).order_by("-created_at", "-pk")
-        qs = Application.objects.select_related("job", "resume", "candidate__user", "current_assessment").prefetch_related(
+        qs = Application.objects.select_related("job__recruiter", "resume", "candidate__user", "current_assessment").prefetch_related(
             models.Prefetch("interviews", queryset=interviews),
         ).annotate(
             integrity_look_away_limit=models.functions.Coalesce(
