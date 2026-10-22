@@ -88,6 +88,11 @@ review/
 backups/
 /docs/
 
+# Local deployment examples and platform/export dependency snapshots.
+/deploy/
+/requirements-vision-export.txt
+/requirements-vision-win-py312.lock
+
 # ── Temporary / AI scratch files ─────────────────────────────
 tmp_genai/
 

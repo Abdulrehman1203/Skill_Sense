@@ -1,9 +1,0 @@
-# Offline artifact BUILD tooling only; not installed in the worker/web image.
-# Install CPU torch/torchvision from https://download.pytorch.org/whl/cpu first.
-torch==2.5.1
-torchvision==0.20.1
-ultralytics==8.3.70
-onnx==1.17.0
-numpy==1.26.4
-opencv-python==4.11.0.86
-Pillow==11.2.1
