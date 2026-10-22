@@ -1,126 +1,117 @@
-"""Phase 6 candidate scoring task.
-
-Scoring writes a CandidateScore only. Application status is controlled solely
-by the screening and recruiter decision workflow.
-"""
-
-from __future__ import annotations
-
-import logging
+"""Durable combined-v1 scoring; legacy public task name retained as an adapter."""
+from datetime import timedelta
+import uuid
 
 from celery import shared_task
-from django.apps import apps
-from django.core.exceptions import FieldDoesNotExist
-from django.db import InterfaceError, OperationalError
+from django.db import transaction
+from django.db.models import Q
+from django.utils import timezone
 
-from ai.scoring.rubric import score
-
-from ..models import Application, CandidateScore, ParsedResume, Resume, ScoringRubric
-
-logger = logging.getLogger(__name__)
+from ai.scoring.rubric import combined_score
+from ..answer_evaluation import digest
+from ..final_scoring import current_inputs, dispatch, ensure, lock_sources, payload
+from ..models import Application, CandidateScore, Notification, ScoreRevision, ScoringPolicyState
 
 
 class ScoringConfigurationError(RuntimeError):
-    """Scoring cannot run without exactly one active rubric."""
+    """Compatibility import; configuration gaps are now incomplete states."""
 
 
 class ScoringInputNotReady(RuntimeError):
-    """The Phase 5 match is not complete or failed."""
+    """Compatibility import; missing evidence is now explicit, never zero."""
 
 
-def _interview_signal(application_id: str) -> float | None:
-    """Read a future Phase 9 session metric when that field exists."""
+@shared_task(name='interview_system.tasks.analysis.generate_candidate_score')
+def generate_candidate_score(application_id):
+    row = ensure(application_id)
+    if row and row.status in ('QUEUED', 'PROCESSING'):
+        calculate_score_revision.run(str(row.pk))
+    return payload(Application.objects.get(pk=application_id))
+
+
+@shared_task(ignore_result=True, acks_late=True, soft_time_limit=20, time_limit=30)
+def calculate_score_revision(revision_id):
+    ref = ScoreRevision.objects.select_related('evaluation').get(pk=revision_id)
+    if not ref.evaluation_id or ref.status not in ('QUEUED', 'PROCESSING'):
+        return
+    token = uuid.uuid4()
+    with transaction.atomic():
+        app = lock_sources(ref)
+        row = ScoreRevision.objects.select_for_update().get(pk=revision_id)
+        if row.status not in ('QUEUED', 'PROCESSING') or row.next_attempt_at > timezone.now():
+            return
+        if row.lease_until and row.lease_until > timezone.now():
+            return
+        if digest(row.inputs) != row.key:
+            row.status, row.error_code = 'FAILED', 'INPUT_HASH_MISMATCH'
+            row.save()
+            return
+        if digest(current_inputs(app)[0]) != row.key:
+            row.status, row.error_code = 'STALE', 'SOURCE_SUPERSEDED'
+            row.save()
+            return
+        if row.attempts >= 4:
+            row.status, row.error_code = 'FAILED', 'ATTEMPTS_EXHAUSTED'
+            row.claim_token = row.lease_until = None
+            row.save()
+            return
+        row.attempts += 1
+        row.claim_token, row.lease_until = token, timezone.now() + timedelta(seconds=60)
+        row.status = 'PROCESSING'
+        row.save()
     try:
-        session_model = apps.get_model("interview_system", "InterviewSession")
-        session_model._meta.get_field("interview_signal")
-    except (LookupError, FieldDoesNotExist):
-        # Today's session/transcript stubs do not measure completeness.
-        return None
-    return (
-        session_model.objects
-        .filter(interview__application_id=application_id, interview_signal__isnull=False)
-        .order_by("-interview__created_at", "-pk")
-        .values_list("interview_signal", flat=True)
-        .first()
-    )
+        result = combined_score(row.inputs['screening_match_percentage'], row.inputs['interview_performance_percentage'],
+            weight_match=row.inputs['weights']['match'], weight_interview=row.inputs['weights']['interview'])
+        with transaction.atomic():
+            app = lock_sources(ref)
+            current = ScoreRevision.objects.select_for_update().get(pk=revision_id)
+            if current.claim_token != token or current.status != 'PROCESSING':
+                return
+            if digest(current_inputs(app)[0]) != current.key:
+                current.status, current.error_code = 'STALE', 'SOURCE_SUPERSEDED'
+                current.claim_token = current.lease_until = None
+                current.save()
+                return
+            current.status, current.final_score = 'COMPLETE', result['final_score']
+            current.completed_at = timezone.now()
+            current.claim_token = current.lease_until = None
+            current.save()
+            CandidateScore.objects.update_or_create(application=app, defaults={'current_revision': current,
+                'final_score': result['final_score'], 'breakdown': {'match': float(current.screening_match_percentage),
+                'interview': float(current.interview_performance_percentage), 'behavioral': None},
+                'explanation': 'Combined recommendation from screening and evaluated answers only.'})
+            from ..notifications import queue_notification
+            queue_notification(app.job.recruiter.user_id, 'score_ready', resource_type='score_revision',
+                resource_id=current.pk, revision=current.number,
+                links={'application_id': app.pk, 'interview_id': current.evaluation.interview_id},
+                notification_id=current.pk, deliver_inapp=True)
+            from ..audit import record_audit
+            record_audit(actor=None, action='score.completed', target=current, changed_fields=['status'],
+                revision=current.number, application_id=app.pk, interview_id=current.evaluation.interview_id)
+    except Exception:
+        ScoreRevision.objects.filter(pk=revision_id, claim_token=token, status='PROCESSING', completed_at__isnull=True).update(
+            status='FAILED' if row.attempts >= 4 else 'QUEUED', error_code='SCORING_FAILED', claim_token=None,
+            lease_until=None, next_attempt_at=timezone.now() + timedelta(seconds=15 * 2 ** row.attempts))
 
 
-def _behavioral_signal(application_id: str) -> dict | None:
-    """Read Interview Analysis aggregate data if a linked analysis is available."""
-    try:
-        analysis_model = apps.get_model("interview_system", "BehavioralAnalysis")
-    except LookupError:
-        return None
-    analysis = (
-        analysis_model.objects
-        # B6 reports are observations, not validated scoring signals. Preserve
-        # legacy policy/rows; never opt B6 in by a coincidental numeric value.
-        .filter(session__interview__application_id=application_id, attention_pct__isnull=False,
-                report_schema_version=0)
-        .order_by("-created_at", "-pk")
-        .first()
-    )
-    if analysis is None:
-        return None
-    return {
-        "attention_pct": analysis.attention_pct,
-        "integrity_flag_count": len(analysis.integrity_flags or []),
-    }
-
-
-@shared_task(
-    bind=True,
-    name="interview_system.tasks.analysis.generate_candidate_score",
-    autoretry_for=(OperationalError, InterfaceError),
-    retry_backoff=True,
-    retry_backoff_max=600,
-    max_retries=3,
-)
-def generate_candidate_score(self, application_id: str) -> dict:
-    """Score an application and persist the result without changing its status."""
-    app = Application.objects.select_related("resume", "candidate", "current_assessment").get(pk=application_id)
-    assessment = app.current_assessment
-    if assessment is not None:
-        if assessment.status != "SUCCEEDED" or assessment.match_score is None:
-            raise ScoringInputNotReady("Application screening must succeed before final scoring.")
-        match_score = float(assessment.match_score)
-    else:
-        # Only historical applications without an assessment use the legacy signal.
-        parsed = ParsedResume.objects.filter(resume_id=app.resume_id).first()
-        match_score = (
-            None if app.resume.status == Resume.Status.FAILED
-            else parsed.match_score if parsed is not None else None
-        )
-        if match_score is None and app.resume.status != Resume.Status.FAILED:
-            raise ScoringInputNotReady(
-                f"Match is not ready for application {application_id}."
-            )
-
-    try:
-        rubric = ScoringRubric.objects.get(active=True)
-    except (ScoringRubric.DoesNotExist, ScoringRubric.MultipleObjectsReturned) as exc:
-        raise ScoringConfigurationError(
-            "Exactly one active scoring rubric is required."
-        ) from exc
-
-    result = score(
-        match_score=match_score,
-        interview_signal=_interview_signal(application_id),
-        behavioral_signal=_behavioral_signal(application_id),
-        rubric=rubric,
-    )
-    CandidateScore.objects.update_or_create(
-        application=app,
-        defaults={
-            "final_score": result["final_score"],
-            "breakdown": result["breakdown"],
-            "explanation": result["explanation"],
-        },
-    )
-    logger.info("Candidate score persisted for application_id=%s", application_id)
-
-    # Keep the final chain position, but notify the job owner by explicit User ID.
-    from ..notifications import queue_notification
-
-    queue_notification(app.job.recruiter.user_id, "score_ready")
-    return result
+@shared_task(ignore_result=True)
+def recover_final_scores():
+    state = ScoringPolicyState.objects.filter(pk=1, rebuild_pending=True).first()
+    if state:
+        apps = Application.objects.order_by('pk')
+        if state.rebuild_cursor:
+            apps = apps.filter(pk__gt=state.rebuild_cursor)
+        ids = list(apps.values_list('pk', flat=True)[:100])
+        # Advance only after all intents commit. Crashes repeat an idempotent page.
+        for pk in ids:
+            ensure(pk)
+        with transaction.atomic():
+            current = ScoringPolicyState.objects.select_for_update().get(pk=1)
+            if current.epoch == state.epoch and current.rebuild_cursor == state.rebuild_cursor:
+                current.rebuild_cursor = ids[-1] if ids else current.rebuild_cursor
+                current.rebuild_pending = len(ids) == 100
+                current.save()
+    due = ScoreRevision.objects.filter(status__in=('QUEUED', 'PROCESSING'), next_attempt_at__lte=timezone.now()).filter(
+        Q(lease_until__isnull=True) | Q(lease_until__lte=timezone.now()))
+    for pk in due.order_by('next_attempt_at').values_list('pk', flat=True)[:100]:
+        dispatch(pk)

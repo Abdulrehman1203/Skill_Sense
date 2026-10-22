@@ -11,7 +11,7 @@ from django.db.models.deletion import ProtectedError
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django_filters.rest_framework import DjangoFilterBackend
-from drf_spectacular.utils import OpenApiResponse, extend_schema, extend_schema_view
+from drf_spectacular.utils import OpenApiResponse, extend_schema, extend_schema_view, PolymorphicProxySerializer
 from rest_framework import filters, generics, mixins, status
 from rest_framework.decorators import action
 from rest_framework.exceptions import NotFound, PermissionDenied, ValidationError
@@ -32,6 +32,7 @@ from .models import Application, CandidateProfile, Interview, Job, JobSkill, Rec
 from .permissions import IsAdmin, IsApplicationAccessible, IsCandidate, IsJobOwner, IsRecruiter, IsResumeAccessible
 from .serializers import (
     ApplicationAdvanceSerializer,
+    ApplicationDecisionSerializer,
     ScreeningActionSerializer,
     ScreeningRetrySerializer,
     ApplicationCreateSerializer,
@@ -138,6 +139,7 @@ class AdminAnalyticsView(APIView):
 
     @extend_schema(responses=AdminAnalyticsSerializer)
     def get(self, request):
+        from .final_scoring import ranking_queryset
         counts = dict(Application.objects.order_by().values("status").annotate(n=models.Count("pk")).values_list("status", "n"))
         interviews = Interview.objects.aggregate(
             done=models.Count("pk", filter=models.Q(status=Interview.Status.DONE)),
@@ -145,7 +147,7 @@ class AdminAnalyticsView(APIView):
         )
         return Response({
             "applications_by_status": {value: counts.get(value, 0) for value in Application.Status.values},
-            "average_score": CandidateScore.objects.aggregate(value=models.Avg("final_score"))["value"],
+            "average_score": ranking_queryset().aggregate(value=models.Avg('_rank_score'))['value'],
             "interview_completion_rate": interviews["done"] / interviews["started"] if interviews["started"] else 0.0,
         })
 
@@ -199,13 +201,11 @@ class CandidateScoreView(APIView):
             raise PermissionDenied("This candidate has no application accessible to you.")
         if len(visible) > 1:
             raise ValidationError({"job": "Multiple applications are accessible. Provide ?job={id}."})
-        score = getattr(visible[0], "score", None)
-        data = score if score is not None else {
-            "final_score": None,
-            "breakdown": {"match": None, "interview": None, "behavioral": None},
-            "explanation": "Score not ready.",
-        }
-        return Response(CandidateScoreResponseSerializer(data).data)
+        from .final_scoring import payload
+        data = payload(visible[0])
+        response = Response(CandidateScoreResponseSerializer(data).data)
+        response['Cache-Control'] = 'no-store'
+        return response
 
 
 class JobRankingView(generics.ListAPIView):
@@ -213,17 +213,25 @@ class JobRankingView(generics.ListAPIView):
     serializer_class = ApplicationRankingSerializer
     pagination_class = StandardResultsPagination
 
+    def finalize_response(self, request, response, *args, **kwargs):
+        response = super().finalize_response(request, response, *args, **kwargs)
+        response['Cache-Control'] = 'no-store'
+        return response
+
     def get_queryset(self):
         job = get_object_or_404(Job.objects.select_related("recruiter__user"), pk=self.kwargs["pk"])
         self.check_object_permissions(self.request, job)
-        return Application.objects.filter(job=job).select_related(
-            "candidate__user", "score",
-        ).order_by(models.F("score__final_score").desc(nulls_last=True), "created_at", "pk")
+        from .final_scoring import ranking_queryset
+        return ranking_queryset(job)
 
+
+from .serializers import CandidateInterviewSerializer
 
 @extend_schema_view(
-    list=extend_schema(tags=["Interviews"], summary="List interviews"),
-    retrieve=extend_schema(tags=["Interviews"], summary="Retrieve an interview"),
+    list=extend_schema(tags=["Interviews"], summary="List interviews", responses=PolymorphicProxySerializer(
+        component_name='RoleScopedInterview', serializers=[CandidateInterviewSerializer, InterviewSerializer], resource_type_field_name=None, many=True)),
+    retrieve=extend_schema(tags=["Interviews"], summary="Retrieve an interview", responses=PolymorphicProxySerializer(
+        component_name='RoleScopedInterview', serializers=[CandidateInterviewSerializer, InterviewSerializer], resource_type_field_name=None)),
 )
 class InterviewViewSet(
     VoiceInterviewMixin,
@@ -238,6 +246,12 @@ class InterviewViewSet(
     queryset = Interview.objects.none()
     pagination_class = StandardResultsPagination
 
+    def finalize_response(self, request, response, *args, **kwargs):
+        response = super().finalize_response(request, response, *args, **kwargs)
+        response["Cache-Control"] = "no-store"
+        response["Vary"] = "Authorization"
+        return response
+
     def get_permissions(self) -> list[Any]:
         if self.action in ("list", "retrieve", "start_voice_session", "voice_session", "end_voice_session", "sync_voice_session"):
             return [IsAuthenticated()]
@@ -246,6 +260,9 @@ class InterviewViewSet(
     def get_serializer_class(self):
         if self.action == "create":
             return InterviewCreateSerializer
+        if getattr(self.request.user, "role", None) == User.Role.CANDIDATE:
+            from .serializers import CandidateInterviewSerializer
+            return CandidateInterviewSerializer
         return InterviewSerializer
 
     def get_queryset(self):
@@ -256,7 +273,8 @@ class InterviewViewSet(
         if getattr(user, "role", None) == User.Role.CANDIDATE:
             return Interview.objects.filter(
                 application__candidate__user=user
-            ).order_by("-created_at")
+            ).select_related("application").annotate(approved_question_count=models.Count(
+                "questions", filter=models.Q(questions__approved=True))).order_by("-created_at")
 
         if getattr(user, "role", None) == User.Role.RECRUITER:
             return Interview.objects.filter(
@@ -277,13 +295,16 @@ class InterviewViewSet(
         if request.method == "GET":
             interview = self.get_object()
             return Response(InterviewQuestionSerializer(
-                interview.questions.order_by("created_at", "pk"), many=True,
+                interview.questions.order_by("position", "created_at", "pk"), many=True,
             ).data)
 
         with transaction.atomic():
             # Share this parent lock with generation, serializing changes to
             # the question set without locking throughout a Gemini request.
             interview = get_object_or_404(self.get_queryset().select_for_update(), pk=pk)
+            if interview.question_set_id:
+                from .question_preparation import QuestionConflict
+                raise QuestionConflict("Scheduled question revisions are frozen; review the application question set before scheduling.")
             if interview.status != Interview.Status.SCHEDULED:
                 raise ValidationError({"questions": "Questions cannot change after an interview starts."})
             serializer = InterviewQuestionsPatchSerializer(data=request.data)
@@ -300,8 +321,10 @@ class InterviewViewSet(
                     if field in item:
                         setattr(question, field, item[field])
             interview.questions.model.objects.bulk_update(list(rows.values()), ["text", "approved"])
+            record_audit(actor=request.user, action='questions.legacy_edited', target=interview,
+                changed_fields=['questions'], application_id=interview.application_id, interview_id=interview.pk)
             result = InterviewQuestionSerializer(
-                interview.questions.order_by("created_at", "pk"), many=True,
+                interview.questions.order_by("position", "created_at", "pk"), many=True,
             ).data
         return Response(result)
 
@@ -356,22 +379,31 @@ class InterviewViewSet(
                     {"scheduled_at": "Interview must be scheduled for a future time."}
                 )
 
+            from .question_preparation import freeze_locked, bind_copies
+            question_set, prepared = freeze_locked(application, serializer.validated_data["question_set"],
+                serializer.validated_data["expected_revision"])
             interview = Interview.objects.create(
                 application=application,
                 status=Interview.Status.SCHEDULED,
                 scheduled_at=scheduled_at,
+                question_set=question_set,
+                question_preparation_mode="PREPARED",
+                question_fallback_reason=question_set.fallback_reason,
             )
-            application.status = Application.Status.INTERVIEWED
-            application.save(update_fields=["status", "updated_at"])
-
-            from .tasks.interviewing import generate_questions
-
-            _generate = cast(Any, generate_questions)
-            transaction.on_commit(
-                lambda interview_id=str(interview.pk): _generate.delay(interview_id)
-            )
+            bind_copies(interview, prepared)
+            from .answer_evaluation import freeze_context_locked
+            freeze_context_locked(interview)
+            previous_status = application.status
+            application.status = Application.Status.SCHEDULED
+            application.version += 1
+            application.save(update_fields=["status", "version", "updated_at"])
+            from .models import ScreeningEvent
+            ScreeningEvent.objects.create(application=application, assessment_id=application.current_assessment_id,
+                actor=request.user, source="MANUAL", from_status=previous_status, to_status="SCHEDULED",
+                reason="Interview scheduled with a frozen approved question revision.")
             from .notifications import queue_notification
-            queue_notification(application.candidate.user_id, "interview_scheduled")
+            queue_notification(application.candidate.user_id, "interview_scheduled", resource_type='interview',
+                resource_id=interview.pk, revision=1, links={'application_id': application.pk})
             # Snapshot before dispatch, including in eager development mode.
             result = InterviewSerializer(interview, context={"request": request}).data
 
@@ -397,18 +429,11 @@ class ScoringRubricViewSet(mixins.ListModelMixin, mixins.CreateModelMixin, Gener
     @action(detail=True, methods=["post"])
     def activate(self, request: Request, pk: str | None = None) -> Response:
         with transaction.atomic():
-            # Lock every existing rubric in a stable order. Concurrent
-            # activations therefore serialize; the partial unique constraint
-            # is a database backstop for writes outside this endpoint.
-            locked = list(ScoringRubric.objects.order_by("pk").select_for_update())
-            target = next((rubric for rubric in locked if str(rubric.pk) == pk), None)
-            if target is None:
-                raise NotFound("Scoring rubric not found.")
-            ScoringRubric.objects.filter(active=True).exclude(pk=target.pk).update(active=False)
-            ScoringRubric.objects.filter(pk=target.pk).update(active=True)
-            if not target.active:
+            get_object_or_404(ScoringRubric, pk=pk)
+            from .final_scoring import activate_rubric
+            target, changed = activate_rubric(pk)
+            if changed:
                 record_audit(actor=request.user, action="rubric.activated", target=target, changed_fields=["active"])
-            target.active = True
         return Response(self.get_serializer(target).data, status=status.HTTP_200_OK)
 
 
@@ -923,6 +948,8 @@ class ApplicationViewSet(
     def get_serializer_class(self):
         if self.action == "create":
             return ApplicationCreateSerializer
+        if self.action == "decision":
+            return ApplicationDecisionSerializer
         if self.action == "retrieve":
             return ApplicationDetailSerializer
         if self.action == "advance":
@@ -934,7 +961,7 @@ class ApplicationViewSet(
     def get_permissions(self) -> list[Any]:
         if self.action == "create":
             return [IsAuthenticated(), IsCandidate()]
-        if self.action in ("advance", "shortlist", "reject", "rescreen"):
+        if self.action in ("advance", "shortlist", "reject", "rescreen", "decision"):
             return [IsAuthenticated(), IsRecruiter()]
         if self.action == "retrieve":
             return [IsAuthenticated(), IsApplicationAccessible()]
@@ -1030,7 +1057,8 @@ class ApplicationViewSet(
         with transaction.atomic():
             app = transition(obj.pk, target, actor=request.user, **payload.validated_data)
             from .notifications import queue_notification
-            queue_notification(app.candidate.user_id, "application_status_changed")
+            queue_notification(app.candidate.user_id, "application_status_changed", resource_type='application',
+                resource_id=app.pk, revision=app.version)
         return Response(ApplicationDetailSerializer(app, context={"request": request}).data)
 
     @extend_schema(request=ScreeningActionSerializer, responses={200: ApplicationDetailSerializer})
@@ -1101,7 +1129,7 @@ class ApplicationViewSet(
         summary="Advance application status",
         description=(
             "Screening transitions require expected_version and a reason for overrides/rejection. "
-            "Prefer the dedicated shortlist/reject endpoints. INTERVIEWED → DECISION remains supported. "
+            "Prefer the dedicated shortlist/reject endpoints. DECISION requires the explicit decision payload and eligibility/override policy. "
             "Scheduling occurs only through POST /api/interviews/."
         ),
         request=ApplicationAdvanceSerializer,
@@ -1123,15 +1151,23 @@ class ApplicationViewSet(
         target = request.data.get("status")
         if target in ("SHORTLISTED", "SCREENED", "REJECTED"):
             return self._screening_action(request, "SHORTLISTED" if target == "SCREENED" else target)
-        # Preserve the legacy downstream decision contract for the later interview phase.
-        serializer = ApplicationAdvanceSerializer(data=request.data, context={"application": application})
+        if target == "DECISION":
+            return self.decision(request, pk)
+        raise ValidationError("Use POST /api/interviews/ for scheduling, verified interview lifecycle transitions, or the explicit decision endpoint.")
+
+    @extend_schema(request=ApplicationDecisionSerializer, responses={200: ApplicationDetailSerializer})
+    @action(detail=True, methods=["post"], permission_classes=[IsAuthenticated, IsRecruiter])
+    def decision(self, request, pk=None):
+        from .serializers import ApplicationDecisionSerializer
+        from .interview_workflow import decide
+        application = self.get_object()
+        data = dict(request.data)
+        if self.action == "advance":
+            data.pop("status", None)
+        serializer = ApplicationDecisionSerializer(data=data)
         serializer.is_valid(raise_exception=True)
-        with transaction.atomic():
-            application.status = serializer.validated_data["status"]
-            application.save(update_fields=["status", "updated_at"])
-            from .notifications import queue_notification
-            queue_notification(application.candidate.user_id, "application_status_changed")
-        return Response(ApplicationDetailSerializer(application, context={"request": request}).data)
+        result = decide(application.pk, actor=request.user, **serializer.validated_data)
+        return Response(ApplicationDetailSerializer(result, context={"request": request}).data)
 
 
 

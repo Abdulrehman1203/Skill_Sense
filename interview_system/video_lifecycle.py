@@ -260,6 +260,8 @@ def admit_frame(lease, generation, sequence, capture_ts, *, retain_payload=None,
             full = FrameJob.objects.filter(state__in=ACTIVE_JOBS).count() >= max(1, settings.INTERVIEW_ANALYSIS_GLOBAL_FRAME_CAP)
             session.received_count += 1
             session.last_sequence = sequence
+            # Camera liveness is independent of model/queue admission capacity.
+            session.last_frame_at = now
             if (full and pending is None) or session.admitted_count >= settings.INTERVIEW_ANALYSIS_MAX_SESSION_FRAMES:
                 session.dropped_count += 1
                 session.save()
@@ -284,7 +286,7 @@ def admit_frame(lease, generation, sequence, capture_ts, *, retain_payload=None,
             return job, None
 
 
-def record_frame_drop(lease, generation, sequence):
+def record_frame_drop(lease, generation, sequence, *, validated=False):
     """Count transport/availability drops once, without creating a pending job."""
     if type(sequence) is not int or not 0 <= sequence <= 9007199254740991:
         raise SocketAuthorizationError('invalid_sequence', 400)
@@ -296,7 +298,11 @@ def record_frame_drop(lease, generation, sequence):
         session.last_sequence = sequence
         session.received_count += 1
         session.dropped_count += 1
-        session.save(update_fields=['last_sequence', 'received_count', 'dropped_count'])
+        fields = ['last_sequence', 'received_count', 'dropped_count']
+        if validated:
+            session.last_frame_at = timezone.now()
+            fields.append('last_frame_at')
+        session.save(update_fields=fields)
         touch_analysis_locked(session)
         return True
 

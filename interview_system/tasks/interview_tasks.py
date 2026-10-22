@@ -56,7 +56,10 @@ def process_retell_transcript(self, payload: dict) -> dict:
             if session.audio_ended_at is None:
                 session.transcript = transcript
                 session.audio_ended_at = ended
-                session.save(update_fields=['transcript', 'audio_ended_at'])
+                session.audio_terminal_status = 'ended'
+                session.save(update_fields=['transcript', 'audio_ended_at', 'audio_terminal_status'])
+            from ..answer_evaluation import accept_transcript_locked
+            accept_transcript_locked(interview, session, payload, 'legacy_authenticated')
             if session.lifecycle_version == 1 and session.video_required:
                 from ..video_lifecycle import seal_video_locked
                 seal_video_locked(interview, session, 'audio_ended')

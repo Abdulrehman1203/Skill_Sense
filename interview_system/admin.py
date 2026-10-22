@@ -62,6 +62,15 @@ class QuestionInline(admin.TabularInline):
     model = Question
     extra = 0
 
+    def has_add_permission(self, request, obj=None):
+        return not (obj and obj.question_set_id) and super().has_add_permission(request, obj)
+
+    def has_change_permission(self, request, obj=None):
+        return not (obj and obj.question_set_id) and super().has_change_permission(request, obj)
+
+    def has_delete_permission(self, request, obj=None):
+        return not (obj and obj.question_set_id) and super().has_delete_permission(request, obj)
+
 
 class ResponseInline(admin.TabularInline):
     model = Response
@@ -161,6 +170,7 @@ class ApplicationAdmin(admin.ModelAdmin):
     list_display = ("candidate", "job", "status", "created_at")
     list_filter = ("status", "job")
     search_fields = ("candidate__user__email", "job__title")
+    readonly_fields = ("status", "version", "current_assessment")
 
 
 @admin.register(ParsedResume)
@@ -176,6 +186,7 @@ class InterviewAdmin(admin.ModelAdmin):
     list_filter = ("status",)
     search_fields = ("retell_session_id",)
     inlines = [QuestionInline]
+    readonly_fields = ("status", "retell_session_id", "question_set", "completed_at", "completion_outcome", "evaluation_status")
 
 
 @admin.register(Question)
@@ -183,12 +194,20 @@ class QuestionAdmin(admin.ModelAdmin):
     list_display = ("interview", "category", "source", "approved")
     list_filter = ("category", "source", "approved")
     search_fields = ("text",)
+    actions = None
+
+    def has_change_permission(self, request, obj=None):
+        return not (obj and obj.interview.question_set_id) and super().has_change_permission(request, obj)
+
+    def has_delete_permission(self, request, obj=None):
+        return not (obj and obj.interview.question_set_id) and super().has_delete_permission(request, obj)
 
 
 @admin.register(InterviewSession)
 class InterviewSessionAdmin(admin.ModelAdmin):
     list_display = ("interview", "started_at", "ended_at")
     inlines = [ResponseInline]
+    readonly_fields = ("started_at", "ended_at", "audio_ended_at", "audio_terminal_status", "transcript")
 
 
 @admin.register(Response)
@@ -215,11 +234,25 @@ class ScoringRubricAdmin(AuditedAdminMixin, admin.ModelAdmin):
     audit_fields = ("weight_match", "weight_interview", "weight_behavioral", "active")
     list_display = ("name", "weight_match", "weight_interview", "weight_behavioral", "active")
     list_filter = ("active",)
+    readonly_fields = ('version', 'policy_version', 'active')
+
+    def get_readonly_fields(self, request, obj=None):
+        return self.readonly_fields + (('name', 'weight_match', 'weight_interview', 'weight_behavioral') if obj else ())
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 @admin.register(CandidateScore)
 class CandidateScoreAdmin(admin.ModelAdmin):
     list_display = ("application", "final_score", "created_at")
+    readonly_fields = tuple(field.name for field in CandidateScore._meta.fields)
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False
 
 
 # ── Notification / Audit Admin ───────────────────────────────

@@ -84,7 +84,11 @@ def _question_context(interview, questions) -> tuple[str, str]:
             or category not in _CATEGORIES
         ):
             raise RetellUnavailableError("The approved question set is invalid.")
-        script.append({"text": text, "category": category})
+        item = {"text": text, "category": category}
+        question_id = _field(question, 'pk') or _field(question, 'id')
+        if question_id is not None:
+            item['question_id'] = str(question_id)
+        script.append(item)
     if not script:
         raise RetellUnavailableError("An approved question set is required.")
     return interview_id, json.dumps(script, ensure_ascii=False)
@@ -94,6 +98,15 @@ def _create_call(interview, questions) -> dict:
     """Create a call and validate its ID without logging provider responses."""
     api_key = _configuration("RETELL_API_KEY")
     agent_id = _configuration("RETELL_AGENT_ID")
+    if getattr(settings, 'RETELL_CONVERSATION_GUARD_ENABLED', False):
+        if not getattr(settings, 'RETELL_CONVERSATION_CONTROL_URL', ''):
+            raise RetellUnavailableError('Guarded conversation callback is not configured.')
+        verify_guard_configuration(api_key, agent_id)
+        from ..models import InterviewConversation
+        existing = InterviewConversation.objects.filter(interview_id=_field(interview, 'pk') or _field(interview, 'id')).first()
+        if existing and existing.carried_evidence:
+            remaining = {q['id'] for q in existing.questions[existing.cursor:]}
+            questions = [q for q in questions if str(_field(q, 'pk') or _field(q, 'id')) in remaining]
     interview_id, context = _question_context(interview, questions)
     payload = {
         "agent_id": agent_id,
@@ -129,6 +142,37 @@ def _create_call(interview, questions) -> dict:
         return data
     finally:
         response.close()
+
+
+def verify_guard_configuration(api_key, agent_id):
+    """Fail closed before creating a call if provider configuration has drifted."""
+    from urllib.parse import quote
+    from ..conversation_protocol import PROMPT
+    def read(path):
+        try:
+            response = requests.get('https://api.retellai.com/' + path,
+                headers={'Authorization': f'Bearer {api_key}'}, timeout=(1.0, 2.0), allow_redirects=False)
+        except requests.RequestException:
+            raise RetellUnavailableError('Cannot verify the guarded agent.') from None
+        try:
+            if response.status_code != 200:
+                raise RetellUnavailableError('Cannot verify the guarded agent.')
+            return response.json()
+        except ValueError:
+            raise RetellUnavailableError('Invalid guarded agent configuration.') from None
+        finally:
+            response.close()
+    agent = read('get-agent/' + quote(agent_id, safe=''))
+    engine = agent.get('response_engine', {})
+    if engine.get('type') != 'retell-llm' or not engine.get('llm_id'):
+        raise RetellUnavailableError('Guarded agent response engine is incompatible.')
+    llm = read('get-retell-llm/' + quote(engine['llm_id'], safe=''))
+    tools = llm.get('general_tools') or []
+    if (llm.get('general_prompt') != PROMPT or llm.get('states')
+            or any(tool.get('type') == 'end_call' for tool in tools)
+            or not any(tool.get('name') == 'interview_control'
+                and tool.get('url') == settings.RETELL_CONVERSATION_CONTROL_URL for tool in tools)):
+        raise RetellUnavailableError('Guarded agent configuration changed; operator review is required.')
 
 
 def create_session(interview, questions) -> str:

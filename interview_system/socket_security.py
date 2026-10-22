@@ -1,4 +1,4 @@
-"""Exact browser origins and credential scrubbing before Channels sees a scope."""
+"""Validated browser origins and credential scrubbing before Channels sees a scope."""
 import re
 from urllib.parse import urlsplit
 
@@ -41,8 +41,13 @@ class SecureSocketEntry:
                 # Only a hostname/optional port, not userinfo or a URL path.
                 host_valid = (host.hostname and not host.username and not host.password and not host.path
                               and not host.query and not host.fragment and host.port != 0)
+                dev_loopback = (
+                    origin is not None and settings.DEBUG
+                    and getattr(settings, 'INTERVIEW_ANALYSIS_WS_ALLOW_DEV_LOOPBACK_PORTS', False)
+                    and origin[1] in ('localhost', '127.0.0.1', '::1')
+                )
                 allowed = (origin is not None and host_valid and validate_host(host.hostname, settings.ALLOWED_HOSTS)
-                           and origin in [origin_key(o) for o in settings.INTERVIEW_ANALYSIS_WS_ALLOWED_ORIGINS])
+                           and (dev_loopback or origin in [origin_key(o) for o in settings.INTERVIEW_ANALYSIS_WS_ALLOWED_ORIGINS]))
         except (ValueError, UnicodeDecodeError):
             pass
         query = scope.get('query_string', b'')

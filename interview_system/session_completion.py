@@ -20,6 +20,10 @@ def finish_if_ready(interview, session):
             session.save(update_fields=['ended_at'])
         interview.status = Interview.Status.DONE
         interview.save(update_fields=['status', 'updated_at'])
+        from .interview_workflow import completed_locked
+        completed_locked(interview, session)
+        from .answer_evaluation import prepare_evaluation_locked
+        prepare_evaluation_locked(interview)
 
 
 def mark_video_ended(session_id):

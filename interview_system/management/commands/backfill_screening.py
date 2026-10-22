@@ -10,7 +10,7 @@ class Command(BaseCommand):
         parser.add_argument("--execute", action="store_true")
         parser.add_argument("--limit", type=int, default=100)
         parser.add_argument("--job")
-        parser.add_argument("--apply-decisions", action="store_true", help="Allow policy transitions for pending/review applications.")
+        parser.add_argument("--apply-decisions", action="store_true", help="Allow automatic shortlisting of qualified pending/review applications; never automatically reject.")
 
     def handle(self, *args, **options):
         qs = Application.objects.filter(current_assessment__isnull=True).order_by("created_at", "pk")

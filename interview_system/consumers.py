@@ -177,11 +177,11 @@ class AnalysisSocket(AsyncWebsocketConsumer):
                 or (decision.status == 'accepted' and decision.reason is not None)
                 or (decision.status == 'dropped' and decision.reason not in ('capacity', 'rate_limited', 'stale'))):
             raise ValueError('Invalid admission decision.')
-        await self.ack(sequence, decision.status, decision.reason)
+        await self.ack(sequence, decision.status, decision.reason, validated=True)
 
-    async def ack(self, sequence, status, reason=None):
+    async def ack(self, sequence, status, reason=None, *, validated=False):
         if status == 'dropped':
-            await io(socket_db.drop(self.lease, self.generation, sequence))
+            await io(socket_db.drop(self.lease, self.generation, sequence, validated=validated))
         await self.authorize()
         message = {'type': 'ack', 'connection_generation': str(self.generation), 'sequence': sequence, 'status': status}
         if reason is not None:

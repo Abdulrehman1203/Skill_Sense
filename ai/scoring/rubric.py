@@ -24,7 +24,7 @@ def _number(value: Any, name: str, minimum: float, maximum: float | None = None)
     return result
 
 
-def score(match_score: float | None, interview_signal: float | None,
+def legacy_score(match_score: float | None, interview_signal: float | None,
           behavioral_signal: dict | None, rubric: Any) -> dict:
     """Return a 0–100 score from the available, weighted scoring signals.
 
@@ -87,3 +87,46 @@ def score(match_score: float | None, interview_signal: float | None,
         explanation += " " + "; ".join(unavailable) + "."
 
     return {"final_score": final_score, "breakdown": breakdown, "explanation": explanation}
+
+
+def combined_score(match_percentage, interview_percentage, *, weight_match='0.4', weight_interview='0.6', weight_behavioral=0):
+    """combined-v1: percentages in/out, required evidence, Decimal HALF_UP once.
+
+    Evaluation criteria are normalized upstream. Evaluation.score is already 0..100;
+    never multiply it by 100 again. Behavioral observations do not enter this policy.
+    """
+    from decimal import Decimal, ROUND_HALF_UP
+
+    def decimal(value, maximum):
+        if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
+            raise ValueError('Expected a finite numeric value')
+        result = Decimal(str(value))
+        if not result.is_finite() or not 0 <= result <= maximum:
+            raise ValueError('Numeric value outside policy bounds')
+        return result
+
+    wm, wi, wb = [decimal(v, 1) for v in (weight_match, weight_interview, weight_behavioral)]
+    if not wm or not wi or wb != 0 or wm + wi != 1:
+        raise ValueError('combined-v1 requires positive match/interview weights summing exactly to 1 and behavioral weight zero')
+    match = None if match_percentage is None else decimal(match_percentage, 100)
+    interview = None if interview_percentage is None else decimal(interview_percentage, 100)
+    complete = match is not None and interview is not None
+    final = (wm * match + wi * interview).quantize(Decimal('.01'), rounding=ROUND_HALF_UP) if complete else None
+    return {'status': 'COMPLETE' if complete else 'INCOMPLETE', 'final_score': final,
+        'screening_match_percentage': match, 'interview_performance_percentage': interview,
+        'coverage': (wm if match is not None else 0) + (wi if interview is not None else 0)}
+
+
+def score(match_score, interview_signal, behavioral_signal, rubric):
+    """Current public policy; legacy penalties are available only via legacy_score.
+
+    Compatibility input interview_signal is 0..1. Durable scoring uses the explicit
+    percentage-only combined_score boundary instead.
+    """
+    from decimal import Decimal
+    interview = None if interview_signal is None else Decimal(str(_number(interview_signal, 'interview_signal', 0, 1))) * 100
+    result = combined_score(match_score, interview, weight_match=rubric.weight_match,
+        weight_interview=rubric.weight_interview, weight_behavioral=rubric.weight_behavioral)
+    return {**result, 'breakdown': {'match': result['screening_match_percentage'],
+        'interview': result['interview_performance_percentage'], 'behavioral': None},
+        'explanation': 'Combined recommendation uses screening and evaluated answers only; missing required evidence prevents finalization.'}
