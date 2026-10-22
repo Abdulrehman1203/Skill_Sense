@@ -99,3 +99,6 @@ celerybeat-schedule.bak
 celerybeat-schedule.dat
 celerybeat-schedule.dir
 celerybeat-schedule
+
+!interview_system/test_voice_origin_preflight.py
+!docs/interview_join_fix_2026_10_20.md

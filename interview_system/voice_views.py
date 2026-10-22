@@ -16,6 +16,7 @@ from .integrations import retell_client
 from .models import Interview, InterviewSession, RetellCall, User
 from .serializers import StartVoiceSessionResponseSerializer
 from .voice import accept_event, normalize_call
+from .socket_security import origin_key
 
 
 class VoiceStartSerializer(serializers.Serializer):
@@ -81,6 +82,18 @@ class VoiceInterviewMixin:
     def start_voice_session(self, request, pk=None):
         options = VoiceStartSerializer(data=request.data)
         options.is_valid(raise_exception=True)
+        # HTTP CORS can allow a Flutter debug port that the stricter socket
+        # allowlist rejects. Fail before creating a call or starting video timers.
+        origin = request.headers.get('Origin')
+        if options.validated_data['video_required'] and origin is not None:
+            key = origin_key(origin)
+            allowed = {origin_key(value) for value in settings.INTERVIEW_ANALYSIS_WS_ALLOWED_ORIGINS}
+            if key is None or key not in allowed:
+                return _private(Response({
+                    'detail': 'This app origin is not configured for interview video. '
+                              'Use the configured frontend port or ask the server operator to add '
+                              'this origin to INTERVIEW_ANALYSIS_WS_ALLOWED_ORIGINS.',
+                }, status=503))
         with transaction.atomic():
             interview = get_object_or_404(Interview.objects.select_for_update(), pk=pk)
             app = interview.application
