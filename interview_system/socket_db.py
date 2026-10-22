@@ -65,5 +65,6 @@ async def disconnect(session_id, generation):
     return await database_sync_to_async(_call)(disconnect_publisher, session_id, generation)
 
 
-async def drop(lease, generation, sequence):
-    return await database_sync_to_async(_call)(record_frame_drop, lease, generation, sequence)
+async def drop(lease, generation, sequence, *, validated=False):
+    from functools import partial
+    return await database_sync_to_async(_call)(partial(record_frame_drop, validated=validated), lease, generation, sequence)

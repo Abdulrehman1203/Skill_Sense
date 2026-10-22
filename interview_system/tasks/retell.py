@@ -31,6 +31,8 @@ def process_retell_event(self, event_id):
 
 @shared_task(ignore_result=True)
 def recover_retell():
+    from .conversation import recover_conversation_stops
+    recover_conversation_stops.run()
     now = timezone.now()
     for interview_id in InterviewSession.objects.filter(creation_uncertain=True).values_list('interview_id', flat=True)[:25]:
         try:

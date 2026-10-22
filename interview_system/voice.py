@@ -41,8 +41,9 @@ def normalize_call(call):
 
 
 def accept_event(payload, event='call_ended'):
+    from .answer_evaluation import digest
     row, _ = RetellWebhookEvent.objects.get_or_create(
-        call_id=payload['retell_session_id'], event=event, defaults={'payload': payload},
+        call_id=payload['retell_session_id'], event=event, content_hash=digest(payload), defaults={'payload': payload},
     )
     if row.processed_at is None:
         transaction.on_commit(lambda: dispatch_event(row.pk))
@@ -78,6 +79,12 @@ def reconcile_creation(interview_id):
         interview.retell_session_id = data['call_id']
         interview.status = Interview.Status.LIVE
         interview.save(update_fields=['retell_session_id', 'status', 'updated_at'])
+        from django.conf import settings
+        if settings.RETELL_CONVERSATION_GUARD_ENABLED:
+            from .conversation_control import initialize_locked
+            initialize_locked(interview)
+        from .interview_workflow import started_locked
+        started_locked(interview)
         session.creation_uncertain = False
         session.started_at = session.started_at or timezone.now()
         session.save(update_fields=['creation_uncertain', 'started_at'])
@@ -112,7 +119,10 @@ def apply_event(event_id):
         if session.audio_ended_at is None:
             session.transcript = payload['transcript']
             session.audio_ended_at = ended
-            session.save(update_fields=['transcript', 'audio_ended_at'])
+            session.audio_terminal_status = payload.get('status', 'ended')
+            session.save(update_fields=['transcript', 'audio_ended_at', 'audio_terminal_status'])
+        from .answer_evaluation import accept_transcript_locked
+        accept_transcript_locked(interview, session, {**payload, 'retell_session_id': row.call_id}, row.event)
         call = RetellCall.objects.filter(call_id=row.call_id).first()
         if call:
             call.status = payload.get('status', 'ended')

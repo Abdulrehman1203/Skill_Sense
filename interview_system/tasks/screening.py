@@ -12,7 +12,7 @@ from django.db import transaction
 from django.db.models import F, Q
 from django.utils import timezone
 from ..models import Application, ApplicationAssessment, ParsedResume, Resume
-from ..screening import ACTIVE_STAGES, dispatch, evaluate
+from ..screening import ACTIVE_STAGES, apply_qualification_locked, dispatch, evaluate
 
 logger = logging.getLogger(__name__)
 LEASE = timedelta(minutes=10)
@@ -82,13 +82,16 @@ def parsed_resume(resume_id):
 @shared_task(ignore_result=True, acks_late=True, soft_time_limit=540, time_limit=570)
 def process_assessment(assessment_id):
     token = uuid.uuid4()
+    application_id = ApplicationAssessment.objects.values_list("application_id", flat=True).get(pk=assessment_id)
     with transaction.atomic():
+        # Match completion and API lock order even during claim acquisition.
+        app = Application.objects.select_for_update().get(pk=application_id)
         assessment = ApplicationAssessment.objects.select_for_update().get(pk=assessment_id)
         if assessment.status not in ACTIVE_STAGES or assessment.next_attempt_at > timezone.now():
             return
         if assessment.lease_until and assessment.lease_until > timezone.now():
             return
-        if not Application.objects.filter(pk=assessment.application_id, current_assessment=assessment).exists():
+        if app.current_assessment_id != assessment.pk:
             return
         if assessment.attempts >= MAX_ATTEMPTS:
             assessment.status, assessment.error_code = "FAILED", "RECOVERY_EXHAUSTED"
@@ -130,7 +133,9 @@ def process_assessment(assessment_id):
             current.claim_token = None
             current.error_code = current.error_message = current.recovery_action = ""
             current.save()
-            # Screening records a recommendation; only recruiter actions change the stage.
+            apply_qualification_locked(app, current)
+            from ..final_scoring import ensure_locked
+            ensure_locked(app)
     except ParseBusy:
         claimed.update(status="QUEUED", attempts=F("attempts") - 1, claim_token=None, lease_until=None,
                        next_attempt_at=timezone.now() + timedelta(seconds=15))

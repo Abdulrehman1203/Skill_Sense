@@ -11,7 +11,8 @@ from .models import Interview, Question
 
 
 def prepare_development_questions_locked(interview, actor):
-    if not settings.DEBUG or interview.status != Interview.Status.SCHEDULED or interview.retell_session_id:
+    if (not settings.DEBUG or interview.status != Interview.Status.SCHEDULED
+            or interview.retell_session_id or interview.question_set_id):
         return []
     approved = list(interview.questions.filter(approved=True).order_by('created_at', 'pk'))
     if approved:
@@ -35,6 +36,9 @@ def prepare_development_questions_locked(interview, actor):
     if not selected:
         return []
     Question.objects.bulk_create(selected)
+    interview.question_preparation_mode = "DEMO_TEMPLATE"
+    interview.question_fallback_reason = "DEBUG_START_NOW_TEMPLATES"
+    interview.save(update_fields=["question_preparation_mode", "question_fallback_reason", "updated_at"])
     record_audit(actor=actor, action='interview.development_questions_prepared',
                  target=interview, changed_fields=['questions'])
     return list(interview.questions.filter(approved=True).order_by('created_at', 'pk'))

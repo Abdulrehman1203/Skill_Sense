@@ -9,7 +9,7 @@ from django.db import transaction
 from django.db.models import Max
 from django.utils import timezone
 from rest_framework.exceptions import APIException, ValidationError
-from .models import Application, ApplicationAssessment, Job, ScreeningEvent
+from .models import Application, ApplicationAssessment, Job, QuestionPreparationIntent, ScreeningEvent
 
 logger = logging.getLogger(__name__)
 ACTIVE_STAGES = ("QUEUED", "PARSING", "MATCHING", "SCREENING")
@@ -62,7 +62,26 @@ def normalize(value):
     value = re.sub(r"\s+", " ", str(value).strip().lower())
     return {"py": "python", "js": "javascript", "postgres": "postgresql",
             "nodejs": "node.js", "node js": "node.js", "reactjs": "react",
-            "c sharp": "c#", "csharp": "c#"}.get(value, value)
+            "c sharp": "c#", "csharp": "c#",
+            "rest apis": "rest api", "restful api": "rest api", "restful apis": "rest api",
+            "restful api design": "rest api", "rest api design": "rest api"}.get(value, value)
+
+
+def employment_interval(duration):
+    """Two explicit month/year endpoints, in either common numeric order.
+
+    Keep the existing conservative elapsed-month convention. Month-only ranges
+    do not establish extra full months at both boundaries; never round 11 months
+    up to a required year. Free-text totals/current dates remain unverified.
+    """
+    if not isinstance(duration, str):
+        return None
+    endpoints = re.findall(r'(?<!\d)(?:(19\d{2}|20\d{2})[-/](0[1-9]|1[0-2])|(0[1-9]|1[0-2])[-/](19\d{2}|20\d{2}))(?!\d)', duration)
+    if len(endpoints) != 2:
+        return None
+    values = [int(year or reversed_year) * 12 + int(month or reversed_month)
+        for year, month, reversed_month, reversed_year in endpoints]
+    return tuple(values) if values[1] >= values[0] else None
 
 
 def criterion(kind, name, status, evidence=""):
@@ -72,12 +91,12 @@ def criterion(kind, name, status, evidence=""):
 def evaluate(policy, parsed, score):
     """Conservative evidence rules; omission is UNKNOWN, never an invented failure."""
     results = []
-    skills = {normalize(s) for s in parsed.skills}
+    skills = {normalize(s): s for s in parsed.skills}
     required = policy.get("skills_required", [])
     for skill in required:
         found = normalize(skill) in skills
         results.append(criterion("skill", skill, "PASS" if found else "UNKNOWN",
-                                 skill if found else "Not evidenced in extracted resume skills."))
+                                 skills[normalize(skill)] if found else "Not evidenced in extracted resume skills."))
     criteria = policy.get("screening_criteria", {})
     for cert in criteria.get("certifications", []):
         found = normalize(cert) in {normalize(c) for c in parsed.certifications}
@@ -107,25 +126,22 @@ def evaluate(policy, parsed, score):
                 continue
             evidence = normalize(entry.get("title", "") + " " + entry.get("description", ""))
             relevant = not required or any(re.search(r"(?<!\w)" + re.escape(normalize(s)) + r"(?!\w)", evidence) for s in required)
-            dates = re.findall(r"\b((?:19|20)\d{2})[-/](0[1-9]|1[0-2])\b", str(entry.get("duration", "")))
-            if not relevant or len(dates) != 2:
+            interval = employment_interval(entry.get('duration', ''))
+            if not relevant or interval is None:
                 ambiguous = True
                 continue
-            start, end = [int(y) * 12 + int(m) for y, m in dates]
-            if end < start:
-                ambiguous = True
-                continue
-            intervals.append((start, end))
+            intervals.append(interval)
         merged = []
         for start, end in sorted(intervals):
             if merged and start <= merged[-1][1]:
                 merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
             else:
                 merged.append((start, end))
-        years = Decimal(sum(b - a for a, b in merged)) / 12
+        months = sum(b - a for a, b in merged)
+        years = Decimal(months) / 12
         state = "PASS" if years >= Decimal(str(minimum)) else "UNKNOWN" if ambiguous or not intervals else "FAIL"
         results.append(criterion("experience", f"{minimum} relevant years", state,
-                                 f"{years:.2f} years in explicit non-overlapping relevant date ranges."))
+                                 f"{years:.2f} years ({months} elapsed months) in explicit non-overlapping relevant date ranges."))
     if criteria.get("manual_review_required"):
         results.append(criterion("manual", "Additional mandatory requirements", "UNKNOWN", "Recruiter review required."))
     states = {r["status"] for r in results}
@@ -164,6 +180,51 @@ def permitted_actions(app, user):
     return ["reject"] if recruiter else []
 
 
+def apply_qualification_locked(app, assessment):
+    """Apply only a passing current assessment while holding both row locks.
+
+    Called in the same transaction that persists assessment success, with lock
+    order Application -> ApplicationAssessment. Non-passing recommendations
+    never reject an application, and historical/backfill work is read-only.
+    The preparation intent is the durable handoff, independent of broker uptime.
+    """
+    if (
+        app.current_assessment_id != assessment.pk
+        or assessment.application_id != app.pk
+        or app.resume_id != assessment.resume_id
+        or app.status not in (Application.Status.APPLIED, Application.Status.UNDER_REVIEW)
+        or not assessment.apply_decision
+        or assessment.status != "SUCCEEDED"
+        or assessment.outcome != Application.Status.SHORTLISTED
+        or assessment.eligibility != "PASS"
+        or assessment.reasons != ["QUALIFIED"]
+        or not assessment.policy.get("auto_shortlist_enabled")
+        or assessment.match_score is None
+        or assessment.match_score < Decimal(assessment.policy["screening_threshold"])
+    ):
+        return False
+
+    old_status = app.status
+    app.status = Application.Status.SHORTLISTED
+    app.version += 1
+    app.save(update_fields=["status", "version", "updated_at"])
+    event = ScreeningEvent.objects.create(
+        application=app, assessment=assessment, actor=None, source="SYSTEM",
+        from_status=old_status, to_status=Application.Status.SHORTLISTED,
+        reason="Qualified: match score meets the screening threshold and required criteria are verified.",
+    )
+    QuestionPreparationIntent.objects.create(assessment=assessment, screening_event=event)
+    from .question_preparation import prepare_locked
+    prepare_locked(app, assessment)
+    from .notifications import queue_notification
+    from .audit import record_audit
+    record_audit(actor=None, action='screening.automatically_shortlisted', target=assessment,
+        changed_fields=['status'], revision=assessment.revision, application_id=app.pk)
+    queue_notification(app.candidate.user_id, "application_status_changed", resource_type='application',
+        resource_id=app.pk, revision=app.version)
+    return True
+
+
 @transaction.atomic
 def transition(application_id, target, *, actor, reason="", expected_version=None):
     app = Application.objects.select_for_update(of=("self",)).select_related("current_assessment").get(pk=application_id)
@@ -185,6 +246,13 @@ def transition(application_id, target, *, actor, reason="", expected_version=Non
     old = app.status
     app.status, app.version = target, app.version + 1
     app.save(update_fields=["status", "version", "updated_at"])
-    ScreeningEvent.objects.create(application=app, assessment=assessment, actor=actor,
+    event = ScreeningEvent.objects.create(application=app, assessment=assessment, actor=actor,
                                   source="MANUAL", from_status=old, to_status=target, reason=reason)
+    from .audit import record_audit
+    record_audit(actor=actor, action='screening.manual_decision', target=app,
+        changed_fields=['status'], revision=app.version, application_id=app.pk)
+    if target == "SHORTLISTED":
+        QuestionPreparationIntent.objects.get_or_create(assessment=assessment, defaults={"screening_event": event})
+        from .question_preparation import prepare_locked
+        prepare_locked(app, assessment)
     return app

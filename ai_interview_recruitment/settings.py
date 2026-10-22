@@ -24,6 +24,9 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # application code accesses them only through integrations/retell_client.py.
 RETELL_API_KEY = os.getenv("RETELL_API_KEY", "")
 RETELL_AGENT_ID = os.getenv("RETELL_AGENT_ID", "")
+# Enable after deploying the authenticated callback and guarded agent.
+RETELL_CONVERSATION_GUARD_ENABLED = os.getenv('RETELL_CONVERSATION_GUARD_ENABLED', 'False').lower() == 'true'
+RETELL_CONVERSATION_CONTROL_URL = os.getenv('RETELL_CONVERSATION_CONTROL_URL', '')
 RETELL_CREDENTIAL_ENCRYPTION_KEY = os.getenv("RETELL_CREDENTIAL_ENCRYPTION_KEY", "")
 
 
@@ -235,6 +238,10 @@ CHANNEL_LAYERS = {'default': {
 }}
 INTERVIEW_ANALYSIS_WS_ALLOWED_ORIGINS = [s.strip() for s in os.getenv('INTERVIEW_ANALYSIS_WS_ALLOWED_ORIGINS',
     'http://localhost:3000,http://localhost:50893,http://localhost:50894,http://127.0.0.1:50893,http://127.0.0.1:50894').split(',') if s.strip()]
+# Flutter development assigns a fresh browser port; never relax deployed origins.
+INTERVIEW_ANALYSIS_WS_ALLOW_DEV_LOOPBACK_PORTS = os.getenv(
+    'INTERVIEW_ANALYSIS_WS_ALLOW_DEV_LOOPBACK_PORTS', 'True'
+).lower() in ('true', '1', 'yes')
 INTERVIEW_ANALYSIS_MAX_MESSAGE_BYTES = 307200
 INTERVIEW_ANALYSIS_MAX_JPEG_BYTES = 204800
 INTERVIEW_ANALYSIS_MAX_PIXELS = 921600
@@ -296,6 +303,20 @@ CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_TASK_ALWAYS_EAGER = os.getenv("CELERY_TASK_ALWAYS_EAGER", "False").lower() in ("true", "1", "yes")
 CELERY_BEAT_SCHEDULE = {
+    'recover-notification-outbox': {'task': 'interview_system.tasks.notification_tasks.recover_notification_outbox', 'schedule': 15.0},
+    'recover-feedback-reports': {'task': 'interview_system.tasks.feedback.recover_feedback_reports', 'schedule': 15.0},
+    "recover-final-scores": {
+        "task": "interview_system.tasks.scoring_tasks.recover_final_scores",
+        "schedule": 15.0,
+    },
+    "recover-answer-evaluations": {
+        "task": "interview_system.tasks.evaluation.recover_evaluations",
+        "schedule": 15.0,
+    },
+    "recover-question-preparation": {
+        "task": "interview_system.tasks.questions.recover_question_preparation",
+        "schedule": 15.0,
+    },
     "recover-interview-analysis-video": {
         "task": "interview_system.tasks.video.recover_video",
         "schedule": max(1, INTERVIEW_ANALYSIS_VIDEO_RECOVERY_SECONDS),
@@ -323,8 +344,10 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-3.5-flash-lite")
 GEMINI_REQUEST_TIMEOUT_MS = int(os.getenv("GEMINI_REQUEST_TIMEOUT_MS", "60000"))
 GEMINI_PARSE_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_PARSE_MAX_OUTPUT_TOKENS", "4096"))
-GEMINI_QUESTION_MODEL_NAME = os.getenv("GEMINI_QUESTION_MODEL_NAME", "gemini-2.5-flash")
-GEMINI_QUESTION_TIMEOUT_MS = int(os.getenv("GEMINI_QUESTION_TIMEOUT_MS", "7000"))
+GEMINI_QUESTION_MODEL_NAME = os.getenv("GEMINI_QUESTION_MODEL_NAME", GEMINI_MODEL_NAME)
+GEMINI_QUESTION_TIMEOUT_MS = int(os.getenv("GEMINI_QUESTION_TIMEOUT_MS", "15000"))
+GEMINI_EVALUATION_MODEL_NAME = os.getenv("GEMINI_EVALUATION_MODEL_NAME", GEMINI_MODEL_NAME)
+TRANSCRIPT_ENRICHMENT_WAIT_SECONDS = min(900, max(30, int(os.getenv("TRANSCRIPT_ENRICHMENT_WAIT_SECONDS", "300"))))
 
 # ── SBERT Matching ───────────────────────────────────────────
 SBERT_MODEL_NAME = os.getenv("SBERT_MODEL_NAME", "all-MiniLM-L6-v2")
@@ -388,6 +411,8 @@ SPECTACULAR_SETTINGS = {
     "SERVE_INCLUDE_SCHEMA": False,   # hide the raw /api/schema/ from Swagger sidebar
     "COMPONENT_SPLIT_REQUEST": True, # separate request/response schemas
     "ENUM_NAME_OVERRIDES": {
+        "TranscriptSpeakerEnum": ['agent', 'user'],
+        "PlatformUserRoleEnum": 'interview_system.models.User.Role',
         "JobStatusEnum": "interview_system.models.Job.Status",
         "ResumeStatusEnum": "interview_system.models.Resume.Status",
         "ApplicationStatusEnum": "interview_system.models.Application.Status",

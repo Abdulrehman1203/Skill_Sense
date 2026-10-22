@@ -298,15 +298,16 @@ class ScoringRubricSerializer(serializers.ModelSerializer):
 
     class Meta:  # type: ignore
         model = ScoringRubric
-        fields = ["id", "name", "weight_match", "weight_interview", "weight_behavioral", "active", "created_at"]
-        read_only_fields = ["id", "active", "created_at"]
+        fields = ["id", "name", "version", "policy_version", "weight_match", "weight_interview", "weight_behavioral", "active", "created_at"]
+        read_only_fields = ["id", "version", "policy_version", "active", "created_at"]
 
     def validate(self, attrs: dict[str, Any]) -> dict[str, Any]:
-        # 1e-6 accepts ordinary float representation error while rejecting
-        # materially unbalanced scoring configurations.
-        weights = (attrs["weight_match"], attrs["weight_interview"], attrs["weight_behavioral"])
-        if not math.isclose(math.fsum(weights), 1.0, rel_tol=0.0, abs_tol=1e-6):
-            raise serializers.ValidationError({"weights": "Weights must sum to 1.0 within 1e-6."})
+        from ai.scoring.rubric import combined_score
+        try:
+            combined_score(None, None, weight_match=attrs['weight_match'],
+                weight_interview=attrs['weight_interview'], weight_behavioral=attrs['weight_behavioral'])
+        except (ValueError, ArithmeticError) as exc:
+            raise serializers.ValidationError({'weights': str(exc)}) from None
         return attrs
 
 
@@ -752,7 +753,7 @@ class ApplicationListSerializer(serializers.ModelSerializer):
 class NotificationSerializer(serializers.ModelSerializer):
     class Meta:
         model = Notification
-        fields = ["id", "type", "message", "is_read", "created_at"]
+        fields = ["id", "type", "message", "links", "is_read", "created_at"]
         read_only_fields = fields
 
 
@@ -818,10 +819,38 @@ class ScoreBreakdownSerializer(serializers.Serializer):
     behavioral = serializers.FloatField(allow_null=True, default=None, read_only=True)
 
 
+class ScoreWeightsSerializer(serializers.Serializer):
+    match = serializers.CharField()
+    interview = serializers.CharField()
+    behavioral = serializers.CharField()
+
+
+class ScoreSourcesSerializer(serializers.Serializer):
+    assessment = serializers.UUIDField(allow_null=True)
+    assessment_revision = serializers.IntegerField(allow_null=True)
+    evaluation = serializers.UUIDField(allow_null=True)
+    evaluation_revision = serializers.IntegerField(allow_null=True)
+
+
 class CandidateScoreResponseSerializer(serializers.Serializer):
     final_score = serializers.FloatField(allow_null=True, read_only=True)
     breakdown = ScoreBreakdownSerializer(read_only=True)
     explanation = serializers.CharField(read_only=True)
+    status = serializers.CharField(read_only=True)
+    policy_version = serializers.CharField(read_only=True)
+    score_revision = serializers.UUIDField(allow_null=True, read_only=True)
+    revision = serializers.IntegerField(allow_null=True, read_only=True)
+    rubric = serializers.UUIDField(allow_null=True, read_only=True)
+    rubric_version = serializers.IntegerField(allow_null=True, read_only=True)
+    weights = ScoreWeightsSerializer(allow_null=True, read_only=True)
+    source_revisions = ScoreSourcesSerializer(read_only=True)
+    screening_match_percentage = serializers.FloatField(allow_null=True, read_only=True)
+    interview_performance_percentage = serializers.FloatField(allow_null=True, read_only=True)
+    combined_recommendation_percentage = serializers.FloatField(allow_null=True, read_only=True)
+    coverage = serializers.FloatField(allow_null=True, read_only=True)
+    answer_coverage = serializers.FloatField(allow_null=True, read_only=True)
+    error_code = serializers.CharField(read_only=True)
+    completed_at = serializers.DateTimeField(allow_null=True, read_only=True)
 
 
 class CandidateScoreQuerySerializer(serializers.Serializer):
@@ -831,21 +860,25 @@ class CandidateScoreQuerySerializer(serializers.Serializer):
 class ApplicationRankingSerializer(ApplicationListSerializer):
     """Reuse the candidate identity fields already visible in application lists."""
 
-    final_score = serializers.FloatField(
-        source="score.final_score", allow_null=True, default=None, read_only=True,
-    )
+    final_score = serializers.FloatField(source='_rank_score', allow_null=True, default=None, read_only=True)
+    score_status = serializers.SerializerMethodField()
+    rubric_version = serializers.IntegerField(source='_ranking_rubric_version', allow_null=True, default=None, read_only=True)
+
+    def get_score_status(self, obj) -> str:
+        return 'COMPLETE' if getattr(obj, '_rank_score', None) is not None else 'INCOMPLETE'
 
     class Meta:
         model = Application
-        fields = ["id", "candidate", "candidate_email", "candidate_name", "final_score"]
+        fields = ["id", "candidate", "candidate_email", "candidate_name", "final_score", "score_status", "rubric_version"]
         read_only_fields = fields
 
 
 class ApplicationDetailSerializer(ApplicationListSerializer):
     history = serializers.SerializerMethodField()
+    decision = serializers.SerializerMethodField()
 
     class Meta(ApplicationListSerializer.Meta):
-        fields = ApplicationListSerializer.Meta.fields + ["cover_note", "history"]
+        fields = ApplicationListSerializer.Meta.fields + ["cover_note", "history", "decision"]
         read_only_fields = fields
 
     @extend_schema_field(serializers.ListField(child=serializers.DictField()))
@@ -855,6 +888,37 @@ class ApplicationDetailSerializer(ApplicationListSerializer):
             return []
         return list(obj.screening_events.order_by("-created_at").values(
             "source", "from_status", "to_status", "reason", "created_at", "assessment_id")[:50])
+
+    @extend_schema_field(serializers.DictField(allow_null=True))
+    def get_decision(self, obj):
+        request = self.context.get("request")
+        if not request or request.user.role != "RECRUITER":
+            return None
+        if obj.status != 'DECISION':
+            return None
+        action = obj.workflow_actions.filter(action='decision.recorded').order_by('-created_at', '-pk').first()
+        if action:
+            return {**action.details, 'actor': str(action.actor_id), 'reason': action.reason, 'created_at': action.created_at}
+        row = getattr(obj, "hiring_decision", None)
+        if row is None:
+            return {"legacy_unrecorded": True} if obj.status == "DECISION" else None
+        return {"outcome": row.outcome, "actor": str(row.actor_id), "reason": row.reason,
+            "evaluation": str(row.evaluation_id) if row.evaluation_id else None,
+            "override": row.override, "override_reason": row.override_reason,
+            "application_version": row.application_version, "created_at": row.created_at}
+
+
+class ApplicationDecisionSerializer(serializers.Serializer):
+    expected_version = serializers.IntegerField(min_value=1)
+    outcome = serializers.ChoiceField(choices=["HIRE", "REJECT"])
+    reason = serializers.CharField(max_length=10000, allow_blank=False)
+    override = serializers.BooleanField(default=False)
+    override_reason = serializers.CharField(max_length=10000, allow_blank=False, required=False, default="")
+
+    def to_internal_value(self, data):
+        if not isinstance(data, dict) or set(data) - set(self.fields):
+            raise serializers.ValidationError({"non_field_errors": ["Only documented decision fields may be supplied."]})
+        return super().to_internal_value(data)
 
 
 class ScreeningActionSerializer(serializers.Serializer):
@@ -868,52 +932,12 @@ class ScreeningRetrySerializer(serializers.Serializer):
     consent_given = serializers.BooleanField(required=False, default=False)
 
 
-class ApplicationAdvanceSerializer(serializers.Serializer):
+class ApplicationAdvanceSerializer(ApplicationDecisionSerializer):
+    """Legacy DECISION alias uses the same explicit, versioned decision payload.
+
+    Screening transitions continue through their own ScreeningActionSerializer.
     """
-    Input serializer for PATCH /api/applications/{id}/advance/.
-
-    Validates the transitions owned by the generic advance endpoint.
-
-    Scheduling is the sole owner of SCREENED → INTERVIEWED, so that
-    transition is deliberately rejected here.
-    """
-
-    status = serializers.ChoiceField(choices=Application.Status.choices)
-
-    def validate_status(self, value: str) -> str:
-        application: Application = self.context["application"]
-        current = application.status
-
-        if current in (Application.Status.SCREENED, Application.Status.SHORTLISTED):
-            raise serializers.ValidationError(
-                "SCREENED applications become INTERVIEWED only when an "
-                "interview is scheduled through POST /api/interviews/."
-            )
-
-        allowed = {
-            Application.Status.APPLIED: Application.Status.SCREENED,
-            Application.Status.INTERVIEWED: Application.Status.DECISION,
-        }
-        if current == Application.Status.DECISION:
-            raise serializers.ValidationError(
-                "Application is already in terminal status 'DECISION'. "
-                "No further advancement is possible."
-            )
-        if current not in allowed:
-            raise serializers.ValidationError(
-                f"Application is in an unrecognized status: {current}."
-            )
-
-        next_status = str(allowed[current])
-
-        if value != next_status:
-            raise serializers.ValidationError(
-                f"Invalid status transition. Current status is '{current}'. "
-                f"The next valid status is '{next_status}', "
-                f"but '{value}' was provided."
-            )
-
-        return value
+    status = serializers.ChoiceField(choices=["DECISION"])
 
 
 class StartVoiceSessionResponseSerializer(serializers.Serializer):
@@ -940,6 +964,8 @@ class InterviewCreateSerializer(serializers.Serializer):
 
     application = serializers.UUIDField()
     scheduled_at = serializers.DateTimeField()
+    question_set = serializers.UUIDField()
+    expected_revision = serializers.IntegerField(min_value=1)
 
 
 class InterviewQuestionSerializer(serializers.ModelSerializer):
@@ -981,6 +1007,11 @@ class InterviewSerializer(serializers.ModelSerializer):
     """Read-only scheduled interview response."""
 
     questions = InterviewQuestionSerializer(many=True, read_only=True)
+    workflow_state = serializers.SerializerMethodField()
+
+    def get_workflow_state(self, obj) -> str:
+        from .interview_workflow import workflow_state
+        return workflow_state(obj)
 
     class Meta:  # type: ignore
         model = Interview
@@ -990,10 +1021,47 @@ class InterviewSerializer(serializers.ModelSerializer):
             "status",
             "scheduled_at",
             "questions",
+            "question_preparation_mode",
+            "question_fallback_reason",
+            "workflow_state", "completion_outcome", "evaluation_status", "completed_at",
             "created_at",
             "updated_at",
         ]
         read_only_fields = list(fields)
+
+
+class QuestionReadinessSerializer(serializers.Serializer):
+    state = serializers.ChoiceField(choices=['READY', 'PENDING'])
+    approved_question_count = serializers.IntegerField(min_value=0)
+    can_start = serializers.BooleanField()
+
+
+class CandidateInterviewSerializer(serializers.ModelSerializer):
+    """Candidate lobby contract: no question bank, evaluation content or rubric."""
+    question_readiness = serializers.SerializerMethodField()
+    workflow_state = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Interview
+        fields = ["id", "application", "status", "scheduled_at", "workflow_state",
+                  "completed_at", "question_readiness", "created_at", "updated_at"]
+        read_only_fields = fields
+
+    def get_workflow_state(self, obj) -> str:
+        from .interview_workflow import workflow_state
+        return workflow_state(obj)
+
+    @extend_schema_field(QuestionReadinessSerializer)
+    def get_question_readiness(self, obj):
+        count = getattr(obj, "approved_question_count", None)
+        if count is None:
+            count = obj.questions.filter(approved=True).count()
+        terminal = obj.application.status in ("REJECTED", "DECISION")
+        from datetime import timedelta
+        from django.utils import timezone
+        join_window = obj.status == "LIVE" or obj.scheduled_at is None or obj.scheduled_at <= timezone.now() + timedelta(minutes=15)
+        return {"state": "READY" if count else "PENDING", "approved_question_count": count,
+                "can_start": bool(count and obj.status in ("SCHEDULED", "LIVE") and not terminal and join_window)}
 
 
 # ═══════════════════════════════════════════════════════════════
