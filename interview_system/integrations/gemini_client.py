@@ -127,6 +127,10 @@ turns. Ambiguous or partial evidence remains MISSING_EVIDENCE, never NO_ANSWER.
                     response_mime_type='application/json', max_output_tokens=24000,
                     response_json_schema=schema,
                     automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True)))
+        # Guard: safety filter or quota exhaustion can yield an empty response.
+        raw_eval_text = getattr(response, 'text', None)
+        if not raw_eval_text:
+            raise GeminiParseError('EVALUATION_PROVIDER_EMPTY_RESPONSE')
         # Strict JSON: no fenced prose, NaN, infinity or duplicate keys.
         def object_pairs(pairs):
             result = {}
@@ -135,7 +139,7 @@ turns. Ambiguous or partial evidence remains MISSING_EVIDENCE, never NO_ANSWER.
                     raise ValueError('duplicate key')
                 result[name] = value
             return result
-        return json.loads(response.text, object_pairs_hook=object_pairs,
+        return json.loads(raw_eval_text, object_pairs_hook=object_pairs,
             parse_constant=lambda _: (_ for _ in ()).throw(ValueError('nonfinite')))
     except (ValueError, TypeError) as exc:
         raise InvalidEvaluation('INVALID_EVALUATION_JSON') from exc

@@ -302,7 +302,7 @@ CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
 CELERY_TASK_ALWAYS_EAGER = os.getenv("CELERY_TASK_ALWAYS_EAGER", "False").lower() in ("true", "1", "yes")
-CELERY_BEAT_SCHEDULE = {
+CELERY_BEAT_SCHEDULE: dict[str, dict[str, object]] = {
     'recover-notification-outbox': {'task': 'interview_system.tasks.notification_tasks.recover_notification_outbox', 'schedule': 15.0},
     'recover-feedback-reports': {'task': 'interview_system.tasks.feedback.recover_feedback_reports', 'schedule': 15.0},
     "recover-final-scores": {
@@ -439,3 +439,6 @@ SPECTACULAR_SETTINGS = {
         {"name": "Jobs", "description": "Job posting CRUD and skill management"},
     ],
 }
+
+# Isolate broker deliveries as well as database records during tests.
+TEST_RUNNER = "ai_interview_recruitment.testing.IsolatedTestRunner"

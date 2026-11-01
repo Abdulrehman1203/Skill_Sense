@@ -82,6 +82,7 @@ test_*.py
 tests.py
 **/tests.py
 verification/
+/ai_interview_recruitment/testing.py
 
 # ── Review / Backups / Audits ────────────────────────────────
 review/

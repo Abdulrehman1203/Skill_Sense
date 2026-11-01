@@ -4,10 +4,12 @@ from celery import shared_task
 from django.db import transaction
 from django.utils import timezone
 from ..models import InterviewConversation
+from .guards import skip_missing_resource
 from ..integrations import retell_client
 
 
 @shared_task(ignore_result=True, acks_late=True)
+@skip_missing_resource(InterviewConversation)
 def stop_conversation(interview_id):
     now = timezone.now()
     with transaction.atomic():

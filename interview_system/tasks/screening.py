@@ -12,6 +12,7 @@ from django.db import transaction
 from django.db.models import F, Q
 from django.utils import timezone
 from ..models import Application, ApplicationAssessment, ParsedResume, Resume
+from .guards import skip_missing_resource
 from ..screening import ACTIVE_STAGES, apply_qualification_locked, dispatch, evaluate
 
 logger = logging.getLogger(__name__)
@@ -80,6 +81,7 @@ def parsed_resume(resume_id):
 
 
 @shared_task(ignore_result=True, acks_late=True, soft_time_limit=540, time_limit=570)
+@skip_missing_resource(ApplicationAssessment, Application)
 def process_assessment(assessment_id):
     token = uuid.uuid4()
     application_id = ApplicationAssessment.objects.values_list("application_id", flat=True).get(pk=assessment_id)

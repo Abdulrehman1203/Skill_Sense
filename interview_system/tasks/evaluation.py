@@ -10,9 +10,11 @@ from django.utils import timezone
 from ..answer_evaluation import (InvalidEvaluation, dispatch_evaluation, evaluation_input,
                                 prepare_evaluation_locked, validate_evaluation)
 from ..models import AnswerEvaluation, Interview, InterviewEvaluation, TranscriptPreparation
+from .guards import skip_missing_resource
 
 
 @shared_task(ignore_result=True, acks_late=True, soft_time_limit=65, time_limit=75)
+@skip_missing_resource(InterviewEvaluation, Interview)
 def evaluate_interview(evaluation_id):
     token = uuid.uuid4()
     interview_id = InterviewEvaluation.objects.values_list('interview_id', flat=True).get(pk=evaluation_id)

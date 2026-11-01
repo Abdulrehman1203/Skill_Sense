@@ -8,10 +8,12 @@ from django.db.models import F, Q
 from django.utils import timezone
 
 from ..models import Application, Notification, PreparedQuestion, QuestionPreparationIntent, QuestionReviewDelivery, QuestionSet
+from .guards import skip_missing_resource
 from ..question_preparation import dispatch, generation_context, prepare_locked
 
 
 @shared_task(ignore_result=True, acks_late=True, soft_time_limit=50, time_limit=60)
+@skip_missing_resource(QuestionSet)
 def generate_question_set(set_id):
     token = uuid.uuid4()
     with transaction.atomic():

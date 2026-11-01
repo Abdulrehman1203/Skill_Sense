@@ -10,10 +10,12 @@ from django.db.models import Q
 from django.utils import timezone
 
 from ..models import NotificationOutbox
+from .guards import skip_missing_resource
 from ..notification_contract import EVENT_MESSAGES, event_name
 
 
 @shared_task(ignore_result=True, acks_late=True, soft_time_limit=15, time_limit=20)
+@skip_missing_resource(NotificationOutbox)
 def deliver_notification_outbox(outbox_id):
     from ..notifications import deliver_inapp_locked, obsolete_question_notice
     token = uuid.uuid4()
