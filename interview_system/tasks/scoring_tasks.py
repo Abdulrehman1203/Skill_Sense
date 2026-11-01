@@ -11,6 +11,7 @@ from ai.scoring.rubric import combined_score
 from ..answer_evaluation import digest
 from ..final_scoring import current_inputs, dispatch, ensure, lock_sources, payload
 from ..models import Application, CandidateScore, Notification, ScoreRevision, ScoringPolicyState
+from .guards import skip_missing_resource
 
 
 class ScoringConfigurationError(RuntimeError):
@@ -22,6 +23,7 @@ class ScoringInputNotReady(RuntimeError):
 
 
 @shared_task(name='interview_system.tasks.analysis.generate_candidate_score')
+@skip_missing_resource(Application)
 def generate_candidate_score(application_id):
     row = ensure(application_id)
     if row and row.status in ('QUEUED', 'PROCESSING'):
@@ -30,6 +32,7 @@ def generate_candidate_score(application_id):
 
 
 @shared_task(ignore_result=True, acks_late=True, soft_time_limit=20, time_limit=30)
+@skip_missing_resource(ScoreRevision, Application)
 def calculate_score_revision(revision_id):
     ref = ScoreRevision.objects.select_related('evaluation').get(pk=revision_id)
     if not ref.evaluation_id or ref.status not in ('QUEUED', 'PROCESSING'):
