@@ -24,6 +24,19 @@ def origin_key(value):
         return None
 
 
+def video_origin_allowed(value):
+    """Use the same browser-origin policy for HTTP start and socket admission."""
+    origin = origin_key(value)
+    if origin is None:
+        return False
+    dev_loopback = (
+        settings.DEBUG
+        and getattr(settings, 'INTERVIEW_ANALYSIS_WS_ALLOW_DEV_LOOPBACK_PORTS', False)
+        and origin[1] in ('localhost', '127.0.0.1', '::1')
+    )
+    return dev_loopback or origin in [origin_key(o) for o in settings.INTERVIEW_ANALYSIS_WS_ALLOWED_ORIGINS]
+
+
 class SecureSocketEntry:
     def __init__(self, application):
         self.application = application
@@ -41,13 +54,8 @@ class SecureSocketEntry:
                 # Only a hostname/optional port, not userinfo or a URL path.
                 host_valid = (host.hostname and not host.username and not host.password and not host.path
                               and not host.query and not host.fragment and host.port != 0)
-                dev_loopback = (
-                    origin is not None and settings.DEBUG
-                    and getattr(settings, 'INTERVIEW_ANALYSIS_WS_ALLOW_DEV_LOOPBACK_PORTS', False)
-                    and origin[1] in ('localhost', '127.0.0.1', '::1')
-                )
                 allowed = (origin is not None and host_valid and validate_host(host.hostname, settings.ALLOWED_HOSTS)
-                           and (dev_loopback or origin in [origin_key(o) for o in settings.INTERVIEW_ANALYSIS_WS_ALLOWED_ORIGINS]))
+                           and video_origin_allowed(origins[0].decode('ascii')))
         except (ValueError, UnicodeDecodeError):
             pass
         query = scope.get('query_string', b'')

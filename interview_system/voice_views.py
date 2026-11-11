@@ -16,12 +16,18 @@ from .integrations import retell_client
 from .models import Interview, InterviewSession, RetellCall, User
 from .serializers import StartVoiceSessionResponseSerializer
 from .voice import accept_event, normalize_call
-from .socket_security import origin_key
+from .socket_security import video_origin_allowed
+from .interview_readiness import InterviewNotReady, require_interview_ready
 
 
 class VoiceStartSerializer(serializers.Serializer):
-    video_required = serializers.BooleanField(default=False)
+    video_required = serializers.BooleanField(default=True)
     start_now = serializers.BooleanField(default=False)
+
+    def validate_video_required(self, value):
+        if not value:
+            raise serializers.ValidationError('Video is required for every interview.')
+        return value
 
     def to_internal_value(self, data):
         if not isinstance(data, dict) or set(data) - {'video_required', 'start_now'}:
@@ -86,10 +92,10 @@ class VoiceInterviewMixin:
         # allowlist rejects. Fail before creating a call or starting video timers.
         origin = request.headers.get('Origin')
         if options.validated_data['video_required'] and origin is not None:
-            key = origin_key(origin)
-            allowed = {origin_key(value) for value in settings.INTERVIEW_ANALYSIS_WS_ALLOWED_ORIGINS}
-            if key is None or key not in allowed:
+            if not video_origin_allowed(origin):
                 return _private(Response({
+                    'code': 'video_origin_not_allowed',
+                    'call_creation_uncertain': False,
                     'detail': 'This app origin is not configured for interview video. '
                               'Use the configured frontend port or ask the server operator to add '
                               'this origin to INTERVIEW_ANALYSIS_WS_ALLOWED_ORIGINS.',
@@ -124,7 +130,7 @@ class VoiceInterviewMixin:
                 return Response({'detail': 'This session has ended.'}, status=409)
             if session.creation_uncertain:
                 return Response({'detail': 'Previous call creation is being reconciled. Use sync-voice-session before retrying.'}, status=409)
-            if not created and 'video_required' in request.data and session.video_required != options.validated_data['video_required']:
+            if not created and session.video_required != options.validated_data['video_required']:
                 raise ValidationError({'video_required': 'Session mode cannot change after creation.'})
             if not questions:
                 from .development_interviews import prepare_development_questions_locked
@@ -163,18 +169,24 @@ class VoiceInterviewMixin:
                 elif interview.retell_session_id:
                     # Older call-ID-only sessions cannot safely be replaced.
                     return Response({'detail': 'Legacy call has no join credentials. Use sync-voice-session to recover its state.'}, status=409)
+                require_interview_ready(video_required=session.video_required)
                 credentials = retell_client.create_web_call(interview, questions)
                 call = RetellCall.objects.create(
                     call_id=credentials['call_id'], session=session,
                     credentials=retell_client.encrypt_credentials(credentials), expires_at=credentials['expires_at'],
                 )
+            except InterviewNotReady as error:
+                return _private(Response({'detail': str(error), 'code': error.code,
+                                          'call_creation_uncertain': False}, status=503))
             except retell_client.RetellCreationUncertainError:
                 session.creation_uncertain = True
                 session.save(update_fields=['creation_uncertain'])
-                return _private(Response({'detail': 'Call creation outcome is unknown. Use sync-voice-session before retrying.'}, status=503))
+                return _private(Response({'detail': 'Call creation outcome is unknown. Use sync-voice-session before retrying.',
+                                          'call_creation_uncertain': True}, status=503))
             except retell_client.RetellUnavailableError:
                 # Leave SCHEDULED sessions retryable; no fake LIVE success.
-                return _private(Response({'detail': 'Voice service unavailable. Retry this endpoint.'}, status=503))
+                return _private(Response({'detail': 'Voice service unavailable. Retry this endpoint.',
+                                          'call_creation_uncertain': False}, status=503))
             interview.retell_session_id = call.call_id
             interview.status = Interview.Status.LIVE
             interview.save(update_fields=['retell_session_id', 'status', 'updated_at'])

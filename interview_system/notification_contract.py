@@ -11,6 +11,25 @@ EVENT_MESSAGES = {
     'feedback_retracted': ('Interview feedback withdrawn', 'A previously released feedback report was withdrawn. Sign in for its current status.'),
 }
 CANDIDATE_EVENTS = {'interview_scheduled', 'application_status_changed', 'feedback_released', 'feedback_retracted'}
+INAPP_MESSAGES = {
+    'application_received': 'A new application has been received. Open the application to review it.',
+    'interview_scheduled': 'Your interview has been scheduled. View your interview details.',
+    'application_status_changed': 'Your application status has changed. View your application for the latest update.',
+    'evaluation_failed': 'An interview evaluation could not be completed. Open the review to check its status.',
+    'feedback_released': 'Your recruiter has released interview feedback. View your report.',
+    'feedback_retracted': 'A previously released feedback report was withdrawn. View its current status.',
+}
+
+
+def inapp_message(event, stored_message=None):
+    """Render in-app copy, including rows saved with the old email wording."""
+    if event not in EVENT_MESSAGES:
+        return stored_message or ''
+    if stored_message is not None and stored_message != EVENT_MESSAGES[event][1]:
+        return stored_message
+    return INAPP_MESSAGES.get(event, EVENT_MESSAGES[event][1])
+
+
 RESOURCE_TYPES = {'application', 'interview', 'question_set', 'evaluation', 'score_revision', 'feedback_report'}
 EVENT_RESOURCES = {'application_received': 'application', 'application_status_changed': 'application',
     'interview_scheduled': 'interview', 'score_ready': 'score_revision', 'question_review_ready': 'question_set',

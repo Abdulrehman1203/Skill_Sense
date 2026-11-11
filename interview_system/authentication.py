@@ -14,7 +14,7 @@ from typing import Any
 
 from django.conf import settings
 from django.core.cache import cache
-from django.db import IntegrityError
+from django.db import IntegrityError, transaction
 from django.views.decorators.debug import sensitive_variables
 import jwt
 from jwt.exceptions import ExpiredSignatureError, InvalidTokenError, PyJWKSetError
@@ -83,7 +83,7 @@ class ClerkJWTAuthentication(BaseAuthentication):
             user = self._provision_verified_user(clerk_id)
 
         if not user.is_active:
-            logger.warning("Authentication failed: User with clerk_id=%s is deactivated.", clerk_id)
+            logger.warning("Clerk account is inactive.")
             raise AuthenticationFailed("User account has been deactivated.")
 
         return (user, payload)
@@ -103,8 +103,8 @@ class ClerkJWTAuthentication(BaseAuthentication):
             response.raise_for_status()
             clerk_user = response.json()
         except (requests.RequestException, ValueError) as exc:
-            logger.warning("Could not load Clerk user %s for provisioning: %s", clerk_id, type(exc).__name__)
-            raise AuthenticationFailed("Account setup is still in progress. Please retry shortly.") from exc
+            logger.warning("Clerk provisioning unavailable.")
+            raise AuthenticationFailed("Account setup is still in progress. Please retry shortly.") from None
 
         if not isinstance(clerk_user, dict) or clerk_user.get("id") != clerk_id:
             raise AuthenticationFailed("Clerk returned an invalid account record.")
@@ -113,7 +113,16 @@ class ClerkJWTAuthentication(BaseAuthentication):
         from .webhook_views import ClerkWebhookView
 
         try:
-            ClerkWebhookView()._handle_user_created(clerk_user)
+            # Same serialization key as signed webhook processing. Never resurrect
+            # a deleted identity, including a delete racing server-side provisioning.
+            from datetime import datetime, timezone
+            from .models import ClerkWebhookState
+            with transaction.atomic():
+                state, _ = ClerkWebhookState.objects.select_for_update().get_or_create(
+                    clerk_id=clerk_id, defaults={'last_event_at': datetime(1970, 1, 1, tzinfo=timezone.utc)})
+                if state.is_deleted:
+                    raise AuthenticationFailed('User account has been deactivated.')
+                ClerkWebhookView()._handle_user_created(clerk_user)
         except ValidationError as exc:
             # exc.detail is typed as list | dict; narrow to dict before key access.
             if isinstance(exc.detail, dict) and "email" in exc.detail:
@@ -121,8 +130,10 @@ class ClerkJWTAuthentication(BaseAuthentication):
                 # DRF wraps string errors in a list of ErrorDetail objects.
                 if isinstance(message, list) and message:
                     message = message[0]
-                raise AuthenticationFailed(str(message)) from exc
-            raise AuthenticationFailed("Account setup failed. Please contact support.") from exc
+                raise AuthenticationFailed(str(message)) from None
+            raise AuthenticationFailed("Account setup failed. Please contact support.") from None
+        except (TypeError, AttributeError, ValueError):
+            raise AuthenticationFailed('Clerk returned an invalid account record.') from None
         except IntegrityError:
             # A simultaneous webhook may have created the same identity.
             pass
@@ -130,45 +141,63 @@ class ClerkJWTAuthentication(BaseAuthentication):
         try:
             return User.objects.get(clerk_id=clerk_id)
         except User.DoesNotExist as exc:
-            raise AuthenticationFailed("This email is already registered to another account.") from exc
+            raise AuthenticationFailed("This email is already registered to another account.") from None
 
     def _get_jwks(self, force_refresh: bool = False) -> dict[str, Any] | None:
-        """
-        Fetch JWKS dict from Redis cache, or fetch from CLERK_JWKS_URL on cache miss.
-        """
-        if not force_refresh:
-            try:
-                cached_jwks = cache.get(JWKS_CACHE_KEY)
-                if cached_jwks:
-                    return cached_jwks
-            except Exception as e:
-                logger.warning("Cache read failed (Redis connection error?): %s", e)
+        """One shared refresh attempt per 10s; cache TTL is the stale-key bound.
 
-        jwks_url = getattr(settings, "CLERK_JWKS_URL", "")
-        if not jwks_url:
-            logger.error("CLERK_JWKS_URL setting is missing or empty.")
-            return None
-
-        try:
-            response = requests.get(jwks_url, timeout=10)
-            response.raise_for_status()
-            jwks_data = response.json()
+        No expired-key resurrection. If the shared refresh guard is unavailable,
+        fail closed instead of issuing uncoordinated provider requests per token.
+        """
+        import hashlib
+        url = getattr(settings, 'CLERK_JWKS_URL', '')
+        def cached():
             try:
-                cache.set(JWKS_CACHE_KEY, jwks_data, JWKS_CACHE_TTL)
-            except Exception as e:
-                logger.warning("Cache write failed (Redis connection error?): %s", e)
-            return jwks_data
-        except Exception as exc:
-            logger.error("Failed to fetch Clerk JWKS from URL %s: %s", jwks_url, exc)
-            # Stale fallback attempt if force_refresh failed
-            try:
-                stale_jwks = cache.get(JWKS_CACHE_KEY)
-                if stale_jwks:
-                    logger.info("Using stale cached JWKS as fallback.")
-                    return stale_jwks
+                value = cache.get(JWKS_CACHE_KEY)
+                return value if self._valid_jwks(value) else None
             except Exception:
-                pass
+                logger.warning('Clerk JWKS cache unavailable.')
+                return None
+        current = cached()
+        if current and not force_refresh:
+            return current
+        if not url:
             return None
+        guard = 'clerk:jwks:refresh:' + hashlib.sha256(url.encode()).hexdigest()
+        try:
+            if not cache.add(guard, True, timeout=10):
+                return current
+        except Exception:
+            logger.warning('Clerk JWKS refresh coordination unavailable.')
+            return current
+        try:
+            response = requests.get(url, timeout=5)
+            response.raise_for_status()
+            value = response.json()
+            if not self._valid_jwks(value):
+                raise ValueError('Invalid key set')
+            try:
+                cache.set(JWKS_CACHE_KEY, value, JWKS_CACHE_TTL)
+            except Exception:
+                logger.warning('Clerk JWKS cache write unavailable.')
+            return value
+        except Exception:
+            logger.warning('Clerk JWKS refresh unavailable.')
+            return current  # Only the original unexpired cache entry, never extended.
+
+    @staticmethod
+    def _valid_jwks(value):
+        try:
+            keys = value['keys']
+            if not isinstance(keys, list) or not 1 <= len(keys) <= 16:
+                return False
+            if any(not isinstance(k, dict) or k.get('kty') != 'RSA' or
+                   k.get('alg', 'RS256') != 'RS256' or k.get('use', 'sig') != 'sig' or
+                   not isinstance(k.get('kid'), str) or not 1 <= len(k['kid']) <= 128 for k in keys):
+                return False
+            return len(jwt.PyJWKSet.from_dict(value).keys) == len(keys)
+        except Exception:
+            return False
 
     @sensitive_variables('token', 'payload')
     def _verify_token(self, token: str, jwks_data: dict[str, Any]) -> dict[str, Any]:
@@ -180,7 +209,7 @@ class ClerkJWTAuthentication(BaseAuthentication):
             unverified_header = jwt.get_unverified_header(token)
             kid = unverified_header.get("kid")
 
-            if not kid:
+            if not isinstance(kid, str) or not 1 <= len(kid) <= 128 or unverified_header.get("alg") != "RS256":
                 raise AuthenticationFailed("Token header missing 'kid'.")
 
             # Resolve key matching kid

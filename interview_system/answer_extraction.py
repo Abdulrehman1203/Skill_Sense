@@ -12,6 +12,10 @@ def clean(text):
     return re.sub(r'\W+', ' ', text.lower()).strip()
 
 
+def closing_prompt(turn):
+    return turn['role'] == 'agent' and clean(turn['text']).startswith('have you finished your answers')
+
+
 def extract(inputs, proposals=None):
     from .answer_evaluation import InvalidEvaluation
     questions = inputs['context']['questions']
@@ -34,7 +38,9 @@ def extract(inputs, proposals=None):
     anchors = {}
     for q in questions:
         exact = [i for i, t in enumerate(turns) if t['role'] == 'agent' and clean(q['text']) in clean(t['text'])]
-        if len(exact) == 1:
+        if exact:
+            # Repetition is part of the interview protocol, not ambiguous identity.
+            # Keep the first boundary so preceding answers cannot absorb this one.
             anchors[q['id']] = (exact[0], 1., 'EXACT')
         elif not exact:
             proposal = suggestions.get(q['id'])
@@ -60,15 +66,19 @@ def extract(inputs, proposals=None):
         if anchor:
             start, confidence, method = anchor
             end = next((a for a in ordered_anchors if a > start), len(turns))
+            end = next((i for i in range(start + 1, end) if closing_prompt(turns[i])), end)
             segment = turns[start + 1:end]
-            users = [t for t in segment if t['role'] == 'user']
+            from .conversation_control import is_clarification
+            users = [t for t in segment if t['role'] == 'user' and not is_clarification(t['text'])]
             # Unrecognized question-like prompts may be skipped questions rather
             # than follow-ups. Do not attach their candidate speech by proximity.
-            unclear = any(t['role'] == 'agent' and '?' in t['text'] and not re.match(
+            unclear = any(t['role'] == 'agent' and '?' in t['text']
+                and clean(q['text']) not in clean(t['text']) and not re.match(
                 r'(?i)^(can you (expand|clarify|elaborate)|why\b|how so\b|what (happened next|did you mean))', t['text'])
                 for t in segment)
             final = end < len(turns) or inputs.get('final_evidence', False)
-            state = 'UNALIGNABLE' if unclear else 'PARTIAL' if not final else 'ANSWERED' if users else 'NO_ANSWER'
+            only_clarification = not users and any(t['role'] == 'user' for t in segment)
+            state = 'UNALIGNABLE' if unclear or only_clarification else 'PARTIAL' if not final else 'ANSWERED' if users else 'NO_ANSWER'
             result.update(state=state, confidence=confidence, method=method, asked_turn_id=turns[start]['id'],
                 answer_turn_ids=[t['id'] for t in users],
                 follow_up_turn_ids=[t['id'] for t in segment if t['role'] == 'agent'])

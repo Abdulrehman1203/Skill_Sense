@@ -15,7 +15,8 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()  # reads .env file at project root
+if os.environ.get('DJANGO_SETTINGS_MODULE') != 'ai_interview_recruitment.production_settings':
+    load_dotenv()  # Local convenience only; production receives explicit secrets.
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -145,6 +146,9 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
 STATIC_URL = 'static/'
+MAX_UPLOAD_REQUEST_BYTES = 6 * 1024 * 1024  # 5 MiB document + multipart/metadata headroom.
+DATA_UPLOAD_MAX_MEMORY_SIZE = MAX_UPLOAD_REQUEST_BYTES
+FILE_UPLOAD_MAX_MEMORY_SIZE = 1024 * 1024  # Spooling threshold, NOT the document limit.
 
 # ── Media files (user uploads: resumes, logos, etc.) ─────────
 MEDIA_ROOT = BASE_DIR / "media"
@@ -204,11 +208,11 @@ INTERVIEW_ANALYSIS_GLOBAL_FRAME_CAP = int(os.getenv("INTERVIEW_ANALYSIS_GLOBAL_F
 INTERVIEW_ANALYSIS_FRAME_DEADLINE_SECONDS = int(os.getenv("INTERVIEW_ANALYSIS_FRAME_DEADLINE_SECONDS", "60"))
 INTERVIEW_ANALYSIS_FRAME_CLAIM_SECONDS = int(os.getenv("INTERVIEW_ANALYSIS_FRAME_CLAIM_SECONDS", "30"))
 INTERVIEW_ANALYSIS_MAX_SESSION_FRAMES = int(os.getenv('INTERVIEW_ANALYSIS_MAX_SESSION_FRAMES', '10800'))
-# B4 plumbing is opt-in until B5 implements real local inference.
+# Enable only with the pinned model artifacts and a dedicated warm vision worker.
 INTERVIEW_ANALYSIS_VISION_ENABLED = os.getenv('INTERVIEW_ANALYSIS_VISION_ENABLED', 'False').lower() in ('true', '1', 'yes')
 INTERVIEW_ANALYSIS_MODEL_DIRECTORY = os.getenv('INTERVIEW_ANALYSIS_MODEL_DIRECTORY', str(BASE_DIR / 'vision-artifacts'))
 INTERVIEW_ANALYSIS_MAX_FACES = int(os.getenv('INTERVIEW_ANALYSIS_MAX_FACES', '3'))
-INTERVIEW_ANALYSIS_PAYLOAD_REDIS_URL = os.getenv('INTERVIEW_ANALYSIS_PAYLOAD_REDIS_URL', 'redis://127.0.0.1:6379/14')
+INTERVIEW_ANALYSIS_PAYLOAD_REDIS_URL = os.getenv('PAYLOAD_REDIS_URL', 'redis://127.0.0.1:6385/0')
 INTERVIEW_ANALYSIS_PAYLOAD_PREFIX = os.getenv('INTERVIEW_ANALYSIS_PAYLOAD_PREFIX', 'skillsense.analysis.private')
 INTERVIEW_ANALYSIS_PAYLOAD_CAP = int(os.getenv('INTERVIEW_ANALYSIS_PAYLOAD_CAP', '64'))
 INTERVIEW_ANALYSIS_VISION_QUEUE = os.getenv('INTERVIEW_ANALYSIS_VISION_QUEUE', 'interview.analysis.vision')
@@ -223,11 +227,11 @@ INTERVIEW_ANALYSIS_FINALIZATION_CLAIM_SECONDS = int(os.getenv("INTERVIEW_ANALYSI
 
 # ── Redis Cache ──────────────────────────────────────────────
 
-REDIS_URL = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/1")
+REDIS_URL = os.getenv("CACHE_REDIS_URL", "redis://127.0.0.1:6382/0")
 
 # Interview Analysis: no implicit in-memory fallback in application configuration.
 ASGI_APPLICATION = 'ai_interview_recruitment.asgi.application'
-INTERVIEW_ANALYSIS_REDIS_URL = os.getenv('INTERVIEW_ANALYSIS_REDIS_URL', REDIS_URL)
+INTERVIEW_ANALYSIS_REDIS_URL = os.getenv('GUARD_REDIS_URL', 'redis://127.0.0.1:6384/0')
 INTERVIEW_ANALYSIS_REDIS_PREFIX = os.getenv('INTERVIEW_ANALYSIS_REDIS_PREFIX', 'skillsense.analysis.guard')
 INTERVIEW_ANALYSIS_CHANNEL_PREFIX = os.getenv('INTERVIEW_ANALYSIS_CHANNEL_PREFIX', 'skillsense.analysis.channels')
 CHANNEL_LAYERS = {'default': {
@@ -260,36 +264,8 @@ INTERVIEW_ANALYSIS_DECODE_WORKERS = int(os.getenv('INTERVIEW_ANALYSIS_DECODE_WOR
 INTERVIEW_ANALYSIS_DECODE_TIMEOUT_SECONDS = 2
 INTERVIEW_ANALYSIS_ASGI_INPUT_MESSAGES = 2
 
-def _get_dev_cache_config():
-    redis_url = os.getenv("REDIS_URL", "redis://127.0.0.1:6379/1")
-    if DEBUG and not os.getenv("REDIS_URL"):
-        try:
-            import socket
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(0.2)
-            s.connect(("127.0.0.1", 6379))
-            s.close()
-            return {
-                "BACKEND": "django.core.cache.backends.redis.RedisCache",
-                "LOCATION": redis_url,
-            }
-        except Exception:
-            return {
-                "BACKEND": "django.core.cache.backends.locmem.LocMemCache",
-            }
-    return {
-        "BACKEND": "django.core.cache.backends.redis.RedisCache",
-        "LOCATION": redis_url,
-    }
-
-CACHES = {
-    "default": _get_dev_cache_config()
-}
-
-
-
 # ── Celery (async task queue) ────────────────────────────────
-CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL", REDIS_URL)
+CELERY_BROKER_URL = os.getenv("BROKER_REDIS_URL", "redis://127.0.0.1:6380/0")
 CELERY_BROKER_TRANSPORT = 'interview_system.vision_transport:Transport'
 CELERY_BROKER_CONNECTION_TIMEOUT = 1
 CELERY_BROKER_TRANSPORT_OPTIONS = {'socket_timeout': 1, 'socket_connect_timeout': 1}
@@ -297,7 +273,7 @@ CELERY_TASK_ROUTES = {'interview_system.tasks.vision.process_frame': {
     'queue': INTERVIEW_ANALYSIS_VISION_QUEUE, 'routing_key': INTERVIEW_ANALYSIS_VISION_QUEUE, 'priority': 0},
     'interview_system.tasks.vision.warm_vision': {
     'queue': INTERVIEW_ANALYSIS_VISION_QUEUE, 'routing_key': INTERVIEW_ANALYSIS_VISION_QUEUE, 'priority': 0}}
-CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND", REDIS_URL)
+CELERY_RESULT_BACKEND = os.getenv("RESULT_REDIS_URL", "redis://127.0.0.1:6381/0")
 CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
@@ -411,6 +387,7 @@ SPECTACULAR_SETTINGS = {
     "SERVE_INCLUDE_SCHEMA": False,   # hide the raw /api/schema/ from Swagger sidebar
     "COMPONENT_SPLIT_REQUEST": True, # separate request/response schemas
     "ENUM_NAME_OVERRIDES": {
+        "HiringDecisionOutcomeEnum": ['HIRE', 'REJECT'],
         "TranscriptSpeakerEnum": ['agent', 'user'],
         "PlatformUserRoleEnum": 'interview_system.models.User.Role',
         "JobStatusEnum": "interview_system.models.Job.Status",
@@ -442,3 +419,13 @@ SPECTACULAR_SETTINGS = {
 
 # Isolate broker deliveries as well as database records during tests.
 TEST_RUNNER = "ai_interview_recruitment.testing.IsolatedTestRunner"
+
+# Explicit process-isolated Redis roles; tests use their isolated settings.
+from .redis_config import configure as _configure_redis
+_configure_redis(globals(), os.environ, strict=not DEBUG)
+
+if not DEBUG:
+    from .clerk_config import validate as _validate_clerk
+    CLERK_ISSUER = os.environ.get('CLERK_ISSUER', '')
+    CLERK_REQUIRE_SECURE_CONFIG = True
+    _validate_clerk(globals())

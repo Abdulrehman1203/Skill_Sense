@@ -39,6 +39,11 @@ def validate_resume_upload(value: Any) -> Any:
             try:
                 with ZipFile(value) as archive:
                     members = set(archive.namelist())
+                    if len(archive.infolist()) > 2000 or sum(entry.file_size for entry in archive.infolist()) > 20 * 1024 * 1024:
+                        raise serializers.ValidationError('DOCX expanded content exceeds the document limit.')
+                    if any(entry.flag_bits & 1 or entry.filename.startswith(('/', '\\'))
+                           or '..' in entry.filename.replace('\\', '/').split('/') for entry in archive.infolist()):
+                        raise serializers.ValidationError('DOCX archive contains unsupported entries.')
                     if not {"[Content_Types].xml", "word/document.xml"} <= members:
                         raise serializers.ValidationError("File is not a DOCX document.")
             except (BadZipFile, OSError, ValueError) as exc:

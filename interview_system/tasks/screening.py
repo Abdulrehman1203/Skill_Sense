@@ -29,6 +29,16 @@ class ScreeningFailure(Exception):
         self.code, self.message, self.action, self.transient = code, message, action, transient
 
 
+def similarity_percentage(value):
+    """Matcher input is 0..1; persist 0..100 once, including measured zero."""
+    if isinstance(value, bool) or not isinstance(value, (float, int, Decimal)):
+        raise ValueError('Invalid similarity')
+    number = Decimal(str(value))
+    if not number.is_finite() or not 0 <= number <= 1:
+        raise ValueError('Invalid similarity')
+    return (number * 100).quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+
+
 def parsed_resume(resume_id):
     from ..resumes.extraction import extract_text, ExtractionError
     from ..integrations.gemini_client import parse_resume_text, GeminiParseError
@@ -43,8 +53,9 @@ def parsed_resume(resume_id):
             return parsed, resume.content_hash, parser_version
         if resume.parse_lease_until and resume.parse_lease_until > timezone.now():
             raise ParseBusy()
+        resume.status, resume.processing_error = "PENDING", ""
         resume.parse_claim, resume.parse_lease_until = token, timezone.now() + LEASE
-        resume.save(update_fields=["parse_claim", "parse_lease_until"])
+        resume.save(update_fields=["parse_claim", "parse_lease_until", "status", "processing_error"])
     try:
         with resume.file.open("rb") as source:
             content_hash = hashlib.file_digest(source, "sha256").hexdigest()
@@ -53,8 +64,8 @@ def parsed_resume(resume_id):
             raise ExtractionError("No readable text.")
         if not settings.GEMINI_API_KEY:
             raise ScreeningFailure("PARSER_NOT_CONFIGURED", "Resume processing is temporarily unavailable. Contact support.", "CONTACT_SUPPORT")
-        # Include parser identity in cache key so configuration changes cannot reuse stale parses.
-        cache_key = parser_version + "\n" + text
+        # Keep existing parsed rows usable, but exclude cached pre-project results for new parses.
+        cache_key = parser_version + ":projects\n" + text
         data = get_cached_gemini_parse(cache_key)
         if data is None:
             data = parse_resume_text(text)
@@ -65,6 +76,7 @@ def parsed_resume(resume_id):
                 raise ParseBusy()
             parsed, _ = ParsedResume.objects.update_or_create(resume=locked, defaults={
                 "raw_text": text, **{k: data[k] for k in ("skills", "education", "experience", "certifications")},
+                "projects": data.get("projects"),
             })
             locked.status, locked.processing_error = "PARSED", ""
             locked.content_hash, locked.parser_version = content_hash, parser_version
@@ -98,6 +110,7 @@ def process_assessment(assessment_id):
         if assessment.attempts >= MAX_ATTEMPTS:
             assessment.status, assessment.error_code = "FAILED", "RECOVERY_EXHAUSTED"
             assessment.error_message, assessment.recovery_action = "Screening was interrupted repeatedly. Retry screening.", "RETRY"
+            assessment.claim_token, assessment.lease_until = None, None
             assessment.completed_at = timezone.now()
             assessment.save()
             return
@@ -109,11 +122,12 @@ def process_assessment(assessment_id):
         parsed, content_hash, parser_version = parsed_resume(assessment.resume_id)
         if not claimed.update(status="MATCHING", resume_hash=content_hash, parser_version=parser_version):
             return
-        from ai.matching.sbert import match
+        from ai.matching.sbert import match, model_identity
+        claimed.update(matcher_version=model_identity())
         policy = assessment.policy
         try:
             result = match(parsed.raw_text, "\n".join(policy[k] for k in ("title", "description", "requirements")), policy["skills_required"])
-            score = Decimal(str(result["similarity"] * 100)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+            score = similarity_percentage(result["similarity"])
             if not score.is_finite() or not 0 <= score <= 100:
                 raise ValueError("Invalid matcher score")
         except (ValueError, TypeError, KeyError, InvalidOperation):
@@ -149,6 +163,9 @@ def process_assessment(assessment_id):
                        error_code=failure.code, error_message=failure.message, recovery_action=failure.action,
                        next_attempt_at=timezone.now() + timedelta(seconds=min(300, 15 * 2 ** assessment.attempts) + random.randint(0, 10)),
                        completed_at=None if retry else timezone.now())
+        if not retry and failure.code in ('PARSER_UNAVAILABLE', 'PARSER_NOT_CONFIGURED'):
+            Resume.objects.filter(pk=assessment.resume_id, status__in=['PENDING','STORED'], parse_claim__isnull=True).update(
+                status='FAILED', processing_error=failure.message)
         logger.warning("Screening attempt failed: assessment_id=%s code=%s", assessment_id, failure.code)
 
 
@@ -156,5 +173,9 @@ def process_assessment(assessment_id):
 def recover_stalled_assessments():
     due = ApplicationAssessment.objects.filter(status__in=ACTIVE_STAGES, next_attempt_at__lte=timezone.now(),
         application__current_assessment_id=F("pk")).filter(Q(lease_until__isnull=True) | Q(lease_until__lte=timezone.now()))
+    recovered = 0
     for pk in due.order_by("next_attempt_at").values_list("pk", flat=True)[:100]:
         dispatch(pk)
+        recovered += 1
+    from ai_interview_recruitment.safe_logging import emit_event
+    emit_event('recovery_scan', component='screening', count=recovered)

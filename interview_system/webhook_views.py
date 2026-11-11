@@ -33,6 +33,7 @@ class ClerkWebhookView(APIView):
     """
 
     permission_classes = [AllowAny]
+    authentication_classes = []  # Svix authenticates raw bytes, not bearer middleware.
 
     @extend_schema(
         tags=["Webhooks — Clerk"],
@@ -70,21 +71,30 @@ class ClerkWebhookView(APIView):
             wh = Webhook(webhook_secret)
             payload = wh.verify(body_bytes.decode("utf-8"), headers)
         except WebhookVerificationError as exc:
-            logger.warning("Clerk Webhook HMAC signature verification failed: %s", exc)
+            logger.warning("Clerk webhook signature rejected.")
             return Response(
                 {"detail": "Invalid webhook signature."},
                 status=status.HTTP_401_UNAUTHORIZED,
             )
         except Exception as exc:
-            logger.error("Unexpected error during webhook verification: %s", exc)
+            logger.error("Clerk webhook verification rejected.")
             return Response(
                 {"detail": "Webhook verification error."},
                 status=status.HTTP_401_UNAUTHORIZED,
             )
 
+        if not isinstance(payload, dict) or not isinstance(payload.get('data', {}), dict):
+            return Response({'detail': 'Invalid webhook payload.'}, status=400)
+        data = payload.get('data', {})
+        if (not isinstance(data.get('id', ''), str) or
+            any(not isinstance(data.get(name), (str, type(None))) for name in ('first_name','last_name','image_url')) or
+            any(not isinstance(data.get(name, {}), (dict, type(None))) for name in ('public_metadata','unsafe_metadata')) or
+            not isinstance(data.get('email_addresses', []), list) or
+            any(not isinstance(item, dict) or not isinstance(item.get('email_address', ''), str) for item in data.get('email_addresses', []))):
+            return Response({'detail': 'Invalid webhook payload.'}, status=400)
         event_type = payload.get("type")
         data = payload.get("data", {})
-        logger.info("Received valid Clerk Webhook event: %s", event_type)
+        logger.info("Verified Clerk webhook received.")
 
         if event_type in ("user.created", "user.updated", "user.deleted"):
             # Clerk uses milliseconds for event.created_at; the signed Svix
@@ -103,7 +113,7 @@ class ClerkWebhookView(APIView):
                     status=status.HTTP_409_CONFLICT,
                 )
         else:
-            logger.info("Unhandled Clerk webhook event type: %s", event_type)
+            logger.info("Unhandled Clerk webhook event.")
 
         return Response({"status": "success"}, status=status.HTTP_200_OK)
 
@@ -119,10 +129,10 @@ class ClerkWebhookView(APIView):
         )
         if not created:
             if event_at < state.last_event_at:
-                logger.info("Ignoring stale %s for clerk_id=%s", event_type, clerk_id)
+                logger.info('Clerk identity event handled.')
                 return
             if state.is_deleted and event_type != "user.deleted":
-                logger.info("Ignoring %s after deletion for clerk_id=%s", event_type, clerk_id)
+                logger.info('Clerk identity event handled.')
                 return
             if event_at == state.last_event_at and event_type != "user.deleted":
                 return
@@ -162,18 +172,7 @@ class ClerkWebhookView(APIView):
         existing_user = User.objects.filter(email__iexact=email).first()
         if existing_user:
             if existing_user.clerk_id != clerk_id:
-                if existing_user.is_active:
-                    raise ValidationError({"email": "This email is already registered. Use your existing account login."})
-                else:
-                    logger.info("Reclaiming inactive account for email=%s with new clerk_id=%s", email, clerk_id)
-                    existing_user.clerk_id = clerk_id
-                    existing_user.is_active = True
-                    existing_user.first_name = first_name
-                    existing_user.last_name = last_name
-                    existing_user.profile_image_url = image_url
-                    existing_user.save()
-                    user = existing_user
-                    created = False
+                raise ValidationError({'email': 'This email is already registered. Use your existing account login.'})
             else:
                 # Same clerk_id, just an update or replay
                 # Provisioning is not a local administrator's reactivation
@@ -205,13 +204,7 @@ class ClerkWebhookView(APIView):
         else:
             CandidateProfile.objects.get_or_create(user=user)
 
-        logger.info(
-            "Clerk Webhook: %s user record for clerk_id=%s (email=%s, role=%s).",
-            "Created" if created else "Updated/Reclaimed existing",
-            clerk_id,
-            email,
-            role,
-        )
+        logger.info('Clerk provisioning event applied.')
 
     @transaction.atomic
     def _handle_user_updated(self, data: dict[str, Any]) -> None:
@@ -223,7 +216,7 @@ class ClerkWebhookView(APIView):
         try:
             user = User.objects.get(clerk_id=clerk_id)
         except User.DoesNotExist:
-            logger.warning("user.updated received for non-existent clerk_id=%s. Provisioning...", clerk_id)
+            logger.info('Clerk identity event handled.')
             self._handle_user_created(data)
             return
 
@@ -249,7 +242,7 @@ class ClerkWebhookView(APIView):
         elif user.role == User.Role.CANDIDATE:
             CandidateProfile.objects.get_or_create(user=user)
 
-        logger.info("Clerk Webhook: Updated user record for clerk_id=%s.", clerk_id)
+        logger.info('Clerk identity event handled.')
 
     @transaction.atomic
     def _handle_user_deleted(self, data: dict[str, Any]) -> None:
@@ -262,9 +255,9 @@ class ClerkWebhookView(APIView):
             user = User.objects.get(clerk_id=clerk_id)
             user.is_active = False
             user.save(update_fields=["is_active"])
-            logger.info("Clerk Webhook: Deactivated user record for clerk_id=%s.", clerk_id)
+            logger.info('Clerk identity event handled.')
         except User.DoesNotExist:
-            logger.info("user.deleted received for non-existent clerk_id=%s.", clerk_id)
+            logger.info('Clerk identity event handled.')
 
     def _validate_email(self, email: str, clerk_id: str) -> None:
         if not email:

@@ -104,9 +104,8 @@ def generate_questions(self, interview_id: str) -> list[dict]:
         # but the task must still never persist an empty interview if that
         # integration unexpectedly raises.
         logger.warning(
-            "Question integration failed for interview %s; using templates: %s",
+            "Question integration failed for interview %s; using templates.",
             interview_id,
-            exc,
         )
         questions_data = gemini_client.get_template_questions()
 

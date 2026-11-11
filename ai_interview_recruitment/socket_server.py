@@ -69,7 +69,7 @@ class SocketCLI(CommandLineInterface):
     def __init__(self):
         super().__init__()
         self.parser.set_defaults(websocket_max_message_size=307200, websocket_max_frame_size=307200,
-                                 websocket_timeout=60, websocket_connect_timeout=5, verbosity=0,
+                                 websocket_timeout=-1, websocket_connect_timeout=5, verbosity=0,
                                  application='ai_interview_recruitment.asgi:application')
         # The base CLI has a required positional application; retain the normal
         # Daphne CLI signature in the documented command rather than patch it.

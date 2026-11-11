@@ -44,7 +44,7 @@ def process_retell_transcript(self, payload: dict) -> dict:
         with transaction.atomic():
             matches = list(Interview.objects.select_for_update().filter(retell_session_id=call_id)[:2])
             if len(matches) != 1:
-                logger.warning('Retell transcript dropped: matching_interviews=%s retell_session_id=%r', len(matches), call_id)
+                logger.warning('Retell transcript dropped: matching_interviews=%s', len(matches))
                 return {'status': 'dropped'}
             interview = matches[0]
             session = InterviewSession.objects.select_for_update().filter(interview=interview).first()

@@ -8,7 +8,8 @@ from django.utils import timezone
 
 from .answer_evaluation import digest
 from .models import Notification, NotificationOutbox, User
-from .notification_contract import CANDIDATE_EVENTS, EVENT_MESSAGES, EVENT_RESOURCES, LINK_FIELDS, RESOURCE_TYPES, event_name
+from .notification_contract import CANDIDATE_EVENTS, EVENT_RESOURCES, LINK_FIELDS, RESOURCE_TYPES, event_name
+from .notification_contract import inapp_message
 
 logger = logging.getLogger(__name__)
 
@@ -19,7 +20,7 @@ def deliver_inapp_locked(row):
         row.save()
         return
     Notification.objects.get_or_create(pk=row.pk, defaults={'user_id': row.recipient_id,
-        'type': row.event, 'message': EVENT_MESSAGES[row.event][1], 'links': row.links})
+        'type': row.event, 'message': inapp_message(row.event), 'links': row.links})
     if row.inapp_delivered_at is None:
         row.inapp_delivered_at = timezone.now()
         row.save(update_fields=['inapp_delivered_at'])
@@ -78,3 +79,5 @@ def dispatch_notification(pk):
             args=[str(pk)], queue=deliver_notification_outbox.app.conf.task_default_queue)
     except Exception:
         logger.warning('Notification dispatch deferred outbox_id=%s', pk)
+        from ai_interview_recruitment.safe_logging import emit_event
+        emit_event('dispatch_deferred', component='notification', count=1)

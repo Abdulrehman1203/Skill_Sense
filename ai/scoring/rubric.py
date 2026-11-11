@@ -89,6 +89,18 @@ def legacy_score(match_score: float | None, interview_signal: float | None,
     return {"final_score": final_score, "breakdown": breakdown, "explanation": explanation}
 
 
+def required_factor_explanation(match_percentage, interview_percentage):
+    """Only current-policy required factors; unavailable is never numeric zero."""
+    missing = []
+    if match_percentage is None:
+        missing.append('screening match percentage')
+    if interview_percentage is None:
+        missing.append('evaluated interview performance percentage')
+    if missing:
+        return 'Missing required scoring evidence: ' + '; '.join(missing) + '. Final score is unavailable; missing evidence is not zero.'
+    return 'Required screening and evaluated interview evidence is available; combined recommendation pending or unavailable.'
+
+
 def combined_score(match_percentage, interview_percentage, *, weight_match='0.4', weight_interview='0.6', weight_behavioral=0):
     """combined-v1: percentages in/out, required evidence, Decimal HALF_UP once.
 
@@ -114,7 +126,9 @@ def combined_score(match_percentage, interview_percentage, *, weight_match='0.4'
     final = (wm * match + wi * interview).quantize(Decimal('.01'), rounding=ROUND_HALF_UP) if complete else None
     return {'status': 'COMPLETE' if complete else 'INCOMPLETE', 'final_score': final,
         'screening_match_percentage': match, 'interview_performance_percentage': interview,
-        'coverage': (wm if match is not None else 0) + (wi if interview is not None else 0)}
+        'coverage': (wm if match is not None else 0) + (wi if interview is not None else 0),
+        'explanation': ('Combined recommendation uses screening and evaluated answers only.' if complete
+                        else required_factor_explanation(match, interview))}
 
 
 def score(match_score, interview_signal, behavioral_signal, rubric):
@@ -128,5 +142,4 @@ def score(match_score, interview_signal, behavioral_signal, rubric):
     result = combined_score(match_score, interview, weight_match=rubric.weight_match,
         weight_interview=rubric.weight_interview, weight_behavioral=rubric.weight_behavioral)
     return {**result, 'breakdown': {'match': result['screening_match_percentage'],
-        'interview': result['interview_performance_percentage'], 'behavioral': None},
-        'explanation': 'Combined recommendation uses screening and evaluated answers only; missing required evidence prevents finalization.'}
+        'interview': result['interview_performance_percentage'], 'behavioral': None}}

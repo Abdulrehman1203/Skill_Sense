@@ -107,6 +107,8 @@ def main():
     result = run(args.models, args.sessions, args.seconds)
     Path(args.report).write_text(json.dumps(result, indent=2)+'\n', encoding='utf-8')
     print(json.dumps(result))
+    if not result['meets_offline_budget']:
+        raise SystemExit(1)
 
 
 if __name__ == '__main__':

@@ -180,6 +180,7 @@ class CandidateProfile(models.Model):
     location = models.CharField(max_length=255, blank=True, default="")
     linkedin_url = models.URLField(blank=True, default="")
     portfolio_url = models.URLField(blank=True, default="")
+    github_url = models.URLField(blank=True, default="")
     years_experience = models.PositiveIntegerField(
         blank=True,
         null=True,
@@ -620,6 +621,7 @@ class ParsedResume(models.Model):
     skills = models.JSONField(default=list)
     education = models.JSONField(default=list)
     experience = models.JSONField(default=list)
+    projects = models.JSONField(null=True, blank=True)
     certifications = models.JSONField(default=list)
     raw_text = models.TextField(blank=True)
     match_score = models.FloatField(

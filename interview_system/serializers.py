@@ -30,6 +30,12 @@ from .models import (
     User,
 )
 from .resumes.validation import validate_resume_upload
+from .resumes.download import download_url
+
+
+class PrivateResumeFileField(serializers.FileField):
+    def to_representation(self, value):
+        return download_url(value.instance, self.context.get('request')) if value else None
 
 if TYPE_CHECKING:
     from .models import ParsedResume
@@ -200,7 +206,7 @@ class RecruiterProfileSerializer(serializers.ModelSerializer):
 
 class CandidateProfileSerializer(serializers.ModelSerializer):
     """
-    Serializer for CandidateProfile GET and PATCH endpoints.
+    Serializer for CandidateProfile GET, PATCH, and PUT endpoints.
     Includes read-only nested user info.
     """
 
@@ -236,6 +242,11 @@ class CandidateProfileSerializer(serializers.ModelSerializer):
         required=False,
         allow_blank=True,
     )
+    github_url = serializers.URLField(
+        max_length=200,
+        required=False,
+        allow_blank=True,
+    )
 
     class Meta:  # type: ignore
         model = CandidateProfile
@@ -245,6 +256,7 @@ class CandidateProfileSerializer(serializers.ModelSerializer):
             "location",
             "linkedin_url",
             "portfolio_url",
+            "github_url",
             "years_experience",
             "headline",
             "completion_percentage",
@@ -751,6 +763,12 @@ class ApplicationListSerializer(serializers.ModelSerializer):
 
 
 class NotificationSerializer(serializers.ModelSerializer):
+    message = serializers.SerializerMethodField()
+
+    def get_message(self, obj):
+        from .notification_contract import inapp_message
+        return inapp_message(obj.type, obj.message)
+
     class Meta:
         model = Notification
         fields = ["id", "type", "message", "links", "is_read", "created_at"]
@@ -1086,6 +1104,7 @@ class ResumeDetailSerializer(serializers.Serializer):
     skills = serializers.SerializerMethodField()
     education = serializers.SerializerMethodField()
     experience = serializers.SerializerMethodField()
+    projects = serializers.SerializerMethodField()
     certifications = serializers.SerializerMethodField()
     match_score = serializers.SerializerMethodField()
     matched_skills = serializers.SerializerMethodField()
@@ -1100,10 +1119,7 @@ class ResumeDetailSerializer(serializers.Serializer):
         return None
 
     def get_file_url(self, obj: Resume) -> str | None:
-        if not obj.file:
-            return None
-        request = self.context.get("request")
-        return request.build_absolute_uri(obj.file.url) if request else obj.file.url
+        return download_url(obj, self.context.get('request'))
 
     def get_file_size(self, obj: Resume) -> int | None:
         if not obj.file:
@@ -1134,6 +1150,10 @@ class ResumeDetailSerializer(serializers.Serializer):
         parsed = self._get_parsed(obj)
         return parsed.experience if parsed else None
 
+    def get_projects(self, obj: Resume) -> list | None:
+        parsed = self._get_parsed(obj)
+        return parsed.projects if parsed else None
+
     def get_certifications(self, obj: Resume) -> list | None:
         parsed = self._get_parsed(obj)
         return parsed.certifications if parsed else None
@@ -1156,6 +1176,7 @@ class ResumeListSerializer(serializers.ModelSerializer):
 
     filename = serializers.SerializerMethodField()
     file_url = serializers.SerializerMethodField()
+    file = PrivateResumeFileField()
 
     class Meta:  # type: ignore
         model = Resume
@@ -1185,9 +1206,4 @@ class ResumeListSerializer(serializers.ModelSerializer):
         return "resume.pdf"
 
     def get_file_url(self, obj: Resume) -> str | None:
-        if not obj.file:
-            return None
-        request = self.context.get("request")
-        if request:
-            return request.build_absolute_uri(obj.file.url)
-        return obj.file.url
+        return download_url(obj, self.context.get('request'))

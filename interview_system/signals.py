@@ -19,6 +19,7 @@ def enqueue_resume_parsing(
     sender: type,
     instance: Application,
     created: bool,
+    raw: bool = False,
     **kwargs,
 ) -> None:
     """
@@ -30,7 +31,10 @@ def enqueue_resume_parsing(
     Uses transaction.on_commit to ensure the database transaction is committed
     before the worker attempts to fetch the records, preventing race conditions.
     """
-    if not created:
+    # loaddata/save_base(raw=True) restores rows before related fixture rows may
+    # exist. It must not create work, notifications or broker messages. bulk_create
+    # does not emit this signal either; importers must explicitly schedule work.
+    if raw or not created:
         return
 
     from .screening import create_assessment

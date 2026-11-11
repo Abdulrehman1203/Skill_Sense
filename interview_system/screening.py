@@ -35,6 +35,8 @@ def dispatch(assessment_id):
     except Exception:
         # The persisted QUEUED stage is the durable dispatch record, recovered by Beat.
         logger.warning("Screening dispatch deferred: assessment_id=%s", assessment_id)
+        from ai_interview_recruitment.safe_logging import emit_event
+        emit_event('dispatch_deferred', component='screening', count=1)
 
 
 @transaction.atomic
@@ -45,11 +47,12 @@ def create_assessment(application_id, *, apply_decision=True, use_current_policy
         return current
     job = Job.objects.select_for_update().get(pk=app.job_id)
     revision = (app.assessments.aggregate(n=Max("revision"))["n"] or 0) + 1
+    from ai.matching.sbert import model_identity
     assessment = ApplicationAssessment.objects.create(
         application=app, resume_id=app.resume_id, revision=revision,
         policy=snapshot(job) if use_current_policy or not current else current.policy,
         apply_decision=apply_decision,
-        matcher_version=getattr(settings, "SBERT_MODEL_NAME", "all-MiniLM-L6-v2"),
+        matcher_version=model_identity(),
     )
     app.current_assessment = assessment
     app.version += 1

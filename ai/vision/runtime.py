@@ -23,7 +23,7 @@ class Config:
     object_confidence: float = 0.4
     nms_iou: float = 0.7
     image_size: int = 640
-    threads: int = 2
+    threads: int = 4
     device: str = 'cpu'
 
     def __post_init__(self):

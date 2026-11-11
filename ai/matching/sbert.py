@@ -33,6 +33,19 @@ logger = logging.getLogger(__name__)
 
 # Named constant for model selection
 DEFAULT_MODEL_NAME = "all-MiniLM-L6-v2"
+DEFAULT_MODEL_REVISION = "1110a243fdf4706b3f48f1d95db1a4f5529b4d41"
+
+def model_identity():
+    name = os.environ.get('SBERT_MODEL_NAME', DEFAULT_MODEL_NAME)
+    revision = os.environ.get('SBERT_MODEL_REVISION')
+    if not revision:
+        from pathlib import Path
+        revision = DEFAULT_MODEL_REVISION if name == DEFAULT_MODEL_NAME else Path(name).name
+        if name != DEFAULT_MODEL_NAME and not re.fullmatch(r'[0-9a-f]{40}', revision):
+            raise ValueError('Custom SBERT model requires SBERT_MODEL_REVISION or an immutable snapshot directory.')
+    import hashlib
+    return 'sbert-v2:' + hashlib.sha256((name + '@' + revision).encode()).hexdigest()
+
 
 SKILL_ALIASES = {
     "javascript": ("js",),
@@ -58,7 +71,7 @@ def _get_model():
 
     target_name = os.environ.get("SBERT_MODEL_NAME", DEFAULT_MODEL_NAME)
 
-    if _model is None or _loaded_model_name != target_name:
+    if _model is None or _loaded_model_name != model_identity():
         try:
             import torch
             if torch.get_num_threads() > 2:
@@ -69,8 +82,9 @@ def _get_model():
         from sentence_transformers import SentenceTransformer
 
         logger.info("Loading SBERT model '%s' on CPU...", target_name)
-        _model = SentenceTransformer(target_name, device="cpu")
-        _loaded_model_name = target_name
+        revision = os.environ.get('SBERT_MODEL_REVISION', DEFAULT_MODEL_REVISION if target_name == DEFAULT_MODEL_NAME else None)
+        _model = SentenceTransformer(target_name, device="cpu", **({'revision': revision} if revision else {}))
+        _loaded_model_name = model_identity()
         logger.info("SBERT model loaded successfully.")
 
     return _model
@@ -101,12 +115,13 @@ def _compute_cosine_similarity(vec_a: list[float], vec_b: list[float]) -> float:
 
 def _embedding_for(text: str) -> list[float]:
     """Reuse each text's embedding independently; compute on a cache miss."""
-    cached = get_cached_embedding(text)
+    cache_input = "embedding-v2:" + model_identity() + "\n" + text
+    cached = get_cached_embedding(cache_input)
     if cached is not None:
         return cached
     raw = _get_model().encode(text)
     embedding = raw.tolist() if hasattr(raw, "tolist") else list(raw)
-    set_cached_embedding(text, embedding)
+    set_cached_embedding(cache_input, embedding)
     return embedding
 
 
@@ -205,7 +220,7 @@ if __name__ == "__main__":
             return [0.7, 0.7, 0.0]
 
     _model = MockModel()
-    _loaded_model_name = DEFAULT_MODEL_NAME
+    _loaded_model_name = model_identity()
 
     # (a) Similar texts score high similarity
     res_a = match(
