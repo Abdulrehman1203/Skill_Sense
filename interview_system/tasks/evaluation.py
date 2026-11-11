@@ -45,6 +45,17 @@ def evaluate_interview(evaluation_id):
     try:
         from ..integrations.gemini_client import evaluate_answers
         inputs = evaluation_input(row)
+        if row.prompt_version == 'answers-v2':
+            from ..answer_evaluation import digest
+            from ..models import AnswerExtraction
+            # Preserve validated attribution even if the provider later fails.
+            with transaction.atomic():
+                current = InterviewEvaluation.objects.select_for_update().get(pk=row.pk)
+                if current.claim_token != token or current.status != 'PROCESSING':
+                    return
+                AnswerExtraction.objects.get_or_create(evaluation=current, defaults={
+                    'input_hash': digest({k: v for k, v in inputs.items() if k != 'alignment'}),
+                    'content_hash': digest(inputs['alignment']), 'content': inputs['alignment']})
         output = evaluate_answers(inputs, model_name=row.model_name)
         extraction = None
         if row.prompt_version == 'answers-v2':
@@ -53,7 +64,10 @@ def evaluate_interview(evaluation_id):
             from ..models import AnswerExtraction
             if isinstance(output, dict) and 'alignment' in output:
                 output = dict(output)
-                extraction = extract(inputs, output.pop('alignment'))
+                proposed = extract(inputs, output.pop('alignment'))
+                if proposed != inputs['alignment']:
+                    raise InvalidEvaluation('INVALID_ALIGNMENT')
+                extraction = inputs['alignment']
             else:
                 extraction = inputs['alignment']
             inputs['alignment'] = extraction
@@ -64,9 +78,9 @@ def evaluate_interview(evaluation_id):
             if current.claim_token != token or current.status != 'PROCESSING':
                 return
             if extraction is not None:
-                AnswerExtraction.objects.create(evaluation=current,
-                    input_hash=digest({k: v for k, v in inputs.items() if k != 'alignment'}),
-                    content_hash=digest(extraction), content=extraction)
+                AnswerExtraction.objects.get_or_create(evaluation=current, defaults={
+                    'input_hash': digest({k: v for k, v in inputs.items() if k != 'alignment'}),
+                    'content_hash': digest(extraction), 'content': extraction})
                 from ..models import Response, InterviewSession
                 session = InterviewSession.objects.filter(interview=interview).first()
                 if session:
@@ -99,7 +113,14 @@ def evaluate_interview(evaluation_id):
             if current.claim_token != token:
                 return
             current.status = 'FAILED' if current.attempts >= 4 else 'QUEUED'
-            current.error_code = 'INVALID_OUTPUT' if isinstance(exc, InvalidEvaluation) else 'PROVIDER_UNAVAILABLE'
+            # Persist only closed-vocabulary diagnostics, never provider text.
+            codes = {'INVALID_EVALUATION_OUTPUT', 'INVALID_EVIDENCE_QUOTE',
+                'INVALID_CRITERION_IDS', 'INVALID_QUESTION_ATTRIBUTION',
+                'INVALID_CRITERION_SCORE', 'INVALID_ANSWER_ATTRIBUTION',
+                'INVALID_ALIGNMENT', 'INVALID_ALIGNMENT_REFERENCE',
+                'EVIDENCE_HASH_MISMATCH', 'CONTINUATION_HASH_MISMATCH',
+                'EXTRACTION_HASH_MISMATCH', 'INVALID_EVALUATION_JSON', 'EVALUATION_INPUT_TOO_LARGE'}
+            current.error_code = (str(exc) if str(exc) in codes else 'INVALID_OUTPUT') if isinstance(exc, InvalidEvaluation) else 'PROVIDER_UNAVAILABLE'
             current.claim_token = current.lease_until = None
             current.next_attempt_at = timezone.now() + timedelta(seconds=15 * 2 ** current.attempts)
             current.save()

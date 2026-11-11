@@ -108,8 +108,8 @@ def _ocr_pdf(file_bytes: bytes) -> str:
             raw_page_text = pytesseract.image_to_string(img)
             page_text = str(raw_page_text) if raw_page_text else ""
             ocr_parts.append(page_text)
-        except Exception as exc:
-            logger.warning("OCR failed on page %d: %s", i + 1, exc)
+        except Exception:
+            logger.warning("OCR failed on page %d", i + 1)
 
     full_text = "\n".join(ocr_parts).strip()
     if not full_text:

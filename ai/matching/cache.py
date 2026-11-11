@@ -22,6 +22,12 @@ logger = logging.getLogger(__name__)
 CACHE_TTL = 60 * 60 * 24
 
 
+def _cache_event(kind: str, outcome: str) -> None:
+    """Countable diagnostics without document text, vectors, values or key hashes."""
+    logger.info("AI cache %s %s", kind, outcome,
+                extra={"event_code": "cache_observation", "cache_kind": kind, "cache_outcome": outcome, "count": 1})
+
+
 def compute_sha256(text: str) -> str:
     """Reusable SHA256 hashing helper for cache keys."""
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
@@ -45,12 +51,12 @@ def _get_redis_client():
 
             return LocalCacheClient()
 
-        redis_url = getattr(settings, "REDIS_URL", "redis://127.0.0.1:6379/1")
-        client = redis_lib.from_url(redis_url)
+        redis_url = settings.CACHE_REDIS_URL
+        client = redis_lib.from_url(redis_url, socket_connect_timeout=1, socket_timeout=1)
         client.ping()
         return client
     except Exception as exc:
-        logger.warning("Redis client connection failed (failing open): %s", exc)
+        logger.warning("AI cache unavailable; recomputing when required.")
         return None
 
 
@@ -67,18 +73,19 @@ def get_cached_embedding(text: str, client=None) -> list[float] | None:
 
     r = client if client is not None else _get_redis_client()
     if r is None:
-        logger.info("embedding cache miss (Redis offline): %s", cache_key)
+        _cache_event("embedding", "miss")
         return None
 
     try:
         raw_val = r.get(cache_key)
         if raw_val is not None:
-            logger.info("embedding cache hit: %s", cache_key)
-            return json.loads(raw_val)
+            value = json.loads(raw_val)
+            _cache_event("embedding", "hit")
+            return value
         else:
-            logger.info("embedding cache miss: %s", cache_key)
+            _cache_event("embedding", "miss")
     except Exception as exc:
-        logger.warning("embedding cache read failed (%s): %s", cache_key, exc)
+        logger.warning("AI cache unavailable; recomputing when required.")
 
     return None
 
@@ -95,9 +102,9 @@ def set_cached_embedding(text: str, embedding: list[float], client=None) -> None
     try:
         serialized = json.dumps(embedding)
         r.setex(cache_key, CACHE_TTL, serialized)
-        logger.info("embedding cache set: %s", cache_key)
+        _cache_event("embedding", "stored")
     except Exception as exc:
-        logger.warning("embedding cache write failed (%s): %s", cache_key, exc)
+        logger.warning("AI cache unavailable; recomputing when required.")
 
 
 # ── Gemini Parsed Response Cache ────────────────────────────────
@@ -113,18 +120,19 @@ def get_cached_gemini_parse(text: str, client=None) -> dict[str, Any] | None:
 
     r = client if client is not None else _get_redis_client()
     if r is None:
-        logger.info("gemini_parse cache miss (Redis offline): %s", cache_key)
+        _cache_event("gemini_parse", "miss")
         return None
 
     try:
         raw_val = r.get(cache_key)
         if raw_val is not None:
-            logger.info("gemini_parse cache hit: %s", cache_key)
-            return json.loads(raw_val)
+            value = json.loads(raw_val)
+            _cache_event("gemini_parse", "hit")
+            return value
         else:
-            logger.info("gemini_parse cache miss: %s", cache_key)
+            _cache_event("gemini_parse", "miss")
     except Exception as exc:
-        logger.warning("gemini_parse cache read failed (%s): %s", cache_key, exc)
+        logger.warning("AI cache unavailable; recomputing when required.")
 
     return None
 
@@ -141,9 +149,9 @@ def set_cached_gemini_parse(text: str, data: dict[str, Any], client=None) -> Non
     try:
         serialized = json.dumps(data)
         r.setex(cache_key, CACHE_TTL, serialized)
-        logger.info("gemini_parse cache set: %s", cache_key)
+        _cache_event("gemini_parse", "stored")
     except Exception as exc:
-        logger.warning("gemini_parse cache write failed (%s): %s", cache_key, exc)
+        logger.warning("AI cache unavailable; recomputing when required.")
 
 
 # ── Internal Sanity Checks ───────────────────────────────────────

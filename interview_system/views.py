@@ -277,9 +277,18 @@ class InterviewViewSet(
                 "questions", filter=models.Q(questions__approved=True))).order_by("-created_at")
 
         if getattr(user, "role", None) == User.Role.RECRUITER:
-            return Interview.objects.filter(
+            interviews = Interview.objects.filter(
                 application__job__recruiter__user=user
-            ).order_by("-created_at")
+            ).order_by("-created_at", "-pk")
+            if self.action == "list" and "application" in self.request.query_params:
+                try:
+                    application_id = UUID(self.request.query_params["application"])
+                except ValueError:
+                    raise ValidationError({"application": "Enter a valid UUID."})
+                interviews = interviews.filter(application_id=application_id).select_related(
+                    "application"
+                ).prefetch_related("questions")
+            return interviews
 
         return Interview.objects.none()
 
@@ -643,7 +652,7 @@ class RecruiterProfileView(generics.RetrieveUpdateAPIView):
 )
 class CandidateProfileView(generics.RetrieveUpdateAPIView):
     """
-    GET / PATCH /api/candidates/profile/
+    GET / PATCH / PUT /api/candidates/profile/
     Retrieve or update the authenticated candidate's profile.
     Self-owned only (no {id} in URL).
     """
@@ -1242,14 +1251,14 @@ class CandidateResumeViewSet(ModelViewSet):
         _parse = cast(Any, parse_resume)
         try:
             _parse.delay(resume_id=resume_id)
-        except Exception as exc:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             mode = "inline task" if settings.CELERY_TASK_ALWAYS_EAGER else "broker dispatch"
-            logging.getLogger(__name__).exception(
+            logging.getLogger(__name__).warning(
                 "Resume parsing %s failed for resume_id=%s", mode, resume_id,
             )
             Resume.objects.filter(pk=resume_id, status=Resume.Status.PENDING).update(
                 status=Resume.Status.FAILED,
-                processing_error=f"{mode} failed: {type(exc).__name__}: {exc}"[:500],
+                processing_error="Resume processing could not be queued. Retry or upload the document again.",
             )
 
     def perform_create(self, serializer):

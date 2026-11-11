@@ -101,23 +101,15 @@ def evaluate_answers(inputs: dict, *, model_name: str) -> dict:
     }
     instruction = _ANSWER_SYSTEM
     if inputs.get('contract_version') == 'answers-v2':
-        schema['required'].append('alignment')
-        schema['properties']['alignment'] = {'type': 'array', 'items': {'type': 'object', 'additionalProperties': False,
-            'required': ['question_id', 'asked_turn_id', 'confidence'], 'properties': {
-                'question_id': {'type': 'string', 'enum': [q['id'] for q in inputs['context']['questions']]},
-                'asked_turn_id': {'type': ['string', 'null']},
-                'confidence': {'type': 'number', 'minimum': 0, 'maximum': 1}}}}
         instruction = _ANSWER_SYSTEM + '''
-For answers-v2 return exactly {"alignment":[...],"answers":[...]}.
-First attribute each frozen question to an agent turn by meaning, allowing faithful
-paraphrases. Return one alignment per question with question_id, asked_turn_id
-(null if skipped or ambiguous), confidence 0..1. Do not infer a question was asked
-from its position in the frozen list or from candidate speech. Repeated/combined
-or uncertain prompts must remain unalignable. Confidence below .9 cannot be graded.
-For v2, the exact-wording requirement above is replaced by this grounded alignment.
-Answers may include several candidate turns and clarifying follow-ups before the
-next attributable question. Cite the actual agent prompt and literal candidate
-turns. Ambiguous or partial evidence remains MISSING_EVIDENCE, never NO_ANSWER.
+For answers-v2 return exactly {"answers":[...]}.
+The supplied alignment is authoritative server attribution, already computed
+before grading. Do not replace it or propose new question boundaries.
+For state ANSWERED cite asked_turn_id and literal text from answer_turn_ids only.
+For state NO_ANSWER return NO_ANSWER with zero criteria and cite asked_turn_id.
+For every other state return MISSING_EVIDENCE with all criterion values null.
+Repetitions and closing dialogue have already been segmented by the server.
+Use each question's exact frozen criterion IDs; do not introduce new criteria.
 '''
     try:
         with genai.Client(api_key=key, http_options=types.HttpOptions(timeout=45000,
@@ -183,6 +175,7 @@ class ParsedResumeSchema:
     education: list[EducationEntry] = field(default_factory=list)
     experience: list[ExperienceEntry] = field(default_factory=list)
     certifications: list[str] = field(default_factory=list)
+    projects: list[dict[str, Any]] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -205,6 +198,7 @@ class ParsedResumeSchema:
                 for ex in self.experience
             ],
             "certifications": self.certifications,
+            "projects": self.projects,
         }
 
 
@@ -272,11 +266,27 @@ def _validate_parsed_data(data: Any) -> dict[str, Any]:
         str(c) for c in data["certifications"] if c is not None and str(c).strip()
     ]
 
+    # Null distinguishes older parser output from a resume with no projects.
+    clean_projects = None
+    if "projects" in data:
+        if not isinstance(data["projects"], list):
+            raise GeminiParseError("'projects' must be a list.")
+        clean_projects = []
+        for entry in data["projects"]:
+            if not isinstance(entry, dict) or not isinstance(entry.get("skills"), list):
+                raise GeminiParseError("Each project must be an object with a skills list.")
+            title = str(entry.get("title") or "").strip()
+            description = str(entry.get("description") or "").strip()
+            skills = [skill.strip() for skill in entry["skills"] if isinstance(skill, str) and skill.strip()]
+            if title or description or skills:
+                clean_projects.append({"title": title, "description": description, "skills": skills})
+
     schema = ParsedResumeSchema(
         skills=clean_skills,
         education=clean_education,
         experience=clean_experience,
         certifications=clean_certs,
+        projects=clean_projects,
     )
     return schema.to_dict()
 
@@ -286,7 +296,7 @@ def _validate_parsed_data(data: Any) -> dict[str, Any]:
 _RESUME_RESPONSE_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
-    "required": ["skills", "education", "experience", "certifications"],
+    "required": ["skills", "education", "experience", "certifications", "projects"],
     "properties": {
         "skills": {"type": "array", "items": {"type": "string"}},
         "education": {
@@ -317,6 +327,19 @@ _RESUME_RESPONSE_SCHEMA = {
             },
         },
         "certifications": {"type": "array", "items": {"type": "string"}},
+        "projects": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["title", "description", "skills"],
+                "properties": {
+                    "title": {"type": "string"},
+                    "description": {"type": "string"},
+                    "skills": {"type": "array", "items": {"type": "string"}},
+                },
+            },
+        },
     },
 }
 
@@ -366,6 +389,12 @@ experience:
 - Standalone academic/personal projects are not employment entries. Extract their
   explicitly named skills, and include project details in a role only when linked to it.
 
+projects:
+- Include distinct projects explicitly described in the resume. Preserve the stated
+  title, summarize the stated work, and list only technologies explicitly linked to
+  that project. Use an empty title if it is unnamed. Do not create a project from a
+  skill mention or a generic responsibility.
+
 certifications:
 - Include explicitly listed certifications, licenses, and course-completion credentials.
   Preserve credential names and issuers when provided; do not infer certification from
@@ -374,7 +403,7 @@ certifications:
 
 Before returning, check that every entry is supported by the resume, each distinct
 qualification and role is represented, relevant named skills are retained, and all
-four required keys and required entry fields are present. Output only the JSON.
+required keys and required entry fields are present. Output only the JSON.
 
 Resume text:
 ---
@@ -441,7 +470,7 @@ def get_template_questions() -> list[dict[str, str]]:
 
         rows = list(TemplateQuestion.objects.values_list("category", "text"))
     except Exception as exc:
-        logger.error("TemplateQuestion table unavailable; using emergency templates: %s", exc)
+        logger.error("TemplateQuestion table unavailable; using emergency templates.")
 
     valid_rows = [
         (category, text.strip())
@@ -488,7 +517,8 @@ def _generate_questions_once(job: Any, parsed_resume: Any) -> list[dict[str, str
         raise GeminiParseError("GEMINI_API_KEY is not configured.")
     model_name = getattr(settings, "GEMINI_QUESTION_MODEL_NAME", settings.GEMINI_MODEL_NAME)
     # The provider rejects deadlines below 10 seconds. Keep three attempts plus
-    # backoff within the task's 50-second soft limit, including validation.
+    # backoff nominally fits the task's 50s soft limit; validation/DB/scheduling
+    # overhead is additional and can exceed that margin on a loaded host.
     timeout_ms = min(15000, max(10000, int(getattr(settings, "GEMINI_QUESTION_TIMEOUT_MS", 15000))))
     client = genai.Client(
         api_key=api_key,
@@ -546,9 +576,11 @@ def _question_failure_code(exc):
 def generate_questions_for(job: Any, parsed_resume: Any) -> list[dict[str, str]]:
     """Generate interview questions, retrying here before guaranteed fallback.
 
-    This function owns the whole external-call SLA: three 10–15-second attempts
-    with 1- and 2-second backoffs (at most 48 seconds of request/backoff budget,
-    excluding worker queue time and database overhead). SDK retries are disabled.
+    Request/backoff budget only: three 10–15-second attempts with 1- and
+    2-second backoffs (33–48 seconds configured budget). This is not total
+    user-visible latency: queueing, validation, database commits, recovery and
+    client refresh add time. Actual transport timing must be measured separately.
+    SDK retries are disabled.
     Callers must not
     retry Gemini failures after this function returns template questions.
     """
@@ -666,18 +698,21 @@ def parse_resume_text(text: str) -> dict[str, Any]:
             automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
         )
 
-        response = client.models.generate_content(
-            model=model_name,
-            contents=prompt,
-            config=config,
-        )
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt,
+                config=config,
+            )
+        finally:
+            client.close()
     except Exception as exc:
         logger.warning(
             "Gemini resume request failed: model=%s duration_s=%.3f error_type=%s status=%s",
             model_name, time.monotonic() - started, type(exc).__name__,
             getattr(exc, "code", None),
         )
-        raise GeminiParseError(f"Gemini API call failed: {exc}") from exc
+        raise GeminiParseError("Gemini resume parsing is unavailable. Retry after the service recovers.") from None
 
     usage = getattr(response, "usage_metadata", None)
     candidates = getattr(response, "candidates", None) or []

@@ -199,9 +199,9 @@ def validate_evaluation(data, inputs):
     Exact frozen question wording anchors asked turns. Unalignable/paraphrased
     prompts produce missing evidence, never an invented unanswered zero.
     """
-    def require(ok):
+    def require(ok, code='INVALID_EVALUATION_OUTPUT'):
         if not ok:
-            raise InvalidEvaluation('INVALID_EVALUATION_OUTPUT')
+            raise InvalidEvaluation(code)
     def number(value):
         return type(value) in (int, float) and math.isfinite(value) and 0 <= value <= 1
     def prose(value):
@@ -229,19 +229,27 @@ def validate_evaluation(data, inputs):
         for ref in answer['evidence']:
             require(isinstance(ref, dict) and set(ref) == {'turn_id', 'quote'})
             require(isinstance(ref['turn_id'], str) and ref['turn_id'] in turns and prose(ref['quote']))
-            require(ref['quote'] in turns[ref['turn_id']]['text'])
+            require(ref['quote'] in turns[ref['turn_id']]['text'], 'INVALID_EVIDENCE_QUOTE')
             refs.append(turns[ref['turn_id']])
         alignment = next((a for a in inputs.get('alignment', {}).get('questions', []) if a['question_id'] == qid), None)
         asked = [t for t in refs if t['role'] == 'agent' and (
             (alignment and alignment['state'] in ('ANSWERED', 'NO_ANSWER') and t['id'] == alignment['asked_turn_id'])
             or (not alignment and clean(q['text']) in clean(t['text'])))]
+        if alignment and alignment['state'] in ('ANSWERED', 'NO_ANSWER'):
+            # v2 question attribution is server-owned. Do not ask the model to
+            # re-prove it by repeating a prompt citation. Candidate claims still
+            # require literal, in-segment evidence below.
+            anchor = turns.get(alignment['asked_turn_id'])
+            require(anchor is not None and anchor['role'] == 'agent', 'INVALID_QUESTION_ATTRIBUTION')
+            asked = [anchor]
         user_refs = [t for t in refs if t['role'] == 'user']
         criteria = answer['criteria']
-        require(isinstance(criteria, dict) and set(criteria) == set(q['criteria']))
+        require(isinstance(criteria, dict) and set(criteria) == set(q['criteria']), 'INVALID_CRITERION_IDS')
         if status == 'MISSING_EVIDENCE':
             require(all(v is None for v in criteria.values()))
         else:
-            require(bool(asked) and all(number(v) for v in criteria.values()))
+            require(bool(asked), 'INVALID_QUESTION_ATTRIBUTION')
+            require(all(number(v) for v in criteria.values()), 'INVALID_CRITERION_SCORE')
             start = ordered.index(asked[0]['id'])
             # Bound the answer at the next known frozen question, not a follow-up.
             end = next((i for i in range(start + 1, len(ordered)) if turns[ordered[i]]['role'] == 'agent'
@@ -253,7 +261,7 @@ def validate_evaluation(data, inputs):
                 # Must have a later asked question or analyzed final evidence; a truncated text is not proof of silence.
                 require(alignment['state'] == 'NO_ANSWER' if alignment else end < len(ordered) or inputs.get('final_evidence', False))
             else:
-                require(bool(user_refs) and all(t in segment_users for t in user_refs))
+                require(bool(user_refs) and all(t in segment_users for t in user_refs), 'INVALID_ANSWER_ATTRIBUTION')
             scores.append(sum(criteria.values()) / len(criteria))
         results.append(answer)
     coverage = len(scores) / len(questions) if questions else 0

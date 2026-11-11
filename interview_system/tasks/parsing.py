@@ -19,8 +19,8 @@ def _mark_resume_failed(resume_id: str, reason: str) -> None:
             status=Resume.Status.FAILED, processing_error=reason[:500]
         )
         logger.error("Resume marked as FAILED: resume_id=%s", resume_id)
-    except Exception as exc:
-        logger.error("Could not set Resume status=FAILED for %s: %s", resume_id, exc)
+    except Exception:
+        logger.error("Could not set Resume status=FAILED for resume_id=%s", resume_id)
 
 
 # ═══════════════════════════════════════════════════════════════

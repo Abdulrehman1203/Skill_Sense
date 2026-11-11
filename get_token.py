@@ -16,6 +16,8 @@ import dotenv
 import jwt
 import requests
 
+if os.environ.get('ALLOW_DEVELOPER_TOKEN_TOOL') != '1' or os.environ.get('DJANGO_SETTINGS_MODULE') == 'ai_interview_recruitment.production_settings':
+    sys.exit('Developer-only tool: explicit ALLOW_DEVELOPER_TOKEN_TOOL=1 required outside production.')
 dotenv.load_dotenv()
 
 clerk_secret = os.getenv("CLERK_SECRET_KEY")

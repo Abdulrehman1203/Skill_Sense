@@ -3,9 +3,12 @@ URL configuration for ai_interview_recruitment project.
 """
 
 from django.conf import settings
+from pathlib import Path
 from django.conf.urls.static import static
 from django.contrib import admin
 from django.urls import include, path
+from interview_system.health import live, ready
+from interview_system.metrics import metrics
 from drf_spectacular.views import (
     SpectacularAPIView,
     SpectacularRedocView,
@@ -13,6 +16,10 @@ from drf_spectacular.views import (
 )
 
 urlpatterns = [
+    path("api/health/", live, name="health"),
+    path("api/health/live/", live, name="health-live"),
+    path("api/health/ready/", ready, name="health-ready"),
+    path("api/metrics/", metrics, name="metrics"),
     path("admin/", admin.site.urls),
 
     # ── OpenAPI schema (raw JSON/YAML) ────────────────────────
@@ -36,6 +43,6 @@ urlpatterns = [
     path("api/", include("interview_system.urls", namespace="interview_system")),
 ]
 
-# Serve media files in development (Django ignores this when DEBUG=False)
+# Only public company logos in local development. Never expose the resume tree.
 if settings.DEBUG:
-    urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+    urlpatterns += static('/media/recruiter/logos/', document_root=Path(settings.MEDIA_ROOT) / 'recruiter' / 'logos')

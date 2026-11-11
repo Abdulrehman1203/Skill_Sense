@@ -13,6 +13,13 @@ class ConversationControlView(APIView):
     permission_classes = [AllowAny]
     parser_classes = []
 
+    def get(self, request):
+        # Fixed, read-only capability probe. Never exposes call or candidate data.
+        from .interview_readiness import CONTROL_PROTOCOL
+        response = Response({'protocol': CONTROL_PROTOCOL})
+        response['Cache-Control'] = 'no-store'
+        return response
+
     @extend_schema(auth=[], request=None, responses={200: OpenApiResponse(description='Authenticated conversation instruction.'),
         401: OpenApiResponse(description='Invalid signature.'), 400: OpenApiResponse(description='Invalid command.')})
     def post(self, request):

@@ -7,7 +7,7 @@ Evaluation completion already holds Interview and may acquire Application here.
 from django.db import transaction
 from django.db.models import Max
 
-from ai.scoring.rubric import combined_score
+from ai.scoring.rubric import combined_score, required_factor_explanation
 from .answer_evaluation import digest
 from .models import Application, CandidateScore, Interview, ScoreRevision, ScoringPolicyState
 
@@ -37,8 +37,10 @@ def current_inputs(app):
     from .conversation_control import normal_completion_allowed
     if interview and not normal_completion_allowed(interview):
         reason, performance = 'INTERVIEW_INTERRUPTED', None
+    blockers = [reason] if reason else []
     if not rubric or not rubric.active or rubric.policy_version != 'COMBINED_V1':
         reason = 'SCORING_POLICY_UNAVAILABLE'
+        blockers.append(reason)
     inputs = {'policy': 'COMBINED_V1', 'application': str(app.pk),
         'assessment': str(assessment.pk) if assessment else None,
         'assessment_revision': assessment.revision if assessment else None,
@@ -50,7 +52,7 @@ def current_inputs(app):
         'rubric': str(rubric.pk) if rubric else None, 'rubric_version': rubric.version if rubric else None,
         'weights': ({'match': str(rubric.weight_match), 'interview': str(rubric.weight_interview), 'behavioral': str(rubric.weight_behavioral)} if rubric else None),
         'screening_match_percentage': match, 'interview_performance_percentage': performance,
-        'reason': reason}
+        'reason': reason, 'blockers': blockers}
     return inputs, assessment, evaluation, rubric
 
 
@@ -68,7 +70,7 @@ def ensure_locked(app):
         CandidateScore.objects.update_or_create(application=app, defaults={'current_revision': row,
             'final_score': row.final_score if row.status == 'COMPLETE' else None,
             'breakdown': {'match': inputs['screening_match_percentage'], 'interview': inputs['interview_performance_percentage'], 'behavioral': None},
-            'explanation': 'Current combined recommendation.' if row.status == 'COMPLETE' else 'Final recommendation pending or unavailable.'})
+            'explanation': 'Current combined recommendation.' if row.status == 'COMPLETE' else required_factor_explanation(inputs['screening_match_percentage'], inputs['interview_performance_percentage'])})
         return row
     result = combined_score(inputs['screening_match_percentage'], inputs['interview_performance_percentage'],
         weight_match=rubric.weight_match, weight_interview=rubric.weight_interview, weight_behavioral=rubric.weight_behavioral)
@@ -80,7 +82,7 @@ def ensure_locked(app):
     CandidateScore.objects.update_or_create(application=app, defaults={'current_revision': row,
         'final_score': None, 'breakdown': {'match': inputs['screening_match_percentage'],
         'interview': inputs['interview_performance_percentage'], 'behavioral': None},
-        'explanation': 'Required evidence is incomplete.' if inputs['reason'] else 'Combined recommendation pending.'})
+        'explanation': required_factor_explanation(inputs['screening_match_percentage'], inputs['interview_performance_percentage']) if inputs['reason'] else 'Combined recommendation pending.'})
     if row.status == 'QUEUED':
         transaction.on_commit(lambda: dispatch(row.pk))
     return row
@@ -129,9 +131,10 @@ def payload(app):
         'coverage': float(coverage) if coverage is not None else None,
         'answer_coverage': inputs['evaluation_coverage'],
         'error_code': inputs['reason'] or (row.error_code if row else ''),
+        'blockers': inputs['blockers'],
         'completed_at': row.completed_at if complete else None,
         'breakdown': {'match': inputs['screening_match_percentage'], 'interview': inputs['interview_performance_percentage'], 'behavioral': None},
-        'explanation': 'Combined recommendation from screening and evaluated answers; behavioral observations excluded.' if complete else 'Final recommendation is pending or unavailable; missing evidence is not zero.'}
+        'explanation': 'Combined recommendation from screening and evaluated answers; behavioral observations excluded.' if complete else required_factor_explanation(inputs['screening_match_percentage'], inputs['interview_performance_percentage'])}
     return result
 
 

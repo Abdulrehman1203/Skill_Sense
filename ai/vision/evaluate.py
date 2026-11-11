@@ -32,7 +32,6 @@ def synthetic():
 
 def real_frames(manifest_path):
     """Only explicitly local, consent-attested fixtures. No network sources."""
-    import cv2
     manifest_path = Path(manifest_path).resolve()
     manifest = json.loads(manifest_path.read_text())
     if manifest.get('consented_staged') is not True or manifest.get('schema_version') != 1:
@@ -46,6 +45,7 @@ def real_frames(manifest_path):
         with path.open('rb') as source:
             if file_digest(source, 'sha256').hexdigest() != clip['sha256']:
                 raise ValueError('Fixture checksum mismatch.')
+        import cv2  # Load native runtime only after consent/path/checksum validation.
         capture = cv2.VideoCapture(str(path))
         try:
             fps = capture.get(cv2.CAP_PROP_FPS)
@@ -80,6 +80,7 @@ def run(directory, samples, *, synthetic_only):
     import psutil
     from .runtime import VisionRuntime
     from .types import Calibration
+    from .rules import evaluate as evaluate_rules, RuleConfig
     process = psutil.Process()
     stop = threading.Event()
     baseline = process.memory_info().rss
@@ -90,7 +91,7 @@ def run(directory, samples, *, synthetic_only):
     watcher = threading.Thread(target=monitor, daemon=True)
     watcher.start()
     runtime = None
-    outcomes, latencies = [], defaultdict(list)
+    outcomes, timeline, latencies = [], [], defaultdict(list)
     started = time.perf_counter()
     try:
         runtime = VisionRuntime(directory)
@@ -107,8 +108,14 @@ def run(directory, samples, *, synthetic_only):
                 'vision_details': observation.details(calibration=baseline_gaze, config_version=runtime.config.version,
                                                      face_limit=runtime.config.max_faces),
                 'detected_objects': [item.as_dict() for item in observation.objects]})
+            timeline.append((sample['seconds'], index + 1, {
+                'vision_details': outcomes[-1]['vision_details'],
+                'detected_objects': outcomes[-1]['detected_objects']}))
         peak[0] = max(peak[0], process.memory_info().rss)
         return {'schema_version': 1, 'synthetic_only': synthetic_only,
+            'execution_scope': 'offline_cpu_adapters_and_pure_rules_not_application_stream',
+            'pipeline_version': 'vision-v1', 'rules_version': RuleConfig().version,
+            'episodes': evaluate_rules(timeline),
             'accuracy_validation': 'outstanding' if synthetic_only else 'observations_for_human_review',
             'environment': {'python': platform.python_version(), 'platform': platform.platform(),
                 'processor': os.environ.get('PROCESSOR_IDENTIFIER', platform.processor()), 'device': 'cpu',

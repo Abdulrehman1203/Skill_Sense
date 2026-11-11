@@ -103,4 +103,14 @@ celerybeat-schedule.dat
 celerybeat-schedule.dir
 celerybeat-schedule
 
-!interview_system/test_voice_origin_preflight.py
+# ── Local scripts & container tools ──────────────────────────
+*.ps1
+Start-InterviewServices.ps1
+/ai_interview_recruitment/test_settings.py
+/.local/
+.dockerignore
+Dockerfile
+Makefile
+compose.yaml
+
+

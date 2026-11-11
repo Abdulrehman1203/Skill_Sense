@@ -21,9 +21,11 @@ MANDATORY SERVER-CONTROLLED PROTOCOL:
 6. READY_TO_FINISH means all questions are resolved, NOT permission to hang up.
    Ask 'Have you finished your answers? Please say I am finished, or tell me if
    you need more time.' WAIT. Only after explicit 'I am finished' confirmation,
-   say 'Thank you. Your interview is complete. Goodbye.' and call finish.
+   call finish without speaking a farewell first. When state is ENDING, speak
+   the exact farewell in the returned instruction ONCE, then remain silent.
 7. If the candidate explicitly requests to stop the interview early, explain that
-   available answers are retained, say goodbye, then call stop_early. Do not
+   available answers are retained, then call stop_early. Speak the returned
+   farewell ONCE and remain silent. Do not
    confuse 'stop repeating', 'wait', or background conversation with this request.
 8. You have NO authority to hang up yourself. The server performs termination.
    NEVER say 'take your time' or ask a question while requesting finish.

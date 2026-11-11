@@ -6,6 +6,7 @@ Jobs and skills are registered via DRF routers. Manual paths
 """
 
 from django.urls import include, path
+from .resumes.download import ResumeDownloadView
 from .conversation_views import ConversationControlView
 from rest_framework.routers import DefaultRouter
 
@@ -111,6 +112,7 @@ urlpatterns = [
 
     # Resume detail (Phase 5)
     path("resumes/<uuid:pk>/", ResumeDetailView.as_view(), name="resume-detail"),
+    path("resumes/<uuid:pk>/download/", ResumeDownloadView.as_view(), name="resume-download"),
 
     # Router-generated job CRUD
     path("", include(router.urls)),

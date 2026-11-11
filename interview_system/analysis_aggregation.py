@@ -123,11 +123,28 @@ def calculate(session, base_coverage):
     elif coverage['usable_frames'] == 0:
         status = 'failed'
     elif (mixed or coverage['dropped'] or coverage['superseded'] or coverage['failed'] or coverage['expired']
-          or coverage['unusable_frames'] or coverage['unsupported_frames'] or coverage['unknown_gaze'] or known['gaze'] == 0):
+          or coverage['unusable_frames'] or coverage['unsupported_frames']
+          or known['face'] == 0 or known['objects'] == 0
+          or (session.vision_calibration and (coverage['unknown_gaze'] or known['gaze'] == 0))):
         status = 'partial'
     else:
         status = 'complete'
+    limitations = []
+    if not session.vision_calibration:
+        limitations.append('gaze_not_calibrated')
+    if coverage['processed'] and known['face'] == 0 and known['objects'] == 0:
+        limitations.append('insufficient_temporal_coverage')
+    if coverage['superseded']:
+        limitations.append('sampling_exceeds_processing_capacity')
+    if coverage['unusable_frames']:
+        limitations.append('unusable_image_quality')
     return {'schema_version': 1, 'status': status, 'final': final,
+        'limitations': limitations,
+        'measurement_availability': {
+            'face_duration': known['face'] > 0,
+            'object_duration': known['objects'] > 0,
+            'gaze_duration': known['gaze'] > 0,
+            'expression': False},
         'reason': 'no_usable_evidence' if final and status == 'failed' else 'mixed_provenance' if mixed else None,
         'coverage': {**coverage, 'known_seconds': {key: round(value, 6) for key, value in known.items()}},
         'gaze_centered_pct': round(100*centered/known['gaze'], 4) if known['gaze'] > 0 else None,

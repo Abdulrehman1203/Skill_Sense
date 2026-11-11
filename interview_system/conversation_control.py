@@ -181,8 +181,15 @@ def control(payload):
         row.progress[row.questions[row.cursor]['id']] = {'status': 'AWAITING_ANSWER'}
     if row.end_kind:
         row.stop_requested_at = timezone.now()
+        # The tool response precedes spoken playback. Never race the closing
+        # sentence with the stop API. Persist the deadline for broker recovery.
+        row.next_stop_at = row.stop_requested_at + timedelta(seconds=10)
         transaction.on_commit(lambda: dispatch_stop(row.pk))
-        message = 'The server has accepted the ending request. Do not ask any more questions.'
+        message = ('Say exactly: "Thank you. Your interview is complete. Goodbye." Then remain silent. '
+                   'Do not ask questions or call any more tools. The server will end the call shortly.'
+                   if row.end_kind == 'COMPLETED' else
+                   'Say exactly: "Your interview has ended. Your available answers have been saved. Goodbye." '
+                   'Then remain silent. Do not ask questions or call any more tools.')
     row.revision += 1
     row.save()
     if action not in ('current', 'repeat'):
@@ -198,7 +205,8 @@ def control(payload):
 def dispatch_stop(interview_id):
     from .tasks.conversation import stop_conversation
     try:
-        stop_conversation.apply_async(args=[str(interview_id)], retry=False)
+        deadline = InterviewConversation.objects.values_list('next_stop_at', flat=True).get(pk=interview_id)
+        stop_conversation.apply_async(args=[str(interview_id)], eta=deadline, retry=False)
     except Exception:
         # The intent stays in the database and periodic recovery republishes it.
         import logging

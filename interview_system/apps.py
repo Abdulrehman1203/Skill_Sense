@@ -10,3 +10,4 @@ class InterviewSystemConfig(AppConfig):
         # This is the recommended Django pattern — do NOT rely on
         # import side-effects in models.py.
         import interview_system.signals  # noqa: F401
+        import interview_system.operational_signals  # noqa: F401

@@ -46,8 +46,7 @@ class RetellCallEndedView(APIView):
         raw = request.body  # Raw bytes are required for HMAC, never parsed here.
         if not verify_webhook_signature(raw, request.headers.get('x-retell-signature', '')):
             logger.warning(
-                'Retell webhook rejected source_ip=%s timestamp=%s reason=invalid_signature',
-                request.META.get('REMOTE_ADDR', 'unknown'), timezone.now().isoformat(),
+                'Retell webhook rejected reason=invalid_signature',
             )
             return Response({'detail': 'Invalid webhook signature.'}, status=401)
         # SECURITY BOUNDARY: JSON and all field access are strictly below verification.

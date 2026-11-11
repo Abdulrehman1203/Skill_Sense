@@ -2,6 +2,7 @@
 import asyncio
 from contextlib import suppress
 import json
+import logging
 import uuid
 
 from channels.generic.websocket import AsyncWebsocketConsumer
@@ -13,6 +14,8 @@ from . import frame_admission, observer_delivery, socket_db
 from .frame_validation import ProtocolError, get_decoder, parse_message
 from .socket_auth import SocketAuthorizationError
 from .socket_guard import SocketGuard
+
+logger = logging.getLogger(__name__)
 
 
 def observer_group(session_id):
@@ -62,15 +65,18 @@ class AnalysisSocket(AsyncWebsocketConsumer):
 
     @sensitive_variables()
     async def connect(self):
+        stage = 'ticket'
         try:
             secret = self.scope.pop('interview_analysis_ticket', None)
             session_id = self.scope['url_route']['kwargs']['session_id']
             self.lease = await io(socket_db.redeem(secret, session_id, self.purpose))
             secret = None
             self.guard = SocketGuard(self.lease, self.purpose, uuid.uuid4().hex)
+            stage = 'guard'
             if not await io(self.guard.reserve()):
                 raise SocketAuthorizationError('connection_limit', 409)
             if self.purpose == 'publisher':
+                stage = 'publisher_acquisition'
                 # If an I/O timeout cancels the waiter, retain the acquisition
                 # result long enough for fenced cleanup (sync SQL is not cancellable).
                 self.acquisition = asyncio.create_task(socket_db.acquire(self.lease))
@@ -78,7 +84,9 @@ class AnalysisSocket(AsyncWebsocketConsumer):
             else:
                 self.group_name = observer_group(self.lease.session_id)
                 await io(self.channel_layer.group_add(self.group_name, self.channel_name))
+            stage = 'authorization'
             await self.authorize()
+            stage = 'ready_delivery'
             await self.accept()
             self.accepted = True
             ready = {'type': 'ready', 'protocol_version': 1,
@@ -98,7 +106,9 @@ class AnalysisSocket(AsyncWebsocketConsumer):
             await self.terminate(exc.reason, exc.code)
         except SocketAuthorizationError as exc:
             await self.terminate(exc.reason, auth_close(exc.reason))
-        except Exception:
+        except Exception as exc:
+            logger.warning('analysis_handshake_failed purpose=%s stage=%s error_type=%s',
+                           self.purpose, stage, type(exc).__name__)
             await self.terminate('authorization_unavailable', 1011)
 
     async def authorize(self):
@@ -243,6 +253,9 @@ class AnalysisSocket(AsyncWebsocketConsumer):
         if self.closed:
             return
         self.closed = True  # Fence admission/delivery before any cleanup I/O.
+        # Never include ticket, scope, frame, identity or exception locals.
+        logger.warning('analysis_socket_closed purpose=%s reason=%s code=%s accepted=%s',
+                       self.purpose, reason, code, self.accepted)
         await self.cleanup()
         if self.accepted:
             with suppress(Exception):
