@@ -56,8 +56,10 @@ class AnalysisSocket(AsyncWebsocketConsumer):
     async def __call__(self, scope, receive, send):
         try:
             await super().__call__(scope, receive, send)
-        except Exception:
+        except Exception as exc:
             # Do not log scopes, ticket values, raw payloads or exception locals.
+            logger.warning('analysis_dispatch_failed purpose=%s error_type=%s',
+                           self.purpose, type(exc).__name__)
             with suppress(Exception):
                 await self.terminate('authorization_unavailable', 1011)
         finally:
@@ -257,6 +259,12 @@ class AnalysisSocket(AsyncWebsocketConsumer):
         logger.warning('analysis_socket_closed purpose=%s reason=%s code=%s accepted=%s',
                        self.purpose, reason, code, self.accepted)
         await self.cleanup()
+        if not self.accepted and self.lease is not None and reason in ('publisher_conflict', 'stale_connection'):
+            # A valid ticket may race cleanup of the previous generation.
+            # Deliver its actionable transport reason before closing.
+            with suppress(Exception):
+                await self.accept()
+                self.accepted = True
         if self.accepted:
             with suppress(Exception):
                 await self.emit({'type': 'error', 'reason': reason})

@@ -98,7 +98,8 @@ def _create_call(interview, questions) -> dict:
     """Create a call and validate its ID without logging provider responses."""
     api_key = _configuration("RETELL_API_KEY")
     agent_id = _configuration("RETELL_AGENT_ID")
-    if getattr(settings, 'RETELL_CONVERSATION_GUARD_ENABLED', False):
+    guarded = getattr(settings, 'RETELL_CONVERSATION_GUARD_ENABLED', False)
+    if guarded:
         if not getattr(settings, 'RETELL_CONVERSATION_CONTROL_URL', ''):
             raise RetellUnavailableError('Guarded conversation callback is not configured.')
         verify_guard_configuration(api_key, agent_id)
@@ -111,8 +112,17 @@ def _create_call(interview, questions) -> dict:
     payload = {
         "agent_id": agent_id,
         "metadata": {"interview_id": interview_id},
-        "retell_llm_dynamic_variables": {"interview_questions": context},
     }
+    if guarded:
+        opening = json.loads(context)[0]
+        if not opening.get('question_id'):
+            raise RetellUnavailableError('An approved opening question ID is required.')
+        payload["retell_llm_dynamic_variables"] = {
+            "opening_question": opening["text"],
+            "opening_question_id": opening["question_id"],
+        }
+    else:
+        payload["retell_llm_dynamic_variables"] = {"interview_questions": context}
     # Suppress provider exception chains: even a transport exception may embed
     # Authorization or response tokens. Never interpolate its text into ours.
     try:
@@ -147,7 +157,7 @@ def _create_call(interview, questions) -> dict:
 def verify_guard_configuration(api_key, agent_id):
     """Fail closed before creating a call if provider configuration has drifted."""
     from urllib.parse import quote
-    from ..conversation_protocol import PROMPT
+    from ..conversation_protocol import guard_matches
     def read(path):
         try:
             response = requests.get('https://api.retellai.com/' + path,
@@ -166,12 +176,10 @@ def verify_guard_configuration(api_key, agent_id):
     engine = agent.get('response_engine', {})
     if engine.get('type') != 'retell-llm' or not engine.get('llm_id'):
         raise RetellUnavailableError('Guarded agent response engine is incompatible.')
+    if agent.get('reminder_max_count') != 0:
+        raise RetellUnavailableError('Guarded agent silence reminders must be disabled.')
     llm = read('get-retell-llm/' + quote(engine['llm_id'], safe=''))
-    tools = llm.get('general_tools') or []
-    if (llm.get('general_prompt') != PROMPT or llm.get('states')
-            or any(tool.get('type') == 'end_call' for tool in tools)
-            or not any(tool.get('name') == 'interview_control'
-                and tool.get('url') == settings.RETELL_CONVERSATION_CONTROL_URL for tool in tools)):
+    if not guard_matches(llm, settings.RETELL_CONVERSATION_CONTROL_URL):
         raise RetellUnavailableError('Guarded agent configuration changed; operator review is required.')
 
 

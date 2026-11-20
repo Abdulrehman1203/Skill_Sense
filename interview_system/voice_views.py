@@ -1,5 +1,6 @@
 """Authenticated HTTP lifecycle for browser voice interviews."""
 import time
+import logging
 from datetime import timedelta
 
 from django.conf import settings
@@ -18,6 +19,8 @@ from .serializers import StartVoiceSessionResponseSerializer
 from .voice import accept_event, normalize_call
 from .socket_security import video_origin_allowed
 from .interview_readiness import InterviewNotReady, require_interview_ready
+
+logger = logging.getLogger(__name__)
 
 
 class VoiceStartSerializer(serializers.Serializer):
@@ -41,6 +44,10 @@ class ConversationStatusSerializer(serializers.Serializer):
     skipped = serializers.IntegerField(allow_null=True)
     total = serializers.IntegerField(allow_null=True)
     paused = serializers.BooleanField()
+    question_number = serializers.IntegerField(required=False, allow_null=True)
+    question_text = serializers.CharField(required=False, allow_null=True)
+    live_answer = serializers.CharField(required=False, allow_blank=True)
+    approved_questions = serializers.ListField(child=serializers.CharField(), required=False)
 
 
 class VoiceResultSerializer(serializers.Serializer):
@@ -93,6 +100,7 @@ class VoiceInterviewMixin:
         origin = request.headers.get('Origin')
         if options.validated_data['video_required'] and origin is not None:
             if not video_origin_allowed(origin):
+                logger.warning('interview_start_unavailable code=video_origin_not_allowed')
                 return _private(Response({
                     'code': 'video_origin_not_allowed',
                     'call_creation_uncertain': False,
@@ -107,9 +115,7 @@ class VoiceInterviewMixin:
                 raise PermissionDenied('You do not have access to this interview.')
             if app.status in ('DECISION', 'REJECTED'):
                 return Response({'detail': 'This application has a terminal decision.'}, status=409)
-            # Explicit local testing action only. Never relax production joining
-            # windows, ownership, or completed-call rules. Local template
-            # scaffolding below is confined to this explicit development action.
+            # Only the explicit development action can scaffold missing questions.
             start_now = options.validated_data['start_now']
             if start_now and not settings.DEBUG:
                 raise PermissionDenied('Immediate test interviews are available only in development.')
@@ -117,7 +123,7 @@ class VoiceInterviewMixin:
                 return Response({'detail': 'This interview is complete.'}, status=409)
             if interview.status not in (Interview.Status.SCHEDULED, Interview.Status.LIVE):
                 return Response({'detail': 'This interview has an invalid lifecycle state.'}, status=409)
-            if (not start_now and request.user.role == User.Role.CANDIDATE and interview.status == Interview.Status.SCHEDULED
+            if (not settings.DEBUG and request.user.role == User.Role.CANDIDATE and interview.status == Interview.Status.SCHEDULED
                     and interview.scheduled_at and interview.scheduled_at > timezone.now() + timedelta(minutes=15)):
                 raise ValidationError({'scheduled_at': 'You can join from 15 minutes before the scheduled time.'})
             questions = list(interview.questions.filter(approved=True).order_by('position', 'created_at', 'pk'))
@@ -176,14 +182,17 @@ class VoiceInterviewMixin:
                     credentials=retell_client.encrypt_credentials(credentials), expires_at=credentials['expires_at'],
                 )
             except InterviewNotReady as error:
+                logger.warning('interview_start_unavailable code=%s', error.code)
                 return _private(Response({'detail': str(error), 'code': error.code,
                                           'call_creation_uncertain': False}, status=503))
             except retell_client.RetellCreationUncertainError:
+                logger.warning('interview_start_unavailable code=voice_creation_uncertain')
                 session.creation_uncertain = True
                 session.save(update_fields=['creation_uncertain'])
                 return _private(Response({'detail': 'Call creation outcome is unknown. Use sync-voice-session before retrying.',
                                           'call_creation_uncertain': True}, status=503))
             except retell_client.RetellUnavailableError:
+                logger.warning('interview_start_unavailable code=voice_provider_unavailable')
                 # Leave SCHEDULED sessions retryable; no fake LIVE success.
                 return _private(Response({'detail': 'Voice service unavailable. Retry this endpoint.',
                                           'call_creation_uncertain': False}, status=503))
@@ -227,7 +236,14 @@ class VoiceInterviewMixin:
         from .interview_workflow import workflow_state
         result['workflow_state'] = workflow_state(interview)
         from .conversation_control import snapshot as conversation_snapshot
-        result['conversation'] = conversation_snapshot(interview)
+        result['conversation'] = conversation_snapshot(
+            interview,
+            include_live_question=(
+                request.user.pk == interview.application.candidate.user_id
+                and interview.status == Interview.Status.LIVE
+                and bool(interview.retell_session_id and session and session.audio_ended_at is None)
+            ),
+        )
         if request.user.role == User.Role.CANDIDATE:
             # Transcript/recording/provider analysis release belongs to feedback,
             # not to joining or polling the media lifecycle.
@@ -254,9 +270,12 @@ class VoiceInterviewMixin:
             guard = InterviewConversation.objects.select_for_update().filter(interview=interview).first()
             if guard and not guard.end_kind:
                 guard.end_kind, guard.stop_requested_at = 'CANDIDATE_ENDED', timezone.now()
-                guard.save(update_fields=['end_kind', 'stop_requested_at', 'updated_at'])
+                guard.next_stop_at = guard.stop_requested_at
+                guard.save(update_fields=['end_kind', 'stop_requested_at', 'next_stop_at', 'updated_at'])
                 from .conversation_control import dispatch_stop
                 transaction.on_commit(lambda: dispatch_stop(interview.pk))
+        if guard and guard.stop_requested_at:
+            return Response({'detail': 'Call completion requested. Results will arrive through the webhook.'}, status=202)
         try:
             data = retell_client.get_call(interview.retell_session_id)
             if data.get('call_status') in ('ended', 'error', 'not_connected'):

@@ -62,13 +62,19 @@ def policy_reason(session, now):
     deadlines = []
     if session.video_deadline is not None:
         deadlines.append((session.video_deadline, 0, 'duration_limit'))
-    if session.reconnect_deadline is not None:
-        deadlines.append((session.reconnect_deadline, 1, 'reconnect_timeout'))
-    elif session.connection_state == 'connected' and session.connection_lease_until is not None:
-        deadlines.append((session.connection_lease_until + seconds('INTERVIEW_ANALYSIS_RECONNECT_GRACE_SECONDS'), 1, 'reconnect_timeout'))
-    baseline = session.last_frame_at or session.video_activated_at
-    if baseline is not None:
-        deadlines.append((baseline + seconds('INTERVIEW_ANALYSIS_VIDEO_INACTIVITY_SECONDS'), 2, 'inactivity_timeout'))
+    if session.last_frame_at is not None:
+        if session.reconnect_deadline is not None:
+            deadlines.append((session.reconnect_deadline, 1, 'reconnect_timeout'))
+        elif session.connection_state == 'connected' and session.connection_lease_until is not None:
+            deadlines.append((session.connection_lease_until + seconds('INTERVIEW_ANALYSIS_RECONNECT_GRACE_SECONDS'),
+                              1, 'reconnect_timeout'))
+        deadlines.append((session.last_frame_at + seconds('INTERVIEW_ANALYSIS_VIDEO_INACTIVITY_SECONDS'),
+                          2, 'inactivity_timeout'))
+    elif session.video_activated_at is not None:
+        # A connection that drops before delivering its first frame is still
+        # starting up. Allow a fresh ticket and socket within the startup budget.
+        deadlines.append((session.video_activated_at + seconds('INTERVIEW_ANALYSIS_VIDEO_STARTUP_SECONDS'),
+                          2, 'inactivity_timeout'))
     due = sorted(d for d in deadlines if d[0] <= now)
     return due[0][2] if due else None
 

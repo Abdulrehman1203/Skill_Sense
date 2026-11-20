@@ -140,13 +140,12 @@ Use each question's exact frozen criterion IDs; do not introduce new criteria.
 
 
 class GeminiParseError(Exception):
-    """
-    Unified exception for all Gemini parsing failure modes.
+    """A safe Gemini error with optional retry metadata for résumé parsing."""
 
-    Causes: empty input text, missing API key, API timeout / error,
-    empty response (safety filter block), non-JSON output, or schema validation failure.
-    This is the ONLY exception type that propagates out of this module.
-    """
+    def __init__(self, message, *, status_code=None, transient=False):
+        super().__init__(message)
+        self.status_code = status_code
+        self.transient = transient
 
 
 # ── Schema Validation ────────────────────────────────────────────
@@ -707,12 +706,27 @@ def parse_resume_text(text: str) -> dict[str, Any]:
         finally:
             client.close()
     except Exception as exc:
+        import httpx
+
+        status_code = getattr(exc, "code", None)
+        if isinstance(exc, httpx.HTTPStatusError):
+            status_code = exc.response.status_code
+        transient = (
+            isinstance(status_code, int) and (status_code in (408, 429) or 500 <= status_code < 600)
+            or isinstance(exc, (TimeoutError, ConnectionError, httpx.TimeoutException,
+                                httpx.NetworkError, httpx.RemoteProtocolError))
+        )
         logger.warning(
             "Gemini resume request failed: model=%s duration_s=%.3f error_type=%s status=%s",
             model_name, time.monotonic() - started, type(exc).__name__,
-            getattr(exc, "code", None),
+            status_code,
         )
-        raise GeminiParseError("Gemini resume parsing is unavailable. Retry after the service recovers.") from None
+        raise GeminiParseError(
+            "Gemini resume parsing is unavailable. Retry after the service recovers."
+            if transient else "Gemini resume parsing could not finish.",
+            status_code=status_code,
+            transient=transient,
+        ) from None
 
     usage = getattr(response, "usage_metadata", None)
     candidates = getattr(response, "candidates", None) or []

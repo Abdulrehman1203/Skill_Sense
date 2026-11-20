@@ -44,7 +44,8 @@ def configure(namespace, environ, *, strict=False):
             'LOCATION': urls['cache'], 'KEY_PREFIX': 'skillsense:cache', 'TIMEOUT': 300,
             'OPTIONS': {'socket_connect_timeout': 1, 'socket_timeout': 1}}},
         CHANNEL_LAYERS={'default': {'BACKEND': 'channels_redis.core.RedisChannelLayer', 'CONFIG': {
-            'hosts': [{'address': urls['channels'], 'socket_connect_timeout': 1, 'socket_timeout': 1}],
+            # Channels waits up to five seconds in BZPOPMIN even on a healthy Redis.
+            'hosts': [{'address': urls['channels'], 'socket_connect_timeout': 1, 'socket_timeout': 8}],
             'prefix': 'skillsense:channels', 'capacity': 16, 'expiry': 10, 'group_expiry': 120,
             'serializer_format': 'json'}}},
     )

@@ -105,12 +105,26 @@ celerybeat-schedule
 
 # ── Local scripts & container tools ──────────────────────────
 *.ps1
+*.bat
 Start-InterviewServices.ps1
+Start_Project.bat
+Stop_Project.bat
 /ai_interview_recruitment/test_settings.py
 /.local/
 .dockerignore
 Dockerfile
 Makefile
 compose.yaml
+
+# ── Local prototype & redesign mockups ───────────────────────
+*-prototype.html
+*-redesign.html
+candidate-report-prototype.html
+candidate-report-review-prototype.html
+recruiter-analytics-prototype.html
+recruiter-ranking-prototype.html
+recruiter-ranking-redesign.html
+recruiter-scoring-model-prototype.html
+
 
 

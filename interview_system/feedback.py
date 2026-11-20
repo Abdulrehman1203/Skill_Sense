@@ -78,19 +78,25 @@ def release(report_id, *, actor, expected_revision, expected_edit_version=None):
 
 
 def candidate_state(interview, selected_report=None):
+    attempt = {
+        'interview': str(interview.pk),
+        'application': str(interview.application_id),
+        'role_title': interview.application.job.title,
+        'interview_date': interview.completed_at or interview.scheduled_at,
+    }
     released = selected_report or FeedbackReport.objects.filter(evaluation__interview=interview,
         released_at__isnull=False, status='READY').order_by('-revision').first()
     latest_released = FeedbackReport.objects.filter(evaluation__interview=interview, released_at__isnull=False).order_by('-revision').first()
     if (released and released.retracted_at) or (not selected_report and latest_released and latest_released.retracted_at):
-        return {'state': 'RETRACTED', 'interview': str(interview.pk), 'application': str(interview.application_id), 'report': None}
+        return {**attempt, 'state': 'RETRACTED', 'report': None}
     if (released and released.released_at and released.status == 'READY' and digest(released.content) == released.content_hash
             and (not released.amendments or digest(released.amendments) == released.amendments_hash)):
-        return {'state': 'RELEASED', 'interview': str(interview.pk), 'application': str(interview.application_id),
+        return {**attempt, 'state': 'RELEASED',
             'report': {'id': str(released.pk), 'revision': released.revision, 'contract_version': released.contract_version,
                          'released_at': released.released_at, **released.content,
                          **({'recruiter_public_guidance': released.amendments} if released.amendments else {})}}
     if released and released.released_at:
-        return {'state': 'FAILED', 'interview': str(interview.pk), 'application': str(interview.application_id), 'report': None}
+        return {**attempt, 'state': 'FAILED', 'report': None}
     latest = selected_report or FeedbackReport.objects.filter(evaluation__interview=interview).order_by('-revision').first()
     state = {'READY': 'UNRELEASED', 'FAILED': 'FAILED', 'UNAVAILABLE': 'UNAVAILABLE'}.get(latest.status, 'PENDING') if latest else 'PENDING'
-    return {'state': state, 'interview': str(interview.pk), 'application': str(interview.application_id), 'report': None}
+    return {**attempt, 'state': state, 'report': None}

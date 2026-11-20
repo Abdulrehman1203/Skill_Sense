@@ -8,7 +8,7 @@ from django.core.management.base import BaseCommand, CommandError
 from django.utils import timezone
 
 
-from interview_system.conversation_protocol import PROMPT, guarded_tool
+from interview_system.conversation_protocol import OPENING_MESSAGE, PROMPT, guarded_tools, guard_matches
 
 
 class Command(BaseCommand):
@@ -41,8 +41,10 @@ class Command(BaseCommand):
             raise CommandError('Supply the public HTTPS interview-control callback URL.')
         if not parsed.path.endswith('/api/webhooks/retell/interview-control/'):
             raise CommandError('The callback must use /api/webhooks/retell/interview-control/.')
-        tools = [t for t in llm.get('general_tools', []) if t.get('type') != 'end_call' and t.get('name') != 'interview_control']
-        tools.append(guarded_tool(url))
+        required_tools = guarded_tools(url)
+        required_names = {tool['name'] for tool in required_tools}
+        tools = [t for t in llm.get('general_tools', []) if t.get('type') != 'end_call' and t.get('name') not in required_names]
+        tools.extend(required_tools)
         if not options['apply']:
             self.stdout.write(json.dumps({'agent': agent['agent_id'], 'callback_url': url,
                 'unrestricted_end_tools_to_remove': sum(t.get('type') == 'end_call' for t in llm.get('general_tools', [])),
@@ -54,15 +56,21 @@ class Command(BaseCommand):
         backup = folder / ('retell-guard-' + timezone.now().strftime('%Y%m%dT%H%M%S%fZ') + '.json')
         backup.write_text(json.dumps({'agent': agent, 'llm': llm}, ensure_ascii=False), encoding='utf-8')
         api('PATCH', 'update-retell-llm/' + engine['llm_id'], json={
-            'general_prompt': PROMPT, 'general_tools': tools, 'tool_call_strict_mode': True})
+            'general_prompt': PROMPT, 'general_tools': tools, 'tool_call_strict_mode': True,
+            'begin_message': OPENING_MESSAGE, 'start_speaker': 'agent'})
         # Noise cancellation without aggressively suppressing a quiet candidate.
         api('PATCH', 'update-agent/' + settings.RETELL_AGENT_ID, json={
             'interruption_sensitivity': 0.8, 'denoising_mode': 'noise-cancellation',
+            'reminder_max_count': 0,
+            'webhook_events': ['call_started', 'call_ended', 'call_analyzed', 'transcript_updated'],
             'end_call_after_silence_ms': 300000,
             'webhook_url': url.rsplit('/', 2)[0] + '/call-ended/'})
         checked = api('GET', 'get-retell-llm/' + engine['llm_id'])
-        if any(t.get('type') == 'end_call' for t in checked.get('general_tools', [])):
-            raise CommandError('An unrestricted ending tool remains; do not enable guarded calls.')
-        if checked.get('general_prompt') != PROMPT or not any(t.get('name') == 'interview_control' and t.get('url') == url for t in checked.get('general_tools', [])):
+        if not guard_matches(checked, url):
             raise CommandError('Provider readback did not match the guarded configuration.')
+        checked_agent = api('GET', 'get-agent/' + settings.RETELL_AGENT_ID)
+        if checked_agent.get('reminder_max_count') != 0:
+            raise CommandError('Provider readback did not disable unsolicited reminders.')
+        if 'transcript_updated' not in (checked_agent.get('webhook_events') or []):
+            raise CommandError('Provider readback did not enable live transcript delivery.')
         self.stdout.write(json.dumps({'configured': True, 'backup': str(backup), 'live_audio_verified': False}))

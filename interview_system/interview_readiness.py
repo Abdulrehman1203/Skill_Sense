@@ -1,10 +1,14 @@
 """Pre-call checks: never create a paid call with unavailable required services."""
+import logging
 from urllib.parse import urlsplit
 
 import requests
 from django.conf import settings
 
 CONTROL_PROTOCOL = 'skillsense.interview-control.v1'
+CALLBACK_TIMEOUTS = ((1, 2), (2, 4))
+CALLBACK_TRANSIENT_STATUSES = frozenset({502, 503, 504})
+logger = logging.getLogger(__name__)
 
 
 def require_scoring_policy():
@@ -25,6 +29,33 @@ class InterviewNotReady(Exception):
     def __init__(self, code, message):
         self.code = code
         super().__init__(message)
+
+
+def _callback_ready(url):
+    # Only the public, read-only capability request is retried. Once Retell
+    # call creation begins its existing reconciliation rules still apply.
+    for timeout in CALLBACK_TIMEOUTS:
+        try:
+            with requests.get(url, timeout=timeout, allow_redirects=False,
+                              headers={'Accept': 'application/json', 'ngrok-skip-browser-warning': 'true'}) as response:
+                if response.status_code == 200:
+                    if response.json() == {'protocol': CONTROL_PROTOCOL}:
+                        return True
+                    failure = 'unexpected_protocol'
+                    break
+                failure = f'http_{response.status_code}'
+                if response.status_code not in CALLBACK_TRANSIENT_STATUSES:
+                    break
+        except (requests.exceptions.SSLError, ValueError) as error:
+            failure = type(error).__name__
+            break
+        except (requests.Timeout, requests.ConnectionError) as error:
+            failure = type(error).__name__
+        except requests.RequestException as error:
+            failure = type(error).__name__
+            break
+    logger.warning('interview_callback_check_failed reason=%s', failure)
+    return False
 
 
 def require_interview_ready(*, video_required):
@@ -50,12 +81,6 @@ def require_interview_ready(*, video_required):
             or not parsed.path.endswith('/api/webhooks/retell/interview-control/')):
         raise InterviewNotReady('interview_control_unavailable',
             'The interviewer callback is not configured. Ask the server operator to restore it before starting.')
-    try:
-        with requests.get(url, timeout=(1, 2), allow_redirects=False,
-                          headers={'Accept': 'application/json', 'ngrok-skip-browser-warning': 'true'}) as response:
-            ready = response.status_code == 200 and response.json() == {'protocol': CONTROL_PROTOCOL}
-    except (requests.RequestException, ValueError):
-        ready = False
-    if not ready:
+    if not _callback_ready(url):
         raise InterviewNotReady('interview_control_unavailable',
             'The interviewer cannot reach the interview server. Ask the server operator to restore the public callback, then retry.')

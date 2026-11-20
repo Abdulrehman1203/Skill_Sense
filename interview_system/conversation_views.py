@@ -1,11 +1,49 @@
 """Raw-body HMAC verification before parsing provider tool requests."""
 import json
+import time
+from django.core.cache import cache
 from drf_spectacular.utils import extend_schema, OpenApiResponse
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
 from .conversation_control import control
 from .integrations.retell_client import verify_webhook_signature
+from .conversation_protocol import ANSWER_TOOL
+
+
+def answer_resumed(payload):
+    """Hold answer submission outside DB locks and fence resumed candidate speech."""
+    if payload.get('name') != ANSWER_TOOL:
+        return False
+    call = payload.get('call')
+    if not isinstance(call, dict) or not isinstance(call.get('call_id'), str):
+        return False
+    from .live_transcript import transcript_key
+    from .conversation_control import clean
+
+    def candidate_text(turns):
+        return ' '.join(clean(t.get('content', '')) for t in turns
+                        if isinstance(t, dict) and t.get('role') == 'user')
+
+    original = candidate_text(call.get('transcript_object') or [])
+    delay = 5.0
+    started = call.get('start_timestamp')
+    turns = call.get('transcript_object') or []
+    end = max((word.get('end', 0) for turn in turns
+               if isinstance(turn, dict) and turn.get('role') == 'user'
+               for word in (turn.get('words') or [])
+               if isinstance(word, dict) and type(word.get('end')) in (int, float)
+               and 0 <= word['end'] < 86400), default=None)
+    if type(started) in (int, float) and end is not None:
+        elapsed = time.time() - started / 1000 - end
+        if 0 <= elapsed < 86400:
+            delay = max(0, 5 - elapsed)
+    time.sleep(delay)
+    latest = cache.get(transcript_key(call['call_id']))
+    if not latest:
+        return False
+    heard = candidate_text(latest['turns'])
+    return bool(heard and heard != original and not original.startswith(heard))
 
 
 class ConversationControlView(APIView):
@@ -34,6 +72,12 @@ class ConversationControlView(APIView):
             return Response({'detail': 'Invalid JSON.'}, status=400)
         if not isinstance(payload, dict):
             return Response({'detail': 'Invalid payload.'}, status=400)
-        response = Response(control(payload))
+        if answer_resumed(payload):
+            response = Response({
+                'speech_action': 'WAIT', 'speak_text': '',
+                'instruction': 'The candidate continued speaking. Listen to the full answer, then submit it again after they finish.',
+            })
+        else:
+            response = Response(control(payload))
         response['Cache-Control'] = 'no-store'
         return response
