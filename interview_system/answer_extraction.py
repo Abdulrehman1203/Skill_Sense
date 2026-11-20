@@ -13,7 +13,12 @@ def clean(text):
 
 
 def closing_prompt(turn):
-    return turn['role'] == 'agent' and clean(turn['text']).startswith('have you finished your answers')
+    # Streaming transcripts can split the closing sentence at a candidate
+    # interruption: "Have you finished your" / noise / "answers? ...".
+    # Stop at the first fragment, before confirmation dialogue can contaminate
+    # the last answer or be mistaken for an unrecognized interview question.
+    return turn['role'] == 'agent' and bool(re.match(
+        r'^have you finished your(?: answers?\b|$)', clean(turn['text'])))
 
 
 def extract(inputs, proposals=None):

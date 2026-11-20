@@ -18,6 +18,7 @@ from ..screening import ACTIVE_STAGES, apply_qualification_locked, dispatch, eva
 logger = logging.getLogger(__name__)
 LEASE = timedelta(minutes=10)
 MAX_ATTEMPTS = 4
+RESUME_RETRY_PENDING = "Processing delayed. We’ll retry automatically."
 
 
 class ParseBusy(Exception):
@@ -53,9 +54,9 @@ def parsed_resume(resume_id):
             return parsed, resume.content_hash, parser_version
         if resume.parse_lease_until and resume.parse_lease_until > timezone.now():
             raise ParseBusy()
-        resume.status, resume.processing_error = "PENDING", ""
+        resume.status, resume.processing_error, resume.processing_code = "PENDING", "", ""
         resume.parse_claim, resume.parse_lease_until = token, timezone.now() + LEASE
-        resume.save(update_fields=["parse_claim", "parse_lease_until", "status", "processing_error"])
+        resume.save(update_fields=["parse_claim", "parse_lease_until", "status", "processing_error", "processing_code"])
     try:
         with resume.file.open("rb") as source:
             content_hash = hashlib.file_digest(source, "sha256").hexdigest()
@@ -78,16 +79,31 @@ def parsed_resume(resume_id):
                 "raw_text": text, **{k: data[k] for k in ("skills", "education", "experience", "certifications")},
                 "projects": data.get("projects"),
             })
-            locked.status, locked.processing_error = "PARSED", ""
+            locked.status, locked.processing_error, locked.processing_code = "PARSED", "", ""
             locked.content_hash, locked.parser_version = content_hash, parser_version
             locked.parse_claim, locked.parse_lease_until = None, None
             locked.save()
         return parsed, content_hash, parser_version
     except (ExtractionError, FileNotFoundError):
-        Resume.objects.filter(pk=resume_id, parse_claim=token).update(status="FAILED", processing_error="Upload a readable PDF or DOCX.")
+        Resume.objects.filter(pk=resume_id, parse_claim=token).update(
+            status="FAILED", processing_error="Upload a readable PDF or DOCX.",
+            processing_code=Resume.ProcessingCode.UNREADABLE,
+        )
         raise ScreeningFailure("UNREADABLE_RESUME", "Upload a readable PDF or DOCX, then retry screening.", "REPLACE_RESUME") from None
-    except GeminiParseError:
-        raise ScreeningFailure("PARSER_UNAVAILABLE", "Resume parsing failed. Retry screening after the service recovers.", "RETRY", True) from None
+    except GeminiParseError as exc:
+        if exc.transient:
+            Resume.objects.filter(pk=resume_id, parse_claim=token).update(
+                processing_error=RESUME_RETRY_PENDING,
+                processing_code=Resume.ProcessingCode.RETRY_PENDING,
+            )
+            raise ScreeningFailure(
+                "PARSER_UNAVAILABLE", "Resume parsing is temporarily unavailable. Retry parsing on the existing upload.",
+                "RETRY", True,
+            ) from None
+        code = "PARSER_NOT_CONFIGURED" if exc.status_code in (400, 401, 403, 404) else "PARSER_INVALID_RESPONSE"
+        raise ScreeningFailure(
+            code, "Resume processing could not finish. Contact support.", "CONTACT_SUPPORT",
+        ) from None
     finally:
         Resume.objects.filter(pk=resume_id, parse_claim=token).update(parse_claim=None, parse_lease_until=None)
 
@@ -160,12 +176,16 @@ def process_assessment(assessment_id):
             "SCREENING_SERVICE_ERROR", "Screening could not finish. Retry screening.", "RETRY", True)
         retry = failure.transient and assessment.attempts < MAX_ATTEMPTS
         claimed.update(status="QUEUED" if retry else "FAILED", claim_token=None, lease_until=None,
-                       error_code=failure.code, error_message=failure.message, recovery_action=failure.action,
+                       error_code=failure.code,
+                       error_message=RESUME_RETRY_PENDING if retry and failure.code == "PARSER_UNAVAILABLE" else failure.message,
+                       recovery_action=failure.action,
                        next_attempt_at=timezone.now() + timedelta(seconds=min(300, 15 * 2 ** assessment.attempts) + random.randint(0, 10)),
                        completed_at=None if retry else timezone.now())
-        if not retry and failure.code in ('PARSER_UNAVAILABLE', 'PARSER_NOT_CONFIGURED'):
+        if not retry and failure.code in ('PARSER_UNAVAILABLE', 'PARSER_NOT_CONFIGURED', 'PARSER_INVALID_RESPONSE'):
             Resume.objects.filter(pk=assessment.resume_id, status__in=['PENDING','STORED'], parse_claim__isnull=True).update(
-                status='FAILED', processing_error=failure.message)
+                status='FAILED', processing_error=failure.message,
+                processing_code=Resume.ProcessingCode.RETRY_AVAILABLE if failure.transient else Resume.ProcessingCode.SUPPORT_REQUIRED,
+            )
         logger.warning("Screening attempt failed: assessment_id=%s code=%s", assessment_id, failure.code)
 
 

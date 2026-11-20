@@ -32,6 +32,7 @@ from .views import (
     ScoringRubricViewSet,
 )
 from .webhook_views import ClerkWebhookView
+from .admin_views import AdminOperationsView, AdminOverviewView, AdminUserListView, AdminUserStatusView
 from .retell_webhook import RetellCallEndedView
 from .socket_ticket_views import SocketTicketView
 from .video_views import FinishVideoView
@@ -91,6 +92,10 @@ urlpatterns = [
     path("notifications/unread-count/", NotificationUnreadCountView.as_view(), name="notification-unread-count"),
     path("notifications/<uuid:pk>/", NotificationMarkReadView.as_view(), name="notification-mark-read"),
     path("admin/audit-log/", AuditLogView.as_view(), name="admin-audit-log"),
+    path("admin/overview/", AdminOverviewView.as_view(), name="admin-overview"),
+    path("admin/operations/", AdminOperationsView.as_view(), name="admin-operations"),
+    path("admin/users/", AdminUserListView.as_view(), name="admin-users"),
+    path("admin/users/<uuid:pk>/", AdminUserStatusView.as_view(), name="admin-user-status"),
     path("admin/analytics/", AdminAnalyticsView.as_view(), name="admin-analytics"),
     path("admin/integrity-thresholds/", IntegrityThresholdsView.as_view(), name="admin-integrity-thresholds"),
     path("webhooks/retell/call-ended/", RetellCallEndedView.as_view(), name="retell-call-ended"),

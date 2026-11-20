@@ -5,10 +5,12 @@ Read-only response serializers for Clerk-authenticated user payloads,
 and Job / JobSkill serializers for the job posting API.
 """
 
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 import re
 import math
 
+from django.conf import settings
 from django.utils import timezone
 from django.db import transaction
 from rest_framework import serializers
@@ -1057,17 +1059,21 @@ class QuestionReadinessSerializer(serializers.Serializer):
 class CandidateInterviewSerializer(serializers.ModelSerializer):
     """Candidate lobby contract: no question bank, evaluation content or rubric."""
     question_readiness = serializers.SerializerMethodField()
+    join_window_required = serializers.SerializerMethodField()
     workflow_state = serializers.SerializerMethodField()
 
     class Meta:
         model = Interview
         fields = ["id", "application", "status", "scheduled_at", "workflow_state",
-                  "completed_at", "question_readiness", "created_at", "updated_at"]
+                  "completed_at", "question_readiness", "join_window_required", "created_at", "updated_at"]
         read_only_fields = fields
 
     def get_workflow_state(self, obj) -> str:
         from .interview_workflow import workflow_state
         return workflow_state(obj)
+
+    def get_join_window_required(self, obj) -> bool:
+        return not settings.DEBUG
 
     @extend_schema_field(QuestionReadinessSerializer)
     def get_question_readiness(self, obj):
@@ -1075,9 +1081,12 @@ class CandidateInterviewSerializer(serializers.ModelSerializer):
         if count is None:
             count = obj.questions.filter(approved=True).count()
         terminal = obj.application.status in ("REJECTED", "DECISION")
-        from datetime import timedelta
-        from django.utils import timezone
-        join_window = obj.status == "LIVE" or obj.scheduled_at is None or obj.scheduled_at <= timezone.now() + timedelta(minutes=15)
+        join_window = (
+            not self.get_join_window_required(obj)
+            or obj.status == "LIVE"
+            or obj.scheduled_at is None
+            or obj.scheduled_at <= timezone.now() + timedelta(minutes=15)
+        )
         return {"state": "READY" if count else "PENDING", "approved_question_count": count,
                 "can_start": bool(count and obj.status in ("SCHEDULED", "LIVE") and not terminal and join_window)}
 
@@ -1101,6 +1110,8 @@ class ResumeDetailSerializer(serializers.Serializer):
     uploaded_at = serializers.DateTimeField(read_only=True)
     status = serializers.CharField(read_only=True)
     processing_error = serializers.CharField(read_only=True)
+    processing_code = serializers.CharField(read_only=True)
+    can_retry_parsing = serializers.BooleanField(read_only=True)
     skills = serializers.SerializerMethodField()
     education = serializers.SerializerMethodField()
     experience = serializers.SerializerMethodField()
@@ -1177,11 +1188,13 @@ class ResumeListSerializer(serializers.ModelSerializer):
     filename = serializers.SerializerMethodField()
     file_url = serializers.SerializerMethodField()
     file = PrivateResumeFileField()
+    can_retry_parsing = serializers.BooleanField(read_only=True)
 
     class Meta:  # type: ignore
         model = Resume
-        fields = ["id", "file", "filename", "file_url", "status", "processing_error", "uploaded_at"]
-        read_only_fields = ["id", "status", "processing_error", "uploaded_at"]
+        fields = ["id", "file", "filename", "file_url", "status", "processing_error",
+                  "processing_code", "can_retry_parsing", "uploaded_at"]
+        read_only_fields = ["id", "status", "processing_error", "processing_code", "uploaded_at"]
 
     def create(self, validated_data: dict[str, Any]) -> Resume:
         file_obj = validated_data.get("file")

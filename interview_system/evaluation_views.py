@@ -23,6 +23,7 @@ def report(row, *, private):
         'answers': list(row.answers.order_by('pk').values_list('result', flat=True))}
     if private:
         result.update(transcript_revision=row.transcript.number, transcript_hash=row.transcript.content_hash,
+            questions=row.context.snapshot.get('questions', []),
             context_hash=row.context.content_hash, contract_version=row.prompt_version, model_name=row.model_name,
             error_code=row.error_code, attempts=row.attempts, next_attempt_at=row.next_attempt_at,
             feedback_released=EvaluationRelease.objects.filter(evaluation=row).exists())

@@ -132,6 +132,8 @@ class AuditLogView(generics.ListAPIView):
     serializer_class = AuditLogSerializer
     pagination_class = StandardResultsPagination
     queryset = AuditLogEntry.objects.order_by("-created_at", "-pk")
+    filter_backends = [filters.SearchFilter]
+    search_fields = ["action", "target_type", "target_id"]
 
 
 class AdminAnalyticsView(APIView):
@@ -1256,9 +1258,10 @@ class CandidateResumeViewSet(ModelViewSet):
             logging.getLogger(__name__).warning(
                 "Resume parsing %s failed for resume_id=%s", mode, resume_id,
             )
-            Resume.objects.filter(pk=resume_id, status=Resume.Status.PENDING).update(
+            Resume.objects.filter(pk=resume_id, status=Resume.Status.PENDING, parse_claim__isnull=True).update(
                 status=Resume.Status.FAILED,
-                processing_error="Resume processing could not be queued. Retry or upload the document again.",
+                processing_error="Resume processing could not be queued. Retry parsing on the existing upload.",
+                processing_code=Resume.ProcessingCode.RETRY_AVAILABLE,
             )
 
     def perform_create(self, serializer):
@@ -1276,9 +1279,24 @@ class CandidateResumeViewSet(ModelViewSet):
 
     def perform_update(self, serializer):
         with transaction.atomic():
-            resume = serializer.save(status=Resume.Status.PENDING)
+            resume = serializer.save(status=Resume.Status.PENDING, processing_error="", processing_code="")
             resume_id = str(resume.id)
             transaction.on_commit(lambda: self._dispatch_parse(resume_id))
+
+    @extend_schema(request=None, responses={202: ResumeListSerializer, 409: OpenApiResponse(description="Manual retry unavailable.")})
+    @action(detail=True, methods=["post"], url_path="retry-parsing")
+    def retry_parsing(self, request, pk=None):
+        from rest_framework.generics import get_object_or_404 as get_resume_or_404
+
+        with transaction.atomic():
+            resume = get_resume_or_404(self.get_queryset().select_for_update(), pk=pk)
+            if not resume.can_retry_parsing or resume.parse_claim is not None:
+                return Response({"detail": "This resume is not waiting for a manual retry."}, status=status.HTTP_409_CONFLICT)
+            resume.status, resume.processing_error, resume.processing_code = Resume.Status.PENDING, "", ""
+            resume.save(update_fields=["status", "processing_error", "processing_code"])
+            transaction.on_commit(lambda: self._dispatch_parse(str(resume.pk)))
+        resume.refresh_from_db()
+        return Response(self.get_serializer(resume).data, status=status.HTTP_202_ACCEPTED)
 
     def destroy(self, request, *args, **kwargs):
         resume = self.get_object()

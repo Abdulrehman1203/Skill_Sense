@@ -60,6 +60,10 @@ class RetellCallEndedView(APIView):
             # configured event filter. These events need no transcript work.
             if payload.get('event') == 'call_started':
                 return Response(status=204)
+            if payload.get('event') == 'transcript_updated':
+                from .live_transcript import accept_live_transcript
+                accept_live_transcript(payload.get('call'))
+                return Response(status=204)
             if payload.get('event') not in ('call_ended', 'call_analyzed'):
                 return Response({'detail': 'Unsupported event.'}, status=400)
             event = payload['event']

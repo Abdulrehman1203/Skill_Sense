@@ -324,6 +324,12 @@ class Resume(models.Model):
         PARSED = "PARSED", "Parsed"
         FAILED = "FAILED", "Failed"
 
+    class ProcessingCode(models.TextChoices):
+        RETRY_PENDING = "RETRY_PENDING", "Automatic retry pending"
+        RETRY_AVAILABLE = "RETRY_AVAILABLE", "Manual retry available"
+        UNREADABLE = "UNREADABLE", "Unreadable document"
+        SUPPORT_REQUIRED = "SUPPORT_REQUIRED", "Support required"
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     candidate = models.ForeignKey(
         CandidateProfile,
@@ -347,6 +353,9 @@ class Resume(models.Model):
         help_text="STORED until submitted; application processing is PENDING → PARSED or FAILED.",
     )
     processing_error = models.TextField(blank=True, default="")
+    processing_code = models.CharField(
+        max_length=20, choices=ProcessingCode.choices, blank=True, default="", db_default="",
+    )
     parse_claim = models.UUIDField(null=True, blank=True)
     parse_lease_until = models.DateTimeField(null=True, blank=True)
     content_hash = models.CharField(max_length=64, blank=True)
@@ -354,6 +363,17 @@ class Resume(models.Model):
     uploaded_at = models.DateTimeField(auto_now_add=True)
 
     MAX_FILE_SIZE_MB = 5
+
+    @property
+    def can_retry_parsing(self):
+        return self.status == self.Status.FAILED and (
+            self.processing_code == self.ProcessingCode.RETRY_AVAILABLE
+            or (not self.processing_code and self.processing_error.startswith((
+                "Resume parsing failed. Retry screening",
+                "Resume processing could not be queued.",
+                "Resume processing failed. Retry or upload",
+            )))
+        )
 
     class Meta:
         db_table = "resumes"

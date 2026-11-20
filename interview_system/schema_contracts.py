@@ -106,6 +106,13 @@ class ExtractionDTO(s.Serializer):
     unmatched_turn_ids = s.ListField(child=s.CharField())
 
 
+class FrozenEvaluationQuestionDTO(s.Serializer):
+    id = s.UUIDField()
+    text = s.CharField()
+    category = s.CharField()
+    criteria = s.DictField(child=s.CharField())
+
+
 class EvaluationDTO(s.Serializer):
     id = s.UUIDField()
     revision = s.IntegerField()
@@ -115,6 +122,7 @@ class EvaluationDTO(s.Serializer):
     coverage = s.FloatField(allow_null=True)
     published_at = s.DateTimeField(allow_null=True)
     answers = AnswerDTO(many=True)
+    questions = FrozenEvaluationQuestionDTO(many=True)
     transcript_revision = s.IntegerField()
     transcript_hash = s.CharField()
     context_hash = s.CharField()
@@ -191,6 +199,8 @@ class FeedbackEnvelopeDTO(s.Serializer):
     state = s.ChoiceField(choices=['PENDING','FAILED','UNAVAILABLE','UNRELEASED','RELEASED','RETRACTED'])
     interview = s.UUIDField()
     application = s.UUIDField()
+    role_title = s.CharField(required=False)
+    interview_date = s.DateTimeField(required=False, allow_null=True)
     report = ReleasedFeedbackDTO(allow_null=True)
 
 

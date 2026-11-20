@@ -47,7 +47,8 @@ class CandidateFeedbackListView(APIView):
             raise ValidationError({'contract': 'Integrate the feedback-v1 response and request contract=feedback-v1.'})
         if request.query_params.get('candidate', 'me') != 'me' or set(request.query_params) - {'contract', 'candidate', 'page', 'page_size'}:
             raise ValidationError('Use candidate=me; unsupported feedback query parameters.')
-        interviews = candidate_feedback_interviews(request.user).order_by('-created_at', '-pk')
+        interviews = candidate_feedback_interviews(request.user).select_related(
+            'application__job').order_by('-created_at', '-pk')
         paginator = StandardResultsPagination()
         page = paginator.paginate_queryset(interviews, request)
         response = paginator.get_paginated_response([candidate_state(row) for row in page])
@@ -60,7 +61,7 @@ class CandidateFeedbackDetailView(APIView):
 
     @extend_schema(tags=['Feedback'], responses=FeedbackEnvelopeDTO)
     def get(self, request, pk):
-        row = get_object_or_404(FeedbackReport.objects.select_related('evaluation__interview'),
+        row = get_object_or_404(FeedbackReport.objects.select_related('evaluation__interview__application__job'),
             pk=pk, evaluation__interview__in=candidate_feedback_interviews(request.user))
         return private(candidate_state(row.evaluation.interview, selected_report=row))
 
