@@ -96,6 +96,7 @@ def generate_questions(self, interview_id: str) -> list[dict]:
         return [{**item, "id": str(item["id"])} for item in existing]
     parsed_resume = getattr(application.resume, "parsed_data", None)
     try:
+        from ..integrations.gemini_client import fit_questions_to_mix, question_mix
         questions_data = gemini_client.generate_questions_for(
             application.job, parsed_resume
         )
@@ -107,10 +108,15 @@ def generate_questions(self, interview_id: str) -> list[dict]:
             "Question integration failed for interview %s; using templates.",
             interview_id,
         )
-        questions_data = gemini_client.get_template_questions()
+        questions_data = fit_questions_to_mix(
+            gemini_client.get_template_questions(), question_mix(application.job)
+        )
 
     if not questions_data:
-        questions_data = gemini_client.get_template_questions()
+        from ..integrations.gemini_client import fit_questions_to_mix, question_mix
+        questions_data = fit_questions_to_mix(
+            gemini_client.get_template_questions(), question_mix(application.job)
+        )
 
     question_rows = [
         Question(

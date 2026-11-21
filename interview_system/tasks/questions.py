@@ -34,17 +34,19 @@ def generate_question_set(set_id):
         row.generation_status, row.attempts = "GENERATING", row.attempts + 1
         row.save()
     try:
-        from ..integrations.gemini_client import generate_questions_for, get_template_questions
+        from ..integrations.gemini_client import (
+            fit_questions_to_mix, generate_questions_for, get_template_questions, question_mix,
+        )
         job, candidate = generation_context(row)
         fallback_reason = ""
         try:
             questions = generate_questions_for(job, candidate)
             fallback_reason = getattr(questions, 'fallback_reason', '')
         except Exception:
-            questions = get_template_questions()
+            questions = fit_questions_to_mix(get_template_questions(), question_mix(job))
             fallback_reason = "GENERATOR_UNAVAILABLE"
         if not questions:
-            questions = get_template_questions()
+            questions = fit_questions_to_mix(get_template_questions(), question_mix(job))
             fallback_reason = "EMPTY_GENERATION"
         if not 1 <= len(questions) <= 100:
             raise ValueError("Invalid question count")
