@@ -884,7 +884,7 @@ class SocketTicket(models.Model):
     digest = models.CharField(primary_key=True, max_length=64, editable=False)
     user = models.ForeignKey(User, on_delete=models.CASCADE)
     session = models.ForeignKey(InterviewSession, on_delete=models.CASCADE)
-    purpose = models.CharField(max_length=9, choices=[('publisher', 'Publisher'), ('observer', 'Observer')])
+    purpose = models.CharField(max_length=9, choices=[('publisher', 'Publisher'), ('observer', 'Observer'), ('camera', 'Camera'), ('viewer', 'Viewer')])
     clerk_session_id = models.CharField(max_length=255, blank=True)
     clerk_subject = models.CharField(max_length=255)
     credential_expires_at = models.DateTimeField()
@@ -1655,3 +1655,68 @@ class AuditLogEntry(models.Model):
 
     def __str__(self):
         return f"AuditLog({self.action} on {self.target_type}:{self.target_id})"
+
+class InterviewReplay(models.Model):
+    class State(models.TextChoices):
+        RECORDING = 'recording'
+        PROCESSING = 'processing'
+        READY = 'ready'
+        PARTIAL = 'partial'
+        UNAVAILABLE = 'unavailable'
+        FAILED = 'failed'
+        EXPIRED = 'expired'
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    session = models.OneToOneField(InterviewSession, on_delete=models.CASCADE, related_name='replay')
+    call = models.OneToOneField(RetellCall, on_delete=models.CASCADE)
+    state = models.CharField(max_length=16, choices=State.choices, default=State.RECORDING)
+    acknowledged_at = models.DateTimeField()
+    last_activity = models.DateTimeField(default=timezone.now)
+    capture_until = models.DateTimeField()
+    finalize_until = models.DateTimeField()
+    due_at = models.DateTimeField(db_index=True)
+    expires_at = models.DateTimeField(db_index=True)
+    lease = models.UUIDField(null=True)
+    lease_until = models.DateTimeField(null=True)
+    scratch_bytes = models.PositiveBigIntegerField(default=0)
+    attempts = models.PositiveSmallIntegerField(default=0)
+    output_key = models.CharField(max_length=220, blank=True)
+    detail = models.CharField(max_length=40, blank=True)
+    gaps = models.JSONField(default=list, blank=True)
+    timing = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        indexes = [models.Index(fields=['state', 'due_at'], name='replay_due')]
+
+
+class ReplaySegment(models.Model):
+    replay = models.ForeignKey(InterviewReplay, on_delete=models.CASCADE, related_name='segments')
+    nonce = models.UUIDField()
+    mime = models.CharField(max_length=20)
+    start_ms = models.PositiveBigIntegerField()
+    uncertainty_ms = models.PositiveIntegerField()
+    ended_ms = models.PositiveIntegerField(null=True)
+    complete = models.BooleanField(default=False)
+    next_sequence = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=['replay', 'nonce'], name='replay_segment_once')]
+
+
+class ReplayObject(models.Model):
+    """Object reservations survive attempt deletion until storage cleanup confirms removal."""
+
+    key = models.CharField(max_length=220, primary_key=True)
+    replay = models.ForeignKey(InterviewReplay, null=True, on_delete=models.SET_NULL)
+    segment = models.ForeignKey(ReplaySegment, null=True, on_delete=models.SET_NULL, related_name='chunks')
+    sequence = models.PositiveIntegerField(null=True)
+    elapsed_ms = models.PositiveIntegerField(default=0)
+    size = models.PositiveBigIntegerField()
+    digest = models.CharField(max_length=64, blank=True)
+    verified = models.BooleanField(default=False)
+    delete_after = models.DateTimeField(db_index=True)
+
+
+class ReplayBudget(models.Model):
+    id = models.PositiveSmallIntegerField(primary_key=True, default=1, editable=False)
+    inventory_ok = models.BooleanField(default=True)

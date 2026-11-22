@@ -5,7 +5,7 @@ import re
 from contextvars import ContextVar
 
 request_id = ContextVar('request_id', default='')
-EVENTS = {'http_completed', 'task_completed', 'task_failed', 'dispatch_deferred', 'recovery_scan', 'cache_observation'}
+EVENTS = {'monitor_attempt', 'monitor_join', 'monitor_media', 'monitor_relay', 'monitor_reconnect', 'monitor_closed','http_completed', 'task_completed', 'task_failed', 'dispatch_deferred', 'recovery_scan', 'cache_observation'}
 FIELDS = {'event_code','request_id','task_id','component','route','method','status','duration_ms','count','cache_kind','cache_outcome'}
 _STANDARD = set(logging.makeLogRecord({}).__dict__)
 
@@ -63,7 +63,8 @@ class EventFormatter(logging.Formatter):
             if value in allowed:
                 row[key] = value
         route = getattr(record, 'route', '')
-        if route in {'resume','application','health','metrics','auth','other','unmatched'}:
+        if route in {'resume','application','health','metrics','auth','other','unmatched',
+                     'replay_capture','replay_playback'}:
             row['route'] = route
         for key in ('status','duration_ms','count'):
             value = getattr(record, key, None)

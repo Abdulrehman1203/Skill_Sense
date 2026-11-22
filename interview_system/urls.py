@@ -34,6 +34,7 @@ from .views import (
 from .webhook_views import ClerkWebhookView
 from .admin_views import AdminOperationsView, AdminOverviewView, AdminUserListView, AdminUserStatusView
 from .retell_webhook import RetellCallEndedView
+from .replay.views import ReplayChunk, ReplayConsent, ReplayPlayback, ReplaySeal
 from .socket_ticket_views import SocketTicketView
 from .video_views import FinishVideoView
 from .question_views import ApplicationQuestionSetView, QuestionSetView
@@ -64,6 +65,10 @@ job_skill_detail = JobSkillViewSet.as_view(
 from .analysis_views import AnalysisStatusView, BehavioralReportView, AnalysisSnapshotView
 
 urlpatterns = [
+    path('interviews/<uuid:pk>/replay/', ReplayPlayback.as_view(), name='interview-replay'),
+    path('interview-sessions/<uuid:pk>/replay/', ReplayConsent.as_view(), name='replay-capture'),
+    path('interview-sessions/<uuid:pk>/replay/<int:segment>/chunks/<int:sequence>/', ReplayChunk.as_view(), name='replay-chunk'),
+    path('interview-sessions/<uuid:pk>/replay/<int:segment>/seal/', ReplaySeal.as_view(), name='replay-seal'),
     path('interviews/<uuid:pk>/rerun-evaluation/', EvaluationRerunView.as_view(), name='evaluation-rerun'),
     path('interviews/<uuid:pk>/select-transcript/', TranscriptSelectionView.as_view(), name='transcript-selection'),
     path('interviews/<uuid:pk>/reschedule/', InterviewRescheduleView.as_view(), name='interview-reschedule'),

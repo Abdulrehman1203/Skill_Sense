@@ -435,3 +435,31 @@ if not DEBUG:
     CLERK_ISSUER = os.environ.get('CLERK_ISSUER', '')
     CLERK_REQUIRE_SECURE_CONFIG = True
     _validate_clerk(globals())
+
+LIVE_MONITOR_ENABLED = os.getenv('LIVE_MONITOR_ENABLED', 'false').lower() == 'true'
+LIVE_MONITOR_TURN_URLS = os.getenv('LIVE_MONITOR_TURN_URLS', '').split()
+LIVE_MONITOR_STUN_URLS = os.getenv('LIVE_MONITOR_STUN_URLS', '').split()
+LIVE_MONITOR_TURN_SECRET = os.getenv('LIVE_MONITOR_TURN_SECRET', '')
+LIVE_MONITOR_RELAY_ONLY = os.getenv('LIVE_MONITOR_RELAY_ONLY', 'false').lower() == 'true'
+
+# Interview replay has independent capture and delivery switches. Recovery and
+# retention continue after both switches have been disabled.
+REPLAY_CAPTURE_ENABLED = os.getenv('REPLAY_CAPTURE_ENABLED', 'false').lower() == 'true'
+REPLAY_PLAYBACK_ENABLED = os.getenv('REPLAY_PLAYBACK_ENABLED', 'false').lower() == 'true'
+REPLAY_R2_ENDPOINT = os.getenv('REPLAY_R2_ENDPOINT', '')
+REPLAY_R2_BUCKET = os.getenv('REPLAY_R2_BUCKET', '')
+REPLAY_R2_ACCESS_KEY = os.getenv('REPLAY_R2_ACCESS_KEY', '')
+REPLAY_R2_SECRET_KEY = os.getenv('REPLAY_R2_SECRET_KEY', '')
+REPLAY_BUDGET_BYTES = int(os.getenv('REPLAY_BUDGET_BYTES', '8000000000'))
+REPLAY_RETENTION_DAYS = int(os.getenv('REPLAY_RETENTION_DAYS', '30'))
+REPLAY_RETELL_AUDIO_HOSTS = tuple(os.getenv('REPLAY_RETELL_AUDIO_HOSTS', 'retellai.s3.us-west-2.amazonaws.com').split(','))
+REPLAY_SCRATCH_DIRECTORY = os.getenv('REPLAY_SCRATCH_DIRECTORY') or None
+CELERY_TASK_ROUTES['interview_system.replay.*'] = {'queue': 'interview_replay'}
+if REPLAY_R2_BUCKET:
+    CELERY_BEAT_SCHEDULE['reconcile-interview-replay'] = {
+        'task': 'interview_system.replay.reconcile', 'schedule': 30,
+        'options': {'expires': 25},
+    }
+
+from corsheaders.defaults import default_headers as _cors_default_headers
+CORS_ALLOW_HEADERS = (*_cors_default_headers, 'x-replay-elapsed', 'x-replay-sha256')

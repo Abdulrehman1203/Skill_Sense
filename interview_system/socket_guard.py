@@ -53,6 +53,8 @@ class SocketGuard:
         self.purpose = purpose
         self.connection_id = connection_id
         self.prefix = settings.INTERVIEW_ANALYSIS_REDIS_PREFIX
+        if purpose in ('camera', 'viewer'):
+            self.prefix += ':monitor'
         self.redis = Redis.from_url(settings.INTERVIEW_ANALYSIS_REDIS_URL, socket_connect_timeout=1,
                                     socket_timeout=1, max_connections=2)
         self.keys = [f'{self.prefix}:connections:user:{lease.user_id}',
@@ -61,7 +63,7 @@ class SocketGuard:
 
     async def reserve(self, refresh=False):
         limits = [max(1, settings.INTERVIEW_ANALYSIS_MAX_USER_SOCKETS),
-                  1 if self.purpose == 'publisher' else max(1, settings.INTERVIEW_ANALYSIS_MAX_SESSION_OBSERVERS),
+                  1 if self.purpose in ('camera', 'viewer', 'publisher') else max(1, settings.INTERVIEW_ANALYSIS_MAX_SESSION_OBSERVERS),
                   max(1, settings.INTERVIEW_ANALYSIS_MAX_SOCKETS)]
         return bool(await self.redis.eval(RESERVE, len(self.keys), *self.keys, self.connection_id,
             max(1, settings.INTERVIEW_ANALYSIS_GUARD_LEASE_SECONDS)*1000,

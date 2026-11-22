@@ -113,6 +113,7 @@ Stop_Project.bat
 /.local/
 .dockerignore
 Dockerfile
+Dockerfile.*
 Makefile
 compose.yaml
 
@@ -125,6 +126,3 @@ recruiter-analytics-prototype.html
 recruiter-ranking-prototype.html
 recruiter-ranking-redesign.html
 recruiter-scoring-model-prototype.html
-
-
-
