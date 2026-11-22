@@ -63,7 +63,7 @@ def deliver_notification_outbox(outbox_id):
 @shared_task(ignore_result=True)
 def recover_notification_outbox():
     from ..notifications import dispatch_notification
-    due = NotificationOutbox.objects.filter(Q(inapp_delivered_at__isnull=True) | Q(
+    due = NotificationOutbox.objects.filter(Q(send_in_app=True, inapp_delivered_at__isnull=True) | Q(
         email_status__in=('PENDING', 'SENDING'), next_attempt_at__lte=timezone.now())).filter(
         Q(lease_until__isnull=True) | Q(lease_until__lte=timezone.now()))
     for pk in due.order_by('next_attempt_at').values_list('pk', flat=True)[:100]:

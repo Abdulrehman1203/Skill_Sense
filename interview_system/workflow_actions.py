@@ -9,6 +9,7 @@ from rest_framework.exceptions import ValidationError
 
 from .answer_evaluation import digest, prepare_evaluation_locked, freeze_context_locked
 from .audit import record_audit
+from .interview_timing import validated_timing
 from .models import (Application, FeedbackChange, FeedbackReport, Interview, InterviewEvaluation,
     Question, ScreeningEvent, TranscriptPreparation, TranscriptRevision, WorkflowAction)
 from .screening import ScreeningConflict
@@ -113,17 +114,20 @@ def reschedule(interview_id, actor, data, *, reopen=False):
         return Interview.objects.get(pk=prior.details['result_id'])
     if app.status in ('DECISION', 'REJECTED'):
         raise ScreeningConflict('Reverse the terminal decision deliberately before scheduling another attempt.')
-    if data['scheduled_at'] <= timezone.now():
-        raise ValidationError({'scheduled_at': 'Select a future time.'})
     if interview.application.interviews.order_by('-created_at', '-pk').first().pk != interview.pk:
         raise ScreeningConflict('Only the latest attempt can be changed.')
+    if not reopen and interview.deadline_at is not None:
+        if 'deadline_at' not in data or data['deadline_at'] <= interview.deadline_at:
+            raise ValidationError({'deadline_at': 'Choose a deadline later than the current deadline.'})
+    timing = validated_timing(app.job_id, data, exclude=interview.pk)
     if reopen:
         if interview.status != 'DONE' or not interview.completed_at:
             raise ValidationError('Only a completed attempt can be reopened as a new attempt.')
         if not interview.question_set_id or not interview.questions.filter(approved=True).exists():
             raise ValidationError('An approved frozen question bank is required.')
         result = Interview.objects.create(application=app, question_set=interview.question_set,
-            supersedes=interview, scheduled_at=data['scheduled_at'], question_preparation_mode=interview.question_preparation_mode,
+            supersedes=interview, **timing, question_preparation_mode=interview.question_preparation_mode,
+            notify_in_app=interview.notify_in_app, notify_email=interview.notify_email,
             question_fallback_reason=interview.question_fallback_reason)
         questions = list(interview.questions.filter(approved=True).order_by('position', 'id'))
         Question.objects.bulk_create([Question(interview=result, text=q.text, category=q.category, source=q.source,
@@ -144,8 +148,9 @@ def reschedule(interview_id, actor, data, *, reopen=False):
         session = getattr(interview, 'session', None)
         if interview.status != 'SCHEDULED' or interview.retell_session_id or (session and (session.started_at or session.creation_uncertain)):
             raise ScreeningConflict('A started or uncertain call cannot be rescheduled.')
-        interview.scheduled_at = data['scheduled_at']
-        interview.save(update_fields=['scheduled_at', 'updated_at'])
+        interview.scheduled_at = timing['scheduled_at']
+        interview.deadline_at = timing['deadline_at']
+        interview.save(update_fields=['scheduled_at', 'deadline_at', 'updated_at'])
         result = interview
     previous_status = app.status
     app.status = 'SCHEDULED'
@@ -154,7 +159,8 @@ def reschedule(interview_id, actor, data, *, reopen=False):
         to_status=app.status, reason=data['reason'], assessment_id=app.current_assessment_id)
     from .notifications import queue_notification
     queue_notification(app.candidate.user_id, 'interview_scheduled', resource_type='interview', resource_id=result.pk,
-        revision=app.version, links={'application_id': app.pk})
+        revision=app.version, links={'application_id': app.pk},
+        in_app=result.notify_in_app, email=result.notify_email)
     return result
 
 

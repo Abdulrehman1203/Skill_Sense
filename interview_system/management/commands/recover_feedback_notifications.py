@@ -15,7 +15,7 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         recover_feedback_reports.run()
         if options['inline_delivery']:
-            due = NotificationOutbox.objects.filter(Q(inapp_delivered_at__isnull=True) | Q(
+            due = NotificationOutbox.objects.filter(Q(send_in_app=True, inapp_delivered_at__isnull=True) | Q(
                 email_status__in=('PENDING', 'SENDING'), next_attempt_at__lte=timezone.now())).filter(
                 Q(lease_until__isnull=True) | Q(lease_until__lte=timezone.now()))
             for pk in list(due.order_by('next_attempt_at').values_list('pk', flat=True)[:100]):

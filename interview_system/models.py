@@ -683,6 +683,9 @@ class Interview(models.Model):
     )
     retell_session_id = models.CharField(max_length=255, null=True, blank=True)
     scheduled_at = models.DateTimeField(null=True, blank=True)
+    deadline_at = models.DateTimeField(null=True, blank=True)
+    notify_in_app = models.BooleanField(default=True)
+    notify_email = models.BooleanField(default=True)
     question_preparation_mode = models.CharField(max_length=24, default="LEGACY_UNVERIFIED",
         choices=[(s, s) for s in ("PREPARED", "DEMO_TEMPLATE", "LEGACY_UNVERIFIED")])
     question_fallback_reason = models.CharField(max_length=64, blank=True)
@@ -701,6 +704,16 @@ class Interview(models.Model):
         verbose_name = "interview"
         verbose_name_plural = "interviews"
         ordering = ["-scheduled_at"]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(deadline_at__isnull=True) | models.Q(scheduled_at__isnull=True),
+                name="interview_single_timing_type",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(notify_in_app=True) | models.Q(notify_email=True),
+                name="interview_delivery_channel_required",
+            ),
+        ]
         indexes = [
             models.Index(fields=["status"], name="idx_interview_status"),
             models.Index(fields=["retell_session_id"], name="idx_interview_retell"),
@@ -1551,6 +1564,7 @@ class NotificationOutbox(models.Model):
     revision = models.CharField(max_length=64)
     business_key = models.CharField(max_length=64, unique=True)
     links = models.JSONField(default=dict)
+    send_in_app = models.BooleanField(default=True)
     inapp_delivered_at = models.DateTimeField(null=True)
     email_status = models.CharField(max_length=16, default='PENDING', choices=[(s, s) for s in ('PENDING', 'SENDING', 'SENT', 'FAILED', 'SKIPPED')])
     email_attempts = models.PositiveIntegerField(default=0)
@@ -1571,7 +1585,7 @@ class NotificationOutbox(models.Model):
         if not self._state.adding:
             old = type(self).objects.get(pk=self.pk)
             if any(getattr(old, f) != getattr(self, f) for f in
-                    ('recipient_id', 'event', 'resource_type', 'resource_id', 'revision', 'business_key', 'links')):
+                    ('recipient_id', 'event', 'resource_type', 'resource_id', 'revision', 'business_key', 'links', 'send_in_app')):
                 raise ValidationError('Notification business identity is immutable.')
         return super().save(*args, **kwargs)
 

@@ -5,7 +5,6 @@ Read-only response serializers for Clerk-authenticated user payloads,
 and Job / JobSkill serializers for the job posting API.
 """
 
-from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 import re
 import math
@@ -764,16 +763,48 @@ class ApplicationListSerializer(serializers.ModelSerializer):
         return obj.status in ("SHORTLISTED", "SCREENED") and not obj.interviews.all()
 
 
+class NotificationDetailsSerializer(serializers.Serializer):
+    job_title = serializers.CharField(required=False)
+    company_name = serializers.CharField(required=False)
+    candidate_name = serializers.CharField(required=False)
+    current_application_status = serializers.CharField(required=False)
+    scheduled_at = serializers.DateTimeField(required=False)
+    deadline_at = serializers.DateTimeField(required=False)
+
+
+class NotificationListSerializer(serializers.ListSerializer):
+    def to_representation(self, data):
+        from .notification_details import notification_details
+
+        items = list(data.all() if hasattr(data, "all") else data)
+        request = self.context.get("request")
+        self.context["notification_details"] = notification_details(items, request.user if request else None)
+        return super().to_representation(items)
+
+
 class NotificationSerializer(serializers.ModelSerializer):
     message = serializers.SerializerMethodField()
+    details = serializers.SerializerMethodField()
 
     def get_message(self, obj):
         from .notification_contract import inapp_message
         return inapp_message(obj.type, obj.message)
 
+    @extend_schema_field(NotificationDetailsSerializer(allow_null=True))
+    def get_details(self, obj):
+        from .notification_details import notification_details
+
+        context = self.context.get("notification_details")
+        if context is None:
+            request = self.context.get("request")
+            context = notification_details([obj], request.user if request else None)
+        details = context.get(obj.pk)
+        return NotificationDetailsSerializer(details).data if details is not None else None
+
     class Meta:
         model = Notification
-        fields = ["id", "type", "message", "links", "is_read", "created_at"]
+        list_serializer_class = NotificationListSerializer
+        fields = ["id", "type", "message", "links", "is_read", "created_at", "details"]
         read_only_fields = fields
 
 
@@ -979,13 +1010,30 @@ class StartVoiceSessionResponseSerializer(serializers.Serializer):
     expires_at = serializers.IntegerField(read_only=True)
 
 
-class InterviewCreateSerializer(serializers.Serializer):
+class InterviewTimingSerializer(serializers.Serializer):
+    scheduled_at = serializers.DateTimeField(required=False)
+    deadline_at = serializers.DateTimeField(required=False)
+
+    def validate(self, attrs):
+        if ("scheduled_at" in attrs) == ("deadline_at" in attrs):
+            raise serializers.ValidationError("Supply either scheduled_at or deadline_at.")
+        return super().validate(attrs)
+
+
+class InterviewCreateSerializer(InterviewTimingSerializer):
     """Input contract for recruiter interview scheduling."""
 
     application = serializers.UUIDField()
-    scheduled_at = serializers.DateTimeField()
+    notify_in_app = serializers.BooleanField(default=True)
+    notify_email = serializers.BooleanField(default=True)
     question_set = serializers.UUIDField()
     expected_revision = serializers.IntegerField(min_value=1)
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        if not (attrs["notify_in_app"] or attrs["notify_email"]):
+            raise serializers.ValidationError("Choose at least one delivery channel.")
+        return attrs
 
 
 class InterviewQuestionSerializer(serializers.ModelSerializer):
@@ -1040,6 +1088,9 @@ class InterviewSerializer(serializers.ModelSerializer):
             "application",
             "status",
             "scheduled_at",
+            "deadline_at",
+            "notify_in_app",
+            "notify_email",
             "questions",
             "question_preparation_mode",
             "question_fallback_reason",
@@ -1064,7 +1115,7 @@ class CandidateInterviewSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = Interview
-        fields = ["id", "application", "status", "scheduled_at", "workflow_state",
+        fields = ["id", "application", "status", "scheduled_at", "deadline_at", "workflow_state",
                   "completed_at", "question_readiness", "join_window_required", "created_at", "updated_at"]
         read_only_fields = fields
 
@@ -1073,7 +1124,7 @@ class CandidateInterviewSerializer(serializers.ModelSerializer):
         return workflow_state(obj)
 
     def get_join_window_required(self, obj) -> bool:
-        return not settings.DEBUG
+        return obj.deadline_at is not None or not settings.DEBUG
 
     @extend_schema_field(QuestionReadinessSerializer)
     def get_question_readiness(self, obj):
@@ -1081,12 +1132,8 @@ class CandidateInterviewSerializer(serializers.ModelSerializer):
         if count is None:
             count = obj.questions.filter(approved=True).count()
         terminal = obj.application.status in ("REJECTED", "DECISION")
-        join_window = (
-            not self.get_join_window_required(obj)
-            or obj.status == "LIVE"
-            or obj.scheduled_at is None
-            or obj.scheduled_at <= timezone.now() + timedelta(minutes=15)
-        )
+        from .interview_timing import join_error
+        join_window = join_error(obj, enforce_fixed=self.get_join_window_required(obj)) is None
         return {"state": "READY" if count else "PENDING", "approved_question_count": count,
                 "can_start": bool(count and obj.status in ("SCHEDULED", "LIVE") and not terminal and join_window)}
 
