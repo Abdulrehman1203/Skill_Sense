@@ -15,7 +15,8 @@ from django.views.decorators.debug import sensitive_variables
 from .authentication import ClerkJWTAuthentication
 from .models import Interview, InterviewSession, SocketTicket, User
 
-PURPOSES = ('publisher', 'observer')
+MEDIA_ROLES = ('camera', 'viewer')
+PURPOSES = ('publisher', 'observer', *MEDIA_ROLES)
 SESSION_RELATIONS = ('interview__application__candidate', 'interview__application__job__recruiter')
 
 
@@ -39,12 +40,14 @@ def can_observe(user, session):
 def require_eligibility(user, session, purpose):
     if not user.is_active:
         raise SocketAuthorizationError('account_inactive')
-    allowed = can_publish(user, session) if purpose == 'publisher' else can_observe(user, session)
+    allowed = can_publish(user, session) if purpose in ('publisher', 'camera') else can_observe(user, session)
     if purpose not in PURPOSES or not allowed:
         raise SocketAuthorizationError('access_denied')
     if not session.video_required:
         raise SocketAuthorizationError('video_not_enabled', 409)
-    if purpose == 'publisher' and (
+    if purpose in MEDIA_ROLES and not settings.LIVE_MONITOR_ENABLED:
+        raise SocketAuthorizationError('monitor_unavailable', 409)
+    if purpose in ('publisher', *MEDIA_ROLES) and (
         session.interview.status != Interview.Status.LIVE or session.started_at is None
         or session.ended_at is not None or session.audio_ended_at is not None
         or session.creation_uncertain or session.lifecycle_version != 1
@@ -94,6 +97,10 @@ def issue_ticket(user_id, session_id, purpose, verified_claims):
         require_eligibility(user, session, purpose)
         SocketTicket.objects.filter(user=user, expires_at__lte=now).delete()
         outstanding = SocketTicket.objects.filter(user=user, consumed_at__isnull=True, expires_at__gt=now)
+        if purpose in MEDIA_ROLES:
+            outstanding = outstanding.filter(purpose__in=MEDIA_ROLES)
+        else:
+            outstanding = outstanding.exclude(purpose__in=MEDIA_ROLES)
         if outstanding.count() >= max(1, settings.INTERVIEW_ANALYSIS_MAX_OUTSTANDING_TICKETS):
             raise SocketAuthorizationError('ticket_limit', 429)
         secret = secrets.token_urlsafe(32)
@@ -104,6 +111,8 @@ def issue_ticket(user_id, session_id, purpose, verified_claims):
             credential_expires_at=credential_expiry, expires_at=expires,
         )
     suffix = 'observe/' if purpose == 'observer' else ''
+    if purpose in MEDIA_ROLES:
+        return {'ticket': secret, 'expires_at': expires, 'socket_path': f'/ws/monitor/{session.pk}/{purpose}/', 'protocol_version': 1}
     return {'ticket': secret, 'expires_at': expires, 'socket_path': f'/ws/analysis/{session.pk}/{suffix}',
             'protocol_version': 1}
 

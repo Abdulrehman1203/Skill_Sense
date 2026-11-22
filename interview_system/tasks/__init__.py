@@ -23,10 +23,12 @@ from .notification_tasks import deliver_notification_outbox, recover_notificatio
 from .feedback import recover_feedback_reports
 from .video import recover_video
 from .vision import process_frame, warm_vision
+from ..replay.tasks import reconcile as reconcile_interview_replay
 
 __all__ = (
     "process_frame",
     "warm_vision",
+    "reconcile_interview_replay",
     "recover_video",
     "parse_resume",
     "compute_match_score",

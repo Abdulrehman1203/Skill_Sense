@@ -10,6 +10,7 @@ from django.db import IntegrityError, models, transaction
 from django.db.models.deletion import ProtectedError
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_spectacular.utils import OpenApiResponse, extend_schema, extend_schema_view, PolymorphicProxySerializer
 from rest_framework import filters, generics, mixins, status
@@ -303,6 +304,19 @@ class InterviewViewSet(
             return interviews
 
         return Interview.objects.none()
+
+    @action(detail=False, methods=["get"], url_path="command-deck")
+    def command_deck(self, request):
+        try:
+            start = parse_datetime(request.query_params.get("scheduled_from", ""))
+        except ValueError:
+            start = None
+        if start is None or timezone.is_naive(start):
+            raise ValidationError({"scheduled_from": "Use a timestamp with a timezone."})
+        rows = self.get_queryset().filter(scheduled_at__gte=start).order_by(
+            "scheduled_at", "pk"
+        ).values("id", "application", "status", "scheduled_at")
+        return self.get_paginated_response(self.paginate_queryset(rows))
 
     @extend_schema(
         methods=["GET"], responses={200: InterviewQuestionSerializer(many=True)},
@@ -712,19 +726,37 @@ class JobViewSet(ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
+        jobs = Job.objects.select_related("recruiter").prefetch_related("job_skills")
         if not user or not user.is_authenticated:
-            return Job.objects.filter(status=Job.Status.ACTIVE)
+            return jobs.filter(status=Job.Status.ACTIVE)
 
         if getattr(user, "role", None) == User.Role.RECRUITER:
             recruiter_profile = getattr(user, "recruiter_profile", None)
             if self.action == "retrieve":
-                return Job.objects.filter(
+                return jobs.filter(
                     models.Q(recruiter=recruiter_profile) | models.Q(status=Job.Status.ACTIVE)
                 )
-            return Job.objects.filter(recruiter=recruiter_profile)
+            jobs = jobs.filter(recruiter=recruiter_profile)
+            if self.action == "list":
+                applications = Application.objects.filter(
+                    job_id=models.OuterRef("pk")
+                ).order_by().values("job_id")
+                counts = applications.annotate(total=models.Count("pk")).values("total")
+                averages = applications.filter(
+                    current_assessment__status="SUCCEEDED"
+                ).annotate(
+                    average=models.Avg("current_assessment__match_score")
+                ).values("average")
+                jobs = jobs.annotate(
+                    applicants_count=models.functions.Coalesce(
+                        models.Subquery(counts), models.Value(0)
+                    ),
+                    screening_score_average=models.Subquery(averages),
+                )
+            return jobs
 
         candidate = getattr(user, "candidate_profile", None)
-        return Job.objects.filter(status=Job.Status.ACTIVE).annotate(
+        return jobs.filter(status=Job.Status.ACTIVE).annotate(
             has_applied=models.Exists(
                 Application.objects.filter(candidate=candidate, job_id=models.OuterRef("pk"))
             ),
@@ -982,7 +1014,7 @@ class ApplicationViewSet(
     def get_permissions(self) -> list[Any]:
         if self.action == "create":
             return [IsAuthenticated(), IsCandidate()]
-        if self.action in ("advance", "shortlist", "reject", "rescreen", "decision"):
+        if self.action in ("advance", "shortlist", "reject", "rescreen", "decision", "command_deck"):
             return [IsAuthenticated(), IsRecruiter()]
         if self.action == "retrieve":
             return [IsAuthenticated(), IsApplicationAccessible()]
@@ -1060,6 +1092,45 @@ class ApplicationViewSet(
         if ordering not in mapping:
             raise ValidationError({"ordering": "Invalid ordering."})
         return qs.order_by(mapping[ordering], "pk")
+
+    @action(detail=False, methods=["get"], url_path="command-deck")
+    def command_deck(self, request):
+        rows = Application.objects.filter(job__recruiter__user=request.user).order_by(
+            "-created_at", "pk"
+        ).values(
+            "id", "job", "status", "created_at", "job__title",
+            "candidate__user__first_name", "candidate__user__last_name",
+            "candidate__user__email", "candidate__user__profile_image_url",
+            "current_assessment__status", "current_assessment__revision",
+            "current_assessment__match_score",
+        )
+        results = []
+        for row in self.paginate_queryset(rows):
+            email = row["candidate__user__email"]
+            first = row["candidate__user__first_name"]
+            last = row["candidate__user__last_name"]
+            assessment_status = row["current_assessment__status"]
+            results.append({
+                "id": row["id"],
+                "job": row["job"],
+                "job_title": row["job__title"],
+                "created_at": row["created_at"],
+                "status": row["status"],
+                "candidate_email": email,
+                "candidate_name": f"{first} {last}".strip() or email,
+                "candidate_profile_image_url": row["candidate__user__profile_image_url"],
+                "assessment": {
+                    "status": assessment_status,
+                    "revision": row["current_assessment__revision"],
+                } if assessment_status is not None else None,
+                "match_score": (
+                    row["current_assessment__match_score"]
+                    if assessment_status == "SUCCEEDED" else None
+                ),
+            })
+        response = self.get_paginated_response(results)
+        response["Cache-Control"] = "no-store"
+        return response
 
     @action(detail=False, methods=["get"])
     def summary(self, request):

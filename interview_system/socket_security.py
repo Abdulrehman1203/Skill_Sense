@@ -61,6 +61,7 @@ class SecureSocketEntry:
         query = scope.get('query_string', b'')
         ticket = re.fullmatch(rb'ticket=([A-Za-z0-9_-]{43})', query)
         route = re.fullmatch(r'/ws/analysis/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/(?:observe/)?', scope.get('path', ''))
+        route = route or re.fullmatch(r'/ws/monitor/[0-9a-f-]{36}/(?:camera|viewer)/', scope.get('path', ''))
         if scope.get('interview_analysis_bounded_input') is not True or not allowed or not ticket or not route:
             await receive()  # ASGI requires a connect event before denial.
             await send({'type': 'websocket.close', 'code': 4403})

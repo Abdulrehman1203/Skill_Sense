@@ -342,6 +342,7 @@ class JobSerializer(serializers.ModelSerializer):
 
     match_score = serializers.SerializerMethodField()
     average_match_score = serializers.SerializerMethodField()
+    applicants_count = serializers.IntegerField(read_only=True)
     has_applied = serializers.BooleanField(read_only=True, default=False)
 
     class Meta:  # type: ignore
@@ -365,6 +366,7 @@ class JobSerializer(serializers.ModelSerializer):
             "job_skills",
             "match_score",
             "average_match_score",
+            "applicants_count",
             "has_applied",
             "screening_threshold", "auto_shortlist_enabled", "non_pass_policy",
             "screening_policy_version", "screening_criteria",
@@ -389,6 +391,9 @@ class JobSerializer(serializers.ModelSerializer):
         return None
 
     def get_average_match_score(self, obj: Job) -> float | None:
+        if hasattr(obj, "screening_score_average"):
+            average = obj.screening_score_average
+            return round(average, 2) if average is not None else None
         from django.db.models import Avg
         avg = obj.applications.filter(
             current_assessment__status="SUCCEEDED"

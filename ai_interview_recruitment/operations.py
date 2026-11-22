@@ -23,6 +23,10 @@ def route_bucket(request):
     name = getattr(match, 'url_name', '') or ''
     if not name:
         return 'unmatched'
+    if name == 'interview-replay':
+        return 'replay_playback'
+    if name.startswith('replay-'):
+        return 'replay_capture'
     for prefix, bucket in (('candidate-resume','resume'), ('resume','resume'), ('application','application'),
                            ('health','health'), ('metrics','metrics'), ('login','auth'), ('me','auth')):
         if name.startswith(prefix):
