@@ -1,7 +1,6 @@
 """Authenticated HTTP lifecycle for browser voice interviews."""
 import time
 import logging
-from datetime import timedelta
 
 from django.conf import settings
 from django.db import transaction
@@ -123,9 +122,11 @@ class VoiceInterviewMixin:
                 return Response({'detail': 'This interview is complete.'}, status=409)
             if interview.status not in (Interview.Status.SCHEDULED, Interview.Status.LIVE):
                 return Response({'detail': 'This interview has an invalid lifecycle state.'}, status=409)
-            if (not settings.DEBUG and request.user.role == User.Role.CANDIDATE and interview.status == Interview.Status.SCHEDULED
-                    and interview.scheduled_at and interview.scheduled_at > timezone.now() + timedelta(minutes=15)):
-                raise ValidationError({'scheduled_at': 'You can join from 15 minutes before the scheduled time.'})
+            if not start_now or interview.deadline_at is not None:
+                from .interview_timing import join_error
+                error = join_error(interview, enforce_fixed=not settings.DEBUG and request.user.role == User.Role.CANDIDATE)
+                if error:
+                    raise ValidationError(error)
             questions = list(interview.questions.filter(approved=True).order_by('position', 'created_at', 'pk'))
             if not questions and not start_now:
                 raise ValidationError({'questions': 'At least one approved question is required.'})

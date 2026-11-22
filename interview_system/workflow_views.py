@@ -9,7 +9,7 @@ from rest_framework.views import APIView
 from . import workflow_actions as service
 from .models import Application, Interview, WorkflowAction
 from .permissions import IsRecruiter
-from .serializers import ApplicationDetailSerializer, InterviewSerializer
+from .serializers import ApplicationDetailSerializer, InterviewSerializer, InterviewTimingSerializer
 from .evaluation_views import report
 from .feedback_views import review
 from .schema_contracts import EvaluationDTO, TranscriptSelectionDTO, FeedbackReviewDTO, WorkflowHistoryDTO
@@ -34,8 +34,8 @@ class TranscriptCommand(Command):
     transcript_id = serializers.UUIDField()
 
 
-class ScheduleCommand(Command):
-    scheduled_at = serializers.DateTimeField()
+class ScheduleCommand(Command, InterviewTimingSerializer):
+    pass
 
 
 class ReopenCommand(ScheduleCommand):

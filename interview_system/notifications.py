@@ -15,15 +15,16 @@ logger = logging.getLogger(__name__)
 
 
 def deliver_inapp_locked(row):
-    if row.inapp_delivered_at is None and obsolete_question_notice(row):
+    if not row.send_in_app or row.inapp_delivered_at is not None:
+        return
+    if obsolete_question_notice(row):
         row.inapp_delivered_at, row.email_status = timezone.now(), 'SKIPPED'
         row.save()
         return
     Notification.objects.get_or_create(pk=row.pk, defaults={'user_id': row.recipient_id,
         'type': row.event, 'message': inapp_message(row.event), 'links': row.links})
-    if row.inapp_delivered_at is None:
-        row.inapp_delivered_at = timezone.now()
-        row.save(update_fields=['inapp_delivered_at'])
+    row.inapp_delivered_at = timezone.now()
+    row.save(update_fields=['inapp_delivered_at'])
 
 
 def obsolete_question_notice(row):
@@ -38,7 +39,8 @@ def obsolete_question_notice(row):
 
 
 @transaction.atomic
-def queue_notification(user_id, event, *, resource_type, resource_id, revision, links=None, deliver_inapp=False, notification_id=None):
+def queue_notification(user_id, event, *, resource_type, resource_id, revision, links=None,
+                       deliver_inapp=False, notification_id=None, in_app=True, email=True):
     name = event_name(event)
     recipient = User.objects.get(pk=user_id)
     expected_role = 'CANDIDATE' if name in CANDIDATE_EVENTS else 'RECRUITER'
@@ -60,13 +62,15 @@ def queue_notification(user_id, event, *, resource_type, resource_id, revision, 
     row, _ = NotificationOutbox.objects.get_or_create(business_key=key, defaults={
         'id': notification_id or uuid5(NAMESPACE_URL, 'skillsense-business-event:' + key),
         'recipient': recipient, 'event': name, 'resource_type': resource_type, 'resource_id': resource_id,
-        'revision': revision, 'links': links})
+        'revision': revision, 'links': links,
+        'send_in_app': in_app,
+        'email_status': 'PENDING' if email else 'SKIPPED'})
     row = NotificationOutbox.objects.select_for_update().get(pk=row.pk)
     if row.links != links:
         raise ValueError('Business event cannot be reused with different links')
     if deliver_inapp:
         deliver_inapp_locked(row)
-    if row.email_status in ('PENDING', 'SENDING') or row.inapp_delivered_at is None:
+    if row.email_status in ('PENDING', 'SENDING') or (row.send_in_app and row.inapp_delivered_at is None):
         transaction.on_commit(lambda: dispatch_notification(row.pk))
     return row
 

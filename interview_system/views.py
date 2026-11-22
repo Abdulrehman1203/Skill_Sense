@@ -124,7 +124,7 @@ class NotificationMarkReadView(APIView):
         if not notification.is_read:
             Notification.objects.filter(pk=notification.pk, user=request.user, is_read=False).update(is_read=True)
             notification.is_read = True
-        return Response(NotificationSerializer(notification).data)
+        return Response(NotificationSerializer(notification, context={"request": request}).data)
 
 
 class AuditLogView(generics.ListAPIView):
@@ -282,6 +282,16 @@ class InterviewViewSet(
             interviews = Interview.objects.filter(
                 application__job__recruiter__user=user
             ).order_by("-created_at", "-pk")
+            if self.action == "list":
+                filters = self.request.query_params
+                if "job" in filters:
+                    try:
+                        job_id = UUID(filters["job"])
+                    except ValueError:
+                        raise ValidationError({"job": "Enter a valid UUID."})
+                    interviews = interviews.filter(application__job_id=job_id)
+                if "status" in filters:
+                    interviews = interviews.filter(status=filters["status"])
             if self.action == "list" and "application" in self.request.query_params:
                 try:
                     application_id = UUID(self.request.query_params["application"])
@@ -349,7 +359,7 @@ class InterviewViewSet(
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         application_id = serializer.validated_data["application"]
-        scheduled_at = serializer.validated_data["scheduled_at"]
+        from .interview_timing import validated_timing
 
         recruiter_profile = getattr(request.user, "recruiter_profile", None)
         if recruiter_profile is None:
@@ -358,7 +368,7 @@ class InterviewViewSet(
         with transaction.atomic():
             try:
                 application = (
-                    Application.objects.select_for_update()
+                    Application.objects.select_for_update(of=("self",))
                     .select_related("job")
                     .get(pk=application_id)
                 )
@@ -385,10 +395,7 @@ class InterviewViewSet(
                     }
                 )
 
-            if scheduled_at <= timezone.now():
-                raise ValidationError(
-                    {"scheduled_at": "Interview must be scheduled for a future time."}
-                )
+            timing = validated_timing(application.job_id, serializer.validated_data)
 
             from .question_preparation import freeze_locked, bind_copies
             question_set, prepared = freeze_locked(application, serializer.validated_data["question_set"],
@@ -396,7 +403,9 @@ class InterviewViewSet(
             interview = Interview.objects.create(
                 application=application,
                 status=Interview.Status.SCHEDULED,
-                scheduled_at=scheduled_at,
+                **timing,
+                notify_in_app=serializer.validated_data["notify_in_app"],
+                notify_email=serializer.validated_data["notify_email"],
                 question_set=question_set,
                 question_preparation_mode="PREPARED",
                 question_fallback_reason=question_set.fallback_reason,
@@ -414,7 +423,8 @@ class InterviewViewSet(
                 reason="Interview scheduled with a frozen approved question revision.")
             from .notifications import queue_notification
             queue_notification(application.candidate.user_id, "interview_scheduled", resource_type='interview',
-                resource_id=interview.pk, revision=1, links={'application_id': application.pk})
+                resource_id=interview.pk, revision=1, links={'application_id': application.pk},
+                in_app=interview.notify_in_app, email=interview.notify_email)
             # Snapshot before dispatch, including in eager development mode.
             result = InterviewSerializer(interview, context={"request": request}).data
 
