@@ -11,6 +11,7 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument('--require-ready', action='store_true')
+        parser.add_argument('--check-grading', action='store_true', help='Grade a synthetic answer on each configured model.')
 
     def handle(self, *args, **options):
         executor = MigrationExecutor(connection)
@@ -42,6 +43,43 @@ class Command(BaseCommand):
             'email_backend': settings.EMAIL_BACKEND,
             'smtp_configured': settings.EMAIL_BACKEND == 'django.core.mail.backends.smtp.EmailBackend' and settings.EMAIL_HOST != 'localhost',
             'beat_process_verified': False}
+        if options['check_grading']:
+            data['grading'] = check_grading()
         self.stdout.write(json.dumps(data))
-        if options['require_ready'] and (pending or not worker_data['ready'] or not data['beat_recovery_configured']):
-            raise CommandError('Workflow rollout is not ready. Resolve the reported migration/worker conditions.')
+        grading_unavailable = options['check_grading'] and 'ready' not in data['grading'].values()
+        if options['require_ready'] and (pending or not worker_data['ready']
+                or not data['beat_recovery_configured'] or grading_unavailable):
+            raise CommandError('Workflow rollout is not ready. Resolve the reported conditions.')
+
+
+def check_grading():
+    from interview_system.answer_evaluation import InvalidEvaluation, grading_fallback_model
+    from interview_system.integrations.gemini_client import (
+        EvaluationProviderError, evaluate_answers, has_grading_backup_key,
+    )
+
+    question = {'id': 'synthetic', 'text': 'How would you retry a failed job?', 'category': 'TECHNICAL',
+                'criteria': {'reasoning': 'Explain the retry and deduplication strategy.'}}
+    inputs = {'contract_version': 'answers-v2', 'final_evidence': True, 'context': {'questions': [question]},
+              'transcript': {'turns': [{'id': 't1', 'role': 'agent', 'text': question['text']},
+                  {'id': 't2', 'role': 'user', 'text': 'Retry transient errors with exponential backoff and jitter. '
+                                                    'Use an idempotency key to prevent duplicate side effects.'}]},
+              'alignment': {'questions': [{'question_id': 'synthetic', 'state': 'ANSWERED',
+                                          'asked_turn_id': 't1', 'answer_turn_ids': ['t2']}]}}
+    statuses = {}
+    primary = settings.GEMINI_EVALUATION_MODEL_NAME
+    fallback = grading_fallback_model(primary)
+    routes = [(primary, False)]
+    if fallback:
+        routes.append((fallback, True))
+    for model, is_fallback in routes:
+        label = f'{model} (fallback)' if is_fallback and model == primary else model
+        try:
+            result = evaluate_answers(inputs, model_name=model,
+                                      use_fallback_key=is_fallback and has_grading_backup_key())
+            statuses[label] = 'ready' if result['answers'][0]['status'] == 'ANSWERED' else 'NO_SCORE'
+        except EvaluationProviderError as error:
+            statuses[label] = error.code
+        except InvalidEvaluation:
+            statuses[label] = 'INVALID_OUTPUT'
+    return statuses

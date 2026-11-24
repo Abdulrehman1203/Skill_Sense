@@ -25,12 +25,19 @@ from .models import (
     Job,
     JobSkill,
     Question,
+    RecruiterCalendarConnection,
     RecruiterProfile,
     Resume,
     ScoringRubric,
     User,
 )
-from .resumes.validation import validate_resume_upload
+from .resumes.validation import (
+    RESUME_REPLACEMENT_ERROR,
+    reject_duplicate_resume,
+    resume_has_submission,
+    validate_resume_identity,
+    validate_resume_upload,
+)
 from .resumes.download import download_url
 
 
@@ -136,6 +143,12 @@ class RecruiterProfileSerializer(serializers.ModelSerializer):
     """
 
     user = UserSummarySerializer(read_only=True)
+    calendar_connected = serializers.SerializerMethodField()
+
+    def get_calendar_connected(self, profile) -> bool:
+        return RecruiterCalendarConnection.objects.filter(
+            recruiter=profile, connected_at__isnull=False,
+        ).exists()
     company_logo = ImageOrURLField(source="*", required=False, allow_null=True)
     profile_image = serializers.ImageField(
         required=False, write_only=True,
@@ -164,6 +177,7 @@ class RecruiterProfileSerializer(serializers.ModelSerializer):
             "industry",
             "position",
             "company_size",
+            "calendar_connected",
         ]
         read_only_fields = ["user"]
 
@@ -653,14 +667,16 @@ class ApplicationCreateSerializer(serializers.Serializer):
         return attrs
 
     def create(self, validated_data: dict[str, Any]) -> Application:
-        from django.db import transaction
-
         candidate_profile = validated_data["_candidate_profile"]
         job = validated_data["job"]
         resume_file = validated_data.get("resume_file")
         resume = validated_data.get("resume")
+        upload_hash = (
+            validate_resume_identity(resume_file, self.context["request"].user) if resume_file else None
+        )
 
         with transaction.atomic():
+            candidate_profile = CandidateProfile.objects.select_for_update().get(pk=candidate_profile.pk)
             job = Job.objects.select_for_update().get(pk=job.pk)
             if job.status != Job.Status.ACTIVE or (job.deadline and job.deadline < timezone.localdate()):
                 raise serializers.ValidationError({"job": "This job is no longer accepting applications."})
@@ -668,11 +684,19 @@ class ApplicationCreateSerializer(serializers.Serializer):
                 from .screening import ScreeningConflict
                 raise ScreeningConflict("You have already applied to this job.")
             if resume_file:
+                reject_duplicate_resume(candidate_profile, upload_hash)
                 resume = Resume.objects.create(
                     candidate=candidate_profile,
                     file=resume_file,
-                    original_filename=getattr(resume_file, 'name', ''),
+                    original_filename=resume_file.name,
+                    upload_hash=upload_hash,
                 )
+            else:
+                resume = Resume.objects.filter(candidate=candidate_profile, pk=resume.pk).first()
+                if resume is None:
+                    raise serializers.ValidationError(
+                        {"resume_id": "Resume not found or does not belong to you."}
+                    )
             application = Application.objects.create(
                 candidate=candidate_profile,
                 job=job,
@@ -1079,8 +1103,19 @@ class InterviewQuestionsPatchSerializer(serializers.Serializer):
 class InterviewSerializer(serializers.ModelSerializer):
     """Read-only scheduled interview response."""
 
+    interview_session_id = serializers.UUIDField(source="session.pk", read_only=True, allow_null=True)
+    live_monitor_status = serializers.SerializerMethodField()
+    candidate_name = serializers.SerializerMethodField()
     questions = InterviewQuestionSerializer(many=True, read_only=True)
     workflow_state = serializers.SerializerMethodField()
+
+    def get_live_monitor_status(self, obj) -> str:
+        from .socket_auth import monitor_status
+        return monitor_status(getattr(obj, 'session', None))
+
+    def get_candidate_name(self, obj) -> str:
+        candidate = obj.application.candidate.user
+        return f'{candidate.first_name} {candidate.last_name}'.strip()
 
     def get_workflow_state(self, obj) -> str:
         from .interview_workflow import workflow_state
@@ -1090,6 +1125,9 @@ class InterviewSerializer(serializers.ModelSerializer):
         model = Interview
         fields = [
             "id",
+            "interview_session_id",
+            "live_monitor_status",
+            "candidate_name",
             "application",
             "status",
             "scheduled_at",
@@ -1117,11 +1155,13 @@ class CandidateInterviewSerializer(serializers.ModelSerializer):
     question_readiness = serializers.SerializerMethodField()
     join_window_required = serializers.SerializerMethodField()
     workflow_state = serializers.SerializerMethodField()
+    live_monitor_available = serializers.SerializerMethodField()
 
     class Meta:
         model = Interview
         fields = ["id", "application", "status", "scheduled_at", "deadline_at", "workflow_state",
-                  "completed_at", "question_readiness", "join_window_required", "created_at", "updated_at"]
+                  "completed_at", "question_readiness", "join_window_required", "live_monitor_available",
+                  "created_at", "updated_at"]
         read_only_fields = fields
 
     def get_workflow_state(self, obj) -> str:
@@ -1130,6 +1170,10 @@ class CandidateInterviewSerializer(serializers.ModelSerializer):
 
     def get_join_window_required(self, obj) -> bool:
         return obj.deadline_at is not None or not settings.DEBUG
+
+    def get_live_monitor_available(self, obj) -> bool:
+        from .monitor_configuration import monitor_configuration_status
+        return monitor_configuration_status() == 'available'
 
     @extend_schema_field(QuestionReadinessSerializer)
     def get_question_readiness(self, obj):
@@ -1255,11 +1299,8 @@ class ResumeListSerializer(serializers.ModelSerializer):
         return super().create(validated_data)
 
     def validate_file(self, value: Any) -> Any:
-        if self.instance and (Application.objects.filter(resume=self.instance).exists() or
-                              ApplicationAssessment.objects.filter(resume=self.instance).exists()):
-            raise serializers.ValidationError(
-                "A resume submitted with an application cannot be replaced."
-            )
+        if self.instance and resume_has_submission(self.instance):
+            raise serializers.ValidationError(RESUME_REPLACEMENT_ERROR)
         return validate_resume_upload(value)
 
     def get_filename(self, obj: Resume) -> str:

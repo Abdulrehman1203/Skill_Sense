@@ -31,6 +31,12 @@ from .models import AuditLogEntry, CandidateScore, FrameAnalysis, IntegrityThres
 from .models import InterviewSession
 from .models import Application, CandidateProfile, Interview, Job, JobSkill, RecruiterProfile, Resume, ScoringRubric, User
 from .permissions import IsAdmin, IsApplicationAccessible, IsCandidate, IsJobOwner, IsRecruiter, IsResumeAccessible
+from .resumes.validation import (
+    RESUME_REPLACEMENT_ERROR,
+    reject_duplicate_resume,
+    resume_has_submission,
+    validate_resume_identity,
+)
 from .serializers import (
     ApplicationAdvanceSerializer,
     ApplicationDecisionSerializer,
@@ -283,6 +289,8 @@ class InterviewViewSet(
             interviews = Interview.objects.filter(
                 application__job__recruiter__user=user
             ).order_by("-created_at", "-pk")
+            if self.action in ("list", "retrieve"):
+                interviews = interviews.select_related("session", "application__candidate__user")
             if self.action == "list":
                 filters = self.request.query_params
                 if "job" in filters:
@@ -1353,25 +1361,49 @@ class CandidateResumeViewSet(ModelViewSet):
         if candidate_profile is None:
             raise PermissionDenied("Candidate profile not found.")
 
+        upload_hash = validate_resume_identity(serializer.validated_data["file"], user)
         with transaction.atomic():
-            resume = serializer.save(candidate=candidate_profile, status=Resume.Status.PENDING)
+            candidate_profile = CandidateProfile.objects.select_for_update().get(pk=candidate_profile.pk)
+            reject_duplicate_resume(candidate_profile, upload_hash)
+            resume = serializer.save(
+                candidate=candidate_profile, status=Resume.Status.PENDING, upload_hash=upload_hash,
+            )
             resume_id = str(resume.id)
             transaction.on_commit(lambda: self._dispatch_parse(resume_id))
 
     def perform_update(self, serializer):
+        upload = serializer.validated_data.get("file")
+        upload_hash = validate_resume_identity(upload, self.request.user) if upload else ""
         with transaction.atomic():
-            resume = serializer.save(status=Resume.Status.PENDING, processing_error="", processing_code="")
+            candidate = CandidateProfile.objects.select_for_update().get(pk=serializer.instance.candidate_id)
+            current = get_object_or_404(Resume.objects.select_for_update(), pk=serializer.instance.pk, candidate=candidate)
+            serializer.instance = current
+            updates = {"status": Resume.Status.PENDING, "processing_error": "", "processing_code": ""}
+            if upload:
+                if resume_has_submission(current):
+                    raise ValidationError({"file": RESUME_REPLACEMENT_ERROR})
+                reject_duplicate_resume(candidate, upload_hash)
+                updates.update(
+                    original_filename=upload.name, upload_hash=upload_hash, content_hash="",
+                    parser_version="", parse_claim=None, parse_lease_until=None,
+                )
+            resume = serializer.save(**updates)
             resume_id = str(resume.id)
             transaction.on_commit(lambda: self._dispatch_parse(resume_id))
 
-    @extend_schema(request=None, responses={202: ResumeListSerializer, 409: OpenApiResponse(description="Manual retry unavailable.")})
+    @extend_schema(
+        request=None,
+        summary="Queue a stored resume or retry parsing an existing upload",
+        responses={202: ResumeListSerializer, 409: OpenApiResponse(description="Parsing cannot be queued.")},
+    )
     @action(detail=True, methods=["post"], url_path="retry-parsing")
     def retry_parsing(self, request, pk=None):
         from rest_framework.generics import get_object_or_404 as get_resume_or_404
 
         with transaction.atomic():
             resume = get_resume_or_404(self.get_queryset().select_for_update(), pk=pk)
-            if not resume.can_retry_parsing or resume.parse_claim is not None:
+            can_queue = resume.status == Resume.Status.STORED or resume.can_retry_parsing
+            if not can_queue or resume.parse_claim is not None:
                 return Response({"detail": "This resume is not waiting for a manual retry."}, status=status.HTTP_409_CONFLICT)
             resume.status, resume.processing_error, resume.processing_code = Resume.Status.PENDING, "", ""
             resume.save(update_fields=["status", "processing_error", "processing_code"])

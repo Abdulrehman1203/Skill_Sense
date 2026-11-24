@@ -17,7 +17,7 @@ from rest_framework.views import APIView
 
 from .audit import record_audit
 from .models import (
-    ApplicationAssessment, BehavioralAnalysis, FrameAnalysis, FrameJob, Interview,
+    ApplicationAssessment, BehavioralAnalysis, ClerkWebhookState, FrameAnalysis, FrameJob, Interview,
     Job, Resume, TranscriptRevision, User,
 )
 from .permissions import IsAdmin
@@ -131,6 +131,8 @@ class AdminUserStatusView(AdminConsoleMixin, APIView):
             user = get_object_or_404(User.objects.select_for_update(), pk=pk)
             if user.role == User.Role.ADMIN:
                 raise ValidationError({"is_active": "Admin accounts are managed separately."})
+            if active and ClerkWebhookState.objects.filter(clerk_id=user.clerk_id, is_deleted=True).exists():
+                raise ValidationError({"is_active": "Deleted accounts cannot be reactivated."})
             if user.is_active != active:
                 user.is_active = active
                 user.save(update_fields=["is_active", "updated_at"])

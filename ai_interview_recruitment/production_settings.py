@@ -117,9 +117,10 @@ elif PRIVATE_STORAGE_BACKEND == 's3':
 else:
     raise ImproperlyConfigured('PRIVATE_STORAGE_BACKEND must be filesystem or s3.')
 EMAIL_BACKEND = 'django.core.mail.backends.smtp.EmailBackend'
-EMAIL_HOST = required('EMAIL_HOST')
+if not os.environ.get('SMTP_KEY', '').strip() or os.environ.get('EMAIL_HOST'):
+    EMAIL_HOST = required('EMAIL_HOST')
 EMAIL_HOST_USER = required('EMAIL_HOST_USER')
-EMAIL_HOST_PASSWORD = required('EMAIL_HOST_PASSWORD')
+EMAIL_HOST_PASSWORD = required('EMAIL_HOST_PASSWORD' if os.environ.get('EMAIL_HOST_PASSWORD') else 'SMTP_KEY')
 DEFAULT_FROM_EMAIL = required('DEFAULT_FROM_EMAIL')
 EMAIL_USE_TLS = True
 EMAIL_USE_SSL = False

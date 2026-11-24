@@ -23,7 +23,7 @@ def route_bucket(request):
     name = getattr(match, 'url_name', '') or ''
     if not name:
         return 'unmatched'
-    if name == 'interview-replay':
+    if name in ('interview-replay', 'recording-access'):
         return 'replay_playback'
     if name.startswith('replay-'):
         return 'replay_capture'

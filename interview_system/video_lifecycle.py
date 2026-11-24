@@ -5,7 +5,7 @@ FrameJob -> FrameAnalysis/BehavioralAnalysis. Never acquire the gate inside a
 parent lock. All public mutations take their own parent/session locks.
 """
 from contextlib import contextmanager
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone as dt_timezone
 import math
 import logging
 import uuid
@@ -20,11 +20,15 @@ from .models import (BehavioralAnalysis, FrameAdmissionGate, FrameAnalysis, Fram
                      Interview, InterviewSession, RetellWebhookEvent, User)
 from .session_completion import finish_if_ready
 from .socket_auth import SocketAuthorizationError, can_publish, check_lease
+from . import vision_calibration
 
 ACTIVE_JOBS = ('pending', 'processing')
 TERMINAL_JOBS = ('processed', 'superseded', 'failed', 'expired')
 FINISH_REASONS = ('candidate_finished', 'audio_ended', 'reconnect_timeout',
                   'inactivity_timeout', 'duration_limit', 'service_failure')
+FRAME_DROP_REASONS = ('rate_limited', 'decoder_unavailable', 'invalid_image', 'stale',
+                      'vision_disabled', 'worker_unready', 'payload_capacity',
+                      'payload_redis_unavailable', 'capacity')
 logger = logging.getLogger(__name__)
 
 
@@ -112,6 +116,7 @@ def acquire_publisher(lease):
         if (session.connection_state == 'connected' and session.connection_lease_until
                 and session.connection_lease_until > now):
             raise SocketAuthorizationError('publisher_conflict', 409)
+        vision_calibration.invalidate_locked(session, reconnect=True)
         generation = uuid.uuid4()
         session.connection_generation = generation
         session.connection_state = 'connected'
@@ -129,6 +134,7 @@ def heartbeat_publisher(lease, generation):
         _publisher(session, lease, generation)
         now = timezone.now()
         require_open(session, now)
+        vision_calibration.expire_locked(session, now)
         session.connection_lease_until = min(lease.expires_at, session.connection_auth_expires_at,
                                              now + seconds('INTERVIEW_ANALYSIS_CONNECTION_LEASE_SECONDS'))
         session.save(update_fields=['connection_lease_until'])
@@ -146,6 +152,7 @@ def disconnect_publisher(session_id, generation):
 
 
 def _disconnect_locked(session, now):
+    vision_calibration.invalidate_locked(session, reconnect=True)
     anchor = min(now, session.connection_lease_until or now)
     session.connection_state = 'disconnected'
     session.video_state = 'disconnected'
@@ -203,6 +210,7 @@ def seal_video_locked(interview, session, reason):
     if reason not in FINISH_REASONS:
         raise ValueError('Invalid finish reason.')
     if session.admission_sealed_at is None:
+        vision_calibration.invalidate_locked(session)
         now = timezone.now()
         session.admission_sealed_at = now
         session.sealed_admission_count = session.admitted_count
@@ -237,7 +245,8 @@ def finish_video(session_id, user_id):
         return {'session_id': str(session.pk), 'video_state': session.video_state, 'finish_reason': session.finish_reason}
 
 
-def admit_frame(lease, generation, sequence, capture_ts, *, retain_payload=None, received_at=None):
+def admit_frame(lease, generation, sequence, capture_ts, *, retain_payload=None, received_at=None,
+                calibration_sample=False, frame_size=None):
     """Internal B3/B4 metadata boundary, after byte/image/rate validation.
 
     B4's optional private payload retention hook runs inside the admission lock.
@@ -261,27 +270,34 @@ def admit_frame(lease, generation, sequence, capture_ts, *, retain_payload=None,
                 return existing, None
             if session.last_sequence is not None and sequence <= session.last_sequence:
                 raise SocketAuthorizationError('invalid_sequence', 400)
+            if received_at is not None and received_at + seconds('INTERVIEW_ANALYSIS_FRAME_DEADLINE_SECONDS') <= now:
+                _record_drop_locked(session, sequence, 'stale')
+                return None, 'stale'
             pending = session.frame_jobs.filter(state='pending').first()
             # Replacement does not increase nonterminal global occupancy.
             full = FrameJob.objects.filter(state__in=ACTIVE_JOBS).count() >= max(1, settings.INTERVIEW_ANALYSIS_GLOBAL_FRAME_CAP)
-            session.received_count += 1
-            session.last_sequence = sequence
             # Camera liveness is independent of model/queue admission capacity.
-            session.last_frame_at = now
             if (full and pending is None) or session.admitted_count >= settings.INTERVIEW_ANALYSIS_MAX_SESSION_FRAMES:
-                session.dropped_count += 1
-                session.save()
-                touch_analysis_locked(session)
+                _record_drop_locked(session, sequence, 'capacity', validated=True)
                 return None, 'capacity'
+            vision_context = vision_calibration.frame_context(session, generation, calibration_sample, frame_size, now)
+            if vision_context is None:
+                _record_drop_locked(session, sequence, 'stale')
+                return None, 'stale'
             if pending:
                 pending.state = 'superseded'; pending.terminal_at = now; pending.terminal_reason = 'superseded'
                 pending.save(update_fields=['state', 'terminal_at', 'terminal_reason'])
+            session.received_count += 1
             session.admitted_count += 1
+            session.last_sequence = sequence
             session.last_frame_at = now
             session.analysis_state = 'processing'
+            deadline = min(now, received_at or now) + seconds('INTERVIEW_ANALYSIS_FRAME_DEADLINE_SECONDS')
+            if 'attempt' in vision_context:
+                deadline = min(deadline, datetime.fromtimestamp(session.gaze_setup['deadline'], dt_timezone.utc))
             job = FrameJob.objects.create(session=session, generation=generation, sequence=sequence,
                 admission_number=session.admitted_count, capture_ts=capture_ts, received_at=received_at or now,
-                expires_at=min(now, received_at or now) + seconds('INTERVIEW_ANALYSIS_FRAME_DEADLINE_SECONDS'))
+                expires_at=deadline, vision_context=vision_context)
             if retain_payload is not None:
                 # Executed under gate/parent locks. Failure rolls back replacement and counters.
                 retain_payload(job, pending)
@@ -292,7 +308,29 @@ def admit_frame(lease, generation, sequence, capture_ts, *, retain_payload=None,
             return job, None
 
 
-def record_frame_drop(lease, generation, sequence, *, validated=False):
+def _count_drop_reason(session, reason):
+    if settings.INTERVIEW_ANALYSIS_CAMERA_DIAGNOSTICS_ENABLED and reason in FRAME_DROP_REASONS:
+        reasons = session.frame_drop_reasons
+        reasons[reason] = reasons.get(reason, 0) + 1
+        return True
+    return False
+
+
+def _record_drop_locked(session, sequence, reason, *, validated=False):
+    session.last_sequence = sequence
+    session.received_count += 1
+    session.dropped_count += 1
+    fields = ['last_sequence', 'received_count', 'dropped_count']
+    if _count_drop_reason(session, reason):
+        fields.append('frame_drop_reasons')
+    if validated and reason != 'stale':
+        session.last_frame_at = timezone.now()
+        fields.append('last_frame_at')
+    session.save(update_fields=fields)
+    touch_analysis_locked(session)
+
+
+def record_frame_drop(lease, generation, sequence, *, validated=False, reason=None):
     """Count transport/availability drops once, without creating a pending job."""
     if type(sequence) is not int or not 0 <= sequence <= 9007199254740991:
         raise SocketAuthorizationError('invalid_sequence', 400)
@@ -301,15 +339,7 @@ def record_frame_drop(lease, generation, sequence, *, validated=False):
         require_open(session, timezone.now())
         if session.last_sequence is not None and sequence <= session.last_sequence:
             return False  # B4 may already have counted this admission attempt.
-        session.last_sequence = sequence
-        session.received_count += 1
-        session.dropped_count += 1
-        fields = ['last_sequence', 'received_count', 'dropped_count']
-        if validated:
-            session.last_frame_at = timezone.now()
-            fields.append('last_frame_at')
-        session.save(update_fields=fields)
-        touch_analysis_locked(session)
+        _record_drop_locked(session, sequence, reason, validated=validated)
         return True
 
 
@@ -372,7 +402,7 @@ def _validate_observation(result, versions):
 def settle_frame(job_id, claim_token, outcome, *, result=None, versions=None, reason='worker_failed'):
     if outcome not in ('processed', 'failed', 'expired'):
         raise ValueError('Invalid terminal outcome.')
-    if reason not in ('worker_failed', 'inference_failed', 'payload_missing', 'deadline_expired'):
+    if reason not in ('worker_failed', 'inference_failed', 'payload_missing', 'deadline_expired', 'calibration_cancelled'):
         raise ValueError('Invalid terminal reason.')
     if outcome == 'processed':
         _validate_observation(result, versions or {})
@@ -385,7 +415,10 @@ def settle_frame(job_id, claim_token, outcome, *, result=None, versions=None, re
                 or job.claim_expires_at <= now or job.expires_at <= now):
             return False
         if outcome == 'processed':
-            FrameAnalysis.objects.create(job=job, session=session, ts=job.received_at, **result, **versions)
+            if 'attempt' in job.vision_context or 'passive_attempt' in job.vision_context:
+                vision_calibration.collect_locked(session, job, result, now)
+            if 'attempt' not in job.vision_context:
+                FrameAnalysis.objects.create(job=job, session=session, ts=job.received_at, **result, **versions)
         job.state = outcome; job.terminal_at = now
         job.terminal_reason = '' if outcome == 'processed' else reason
         job.save()
@@ -447,6 +480,7 @@ def recover_video_session(session_id):
         now = timezone.now()
         session.recovery_due_at = now + seconds('INTERVIEW_ANALYSIS_VIDEO_RECOVERY_SECONDS')
         session.save(update_fields=['recovery_due_at'])
+        vision_calibration.expire_locked(session, now)
         expired = session.frame_jobs.filter(state__in=ACTIVE_JOBS, expires_at__lte=now).update(
             state='expired', terminal_at=now, terminal_reason='deadline_expired')
         if expired:

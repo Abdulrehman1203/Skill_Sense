@@ -33,6 +33,8 @@ ENV/
 # ── Database ─────────────────────────────────────────────────
 db.sqlite3
 *.sqlite3
+test_backend_test_*
+
 
 # ── Django collected static & media uploads ──────────────────
 staticfiles/

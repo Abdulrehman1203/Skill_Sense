@@ -13,6 +13,17 @@ def accept_live_transcript(call):
     if not isinstance(call, dict) or not isinstance(call.get("call_id"), str):
         raise ValidationError("Invalid transcript call.")
     turns = call.get("transcript_object")
+    if turns is None:
+        # Current transcript_updated deliveries can supply the documented
+        # tool-inclusive stream before the final transcript_object exists.
+        # Only signed conversational turns participate in captions/consent;
+        # tool invocations/results are never candidate speech.
+        trace = call.get("transcript_with_tool_calls")
+        if not isinstance(trace, list) or len(trace) > 10000:
+            raise ValidationError("Invalid transcript.")
+        turns = [turn for turn in trace if isinstance(turn, dict)
+                 and turn.get('role') in ('agent', 'user')]
+        call = {**call, 'transcript_object': turns}
     if not isinstance(turns, list) or len(turns) > 10000:
         raise ValidationError("Invalid transcript.")
     row = InterviewConversation.objects.select_related("interview").filter(

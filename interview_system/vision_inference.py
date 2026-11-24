@@ -91,13 +91,14 @@ def close_runtime(**kwargs):
         _owner = None
 
 
-def analyze_jpeg(data, *, calibration=None):
+def analyze_jpeg(data, *, calibration=None, strict_gaze=False):
     runtime = ensure_warm()
     from ai.vision.types import Calibration
     from ai.vision.rules import RuleConfig
     baseline = Calibration.from_dict(calibration)
     try:
-        observation = runtime.analyze(data, baseline)
+        observation = (runtime.analyze(data, baseline, strict_gaze=True) if strict_gaze
+                       else runtime.analyze(data, baseline))
     except Exception:
         close_runtime()
         raise
@@ -107,4 +108,6 @@ def analyze_jpeg(data, *, calibration=None):
             'vision_details': observation.details(calibration=baseline, config_version=runtime.config.version,
                                                    face_limit=runtime.config.max_faces)}, {
                 'pipeline_version': 'vision-v1', 'model_version': runtime.model_version,
-                'rules_version': RuleConfig().version}
+                # Observation schema is unchanged. Old aggregators still read
+                # observations from new workers during a rolling deploy.
+                'rules_version': RuleConfig().legacy_version}

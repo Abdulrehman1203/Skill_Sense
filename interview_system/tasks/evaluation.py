@@ -1,4 +1,5 @@
 """Durable leased evaluation and bounded transcript enrichment recovery."""
+import logging
 import uuid
 from datetime import timedelta
 
@@ -7,10 +8,41 @@ from django.db import transaction
 from django.db.models import Q
 from django.utils import timezone
 
-from ..answer_evaluation import (InvalidEvaluation, dispatch_evaluation, evaluation_input,
-                                prepare_evaluation_locked, validate_evaluation)
-from ..models import AnswerEvaluation, Interview, InterviewEvaluation, TranscriptPreparation
+from ..answer_evaluation import (InvalidEvaluation, dispatch_evaluation, evaluation_input, fallback_evaluation_locked,
+                                prepare_evaluation_locked, uses_grading_fallback, validate_evaluation)
+from ..integrations.gemini_client import EvaluationProviderError, GradingBatchPending, has_grading_backup_key
+from ..models import AnswerEvaluation, Application, Interview, InterviewEvaluation, TranscriptPreparation
 from .guards import skip_missing_resource
+
+logger = logging.getLogger(__name__)
+
+
+class EvaluationClaimLost(Exception):
+    pass
+
+
+def checkpoint_answer(evaluation_id, token, question_id, result):
+    with transaction.atomic():
+        row = InterviewEvaluation.objects.select_for_update().get(pk=evaluation_id)
+        if row.claim_token != token or row.status != 'PROCESSING' or row.lease_until <= timezone.now():
+            raise EvaluationClaimLost
+        answers = {**row.grading_progress.get('answers', row.grading_progress), question_id: result}
+        row.grading_progress = {'answers': answers, 'last_progress_attempt': row.attempts}
+        row.save(update_fields=['grading_progress'])
+
+
+def finalize_locked(interview, row, *, replaced_by_fallback=False):
+    from ..evaluation_lifecycle import terminal_locked
+    from ..final_scoring import ensure_locked
+
+    if replaced_by_fallback or interview.evaluations.filter(revision__gt=row.revision).exists():
+        terminal_locked(interview, row, notify=not replaced_by_fallback)
+        return
+    interview.evaluation_status = 'READY' if row.status == 'READY' and row.coverage == 1 else (
+        'FAILED' if row.status == 'FAILED' else 'UNAVAILABLE')
+    interview.save(update_fields=['evaluation_status', 'updated_at'])
+    terminal_locked(interview, row)
+    ensure_locked(Application.objects.select_for_update().get(pk=interview.application_id))
 
 
 @shared_task(ignore_result=True, acks_late=True, soft_time_limit=65, time_limit=75)
@@ -25,16 +57,12 @@ def evaluate_interview(evaluation_id):
             return
         if row.lease_until and row.lease_until > timezone.now():
             return
-        if row.attempts >= 4:
+        if row.attempts - row.grading_progress.get('last_progress_attempt', 0) >= 4:
             # A hard-killed final attempt must also have a terminal state.
             row.status, row.error_code = 'FAILED', 'ATTEMPTS_EXHAUSTED'
             row.claim_token = row.lease_until = None
             row.save()
-            from ..evaluation_lifecycle import terminal_locked
-            terminal_locked(interview, row)
-            if not interview.evaluations.filter(revision__gt=row.revision).exists():
-                interview.evaluation_status = 'FAILED'
-                interview.save(update_fields=['evaluation_status', 'updated_at'])
+            finalize_locked(interview, row)
             return
         row.claim_token, row.lease_until = token, timezone.now() + timedelta(seconds=120)
         row.status, row.attempts = 'PROCESSING', row.attempts + 1
@@ -56,7 +84,11 @@ def evaluate_interview(evaluation_id):
                 AnswerExtraction.objects.get_or_create(evaluation=current, defaults={
                     'input_hash': digest({k: v for k, v in inputs.items() if k != 'alignment'}),
                     'content_hash': digest(inputs['alignment']), 'content': inputs['alignment']})
-        output = evaluate_answers(inputs, model_name=row.model_name)
+        credentials = {'use_fallback_key': True} if uses_grading_fallback(row) and has_grading_backup_key() else {}
+        output = evaluate_answers(inputs, model_name=row.model_name,
+            completed=row.grading_progress.get('answers', row.grading_progress),
+            checkpoint=lambda question_id, result: checkpoint_answer(row.pk, token, question_id, result),
+            **credentials)
         extraction = None
         if row.prompt_version == 'answers-v2':
             from ..answer_extraction import extract
@@ -95,16 +127,11 @@ def evaluate_interview(evaluation_id):
             current.error_code = '' if score is not None else 'MISSING_ANSWER_EVIDENCE'
             current.published_at = timezone.now()
             current.claim_token = current.lease_until = None
+            current.grading_progress = {}
             current.save()
-            from ..evaluation_lifecycle import terminal_locked
-            terminal_locked(interview, current)
-            if not interview.evaluations.filter(revision__gt=current.revision).exists():
-                interview.evaluation_status = 'READY' if coverage == 1 else 'UNAVAILABLE'
-                interview.save(update_fields=['evaluation_status', 'updated_at'])
-                from ..final_scoring import ensure_locked
-                from ..models import Application
-                app = Application.objects.select_for_update().get(pk=interview.application_id)
-                ensure_locked(app)
+            finalize_locked(interview, current)
+    except EvaluationClaimLost:
+        return
     except Exception as exc:
         # Never persist provider exception text, prompts or candidate content in error logs.
         with transaction.atomic():
@@ -112,24 +139,45 @@ def evaluate_interview(evaluation_id):
             current = InterviewEvaluation.objects.select_for_update().get(pk=row.pk)
             if current.claim_token != token:
                 return
-            current.status = 'FAILED' if current.attempts >= 4 else 'QUEUED'
             # Persist only closed-vocabulary diagnostics, never provider text.
             codes = {'INVALID_EVALUATION_OUTPUT', 'INVALID_EVIDENCE_QUOTE',
                 'INVALID_CRITERION_IDS', 'INVALID_QUESTION_ATTRIBUTION',
                 'INVALID_CRITERION_SCORE', 'INVALID_ANSWER_ATTRIBUTION',
                 'INVALID_ALIGNMENT', 'INVALID_ALIGNMENT_REFERENCE',
                 'EVIDENCE_HASH_MISMATCH', 'CONTINUATION_HASH_MISMATCH',
-                'EXTRACTION_HASH_MISMATCH', 'INVALID_EVALUATION_JSON', 'EVALUATION_INPUT_TOO_LARGE'}
-            current.error_code = (str(exc) if str(exc) in codes else 'INVALID_OUTPUT') if isinstance(exc, InvalidEvaluation) else 'PROVIDER_UNAVAILABLE'
+                'EXTRACTION_HASH_MISMATCH', 'INVALID_EVALUATION_JSON', 'EVALUATION_INPUT_TOO_LARGE',
+                'EVALUATION_PROVIDER_EMPTY_RESPONSE'}
+            failed_attempts = current.attempts - current.grading_progress.get('last_progress_attempt', 0)
+            terminal = failed_attempts >= 4
+            replaced_by_fallback = False
+            if isinstance(exc, GradingBatchPending):
+                current.error_code = ''
+            elif isinstance(exc, EvaluationProviderError):
+                current.error_code = exc.code
+                terminal = terminal or not exc.transient
+                if exc.transient:
+                    current.provider_failures += 1
+                    from ..integrations.groq_client import configured as groq_configured
+                    if terminal or ((has_grading_backup_key() or groq_configured()) and current.provider_failures >= 2):
+                        replaced_by_fallback = fallback_evaluation_locked(interview, current) is not None
+                        terminal = terminal or replaced_by_fallback
+            elif isinstance(exc, InvalidEvaluation):
+                current.error_code = str(exc) if str(exc) in codes else 'INVALID_OUTPUT'
+                terminal = terminal or current.error_code in {
+                    'EVIDENCE_HASH_MISMATCH', 'CONTINUATION_HASH_MISMATCH',
+                    'EXTRACTION_HASH_MISMATCH', 'EVALUATION_INPUT_TOO_LARGE'}
+            elif isinstance(exc, TimeoutError):
+                current.error_code = 'PROVIDER_UNAVAILABLE'
+            else:
+                current.error_code = 'EVALUATION_INTERNAL_ERROR'
+                logger.error('Evaluation failed evaluation_id=%s type=%s', row.pk, type(exc).__name__)
+            current.status = 'FAILED' if terminal else 'QUEUED'
             current.claim_token = current.lease_until = None
-            current.next_attempt_at = timezone.now() + timedelta(seconds=15 * 2 ** current.attempts)
+            delay = 0 if isinstance(exc, GradingBatchPending) else 15 * 2 ** min(4, max(1, failed_attempts))
+            current.next_attempt_at = timezone.now() + timedelta(seconds=delay)
             current.save()
-            if current.status == 'FAILED' and not interview.evaluations.filter(revision__gt=current.revision).exists():
-                interview.evaluation_status = 'FAILED'
-                interview.save(update_fields=['evaluation_status', 'updated_at'])
-            if current.status == 'FAILED':
-                from ..evaluation_lifecycle import terminal_locked
-                terminal_locked(interview, current)
+            if terminal:
+                finalize_locked(interview, current, replaced_by_fallback=replaced_by_fallback)
 
 
 @shared_task(ignore_result=True)

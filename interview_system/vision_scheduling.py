@@ -1,6 +1,8 @@
 """Durable dispatch outside ASGI. B2 parent/session/job lock order throughout."""
 from datetime import timedelta
+from typing import cast
 import uuid
+from celery import Task
 from django.conf import settings
 from django.utils import timezone
 from redis.exceptions import RedisError
@@ -8,7 +10,7 @@ from .models import FrameJob
 from .video_lifecycle import (TERMINAL_JOBS, claim_frame, drain_locked,
                               locked_job, locked_session, settle_frame, touch_analysis_locked)
 from .vision_payloads import PayloadStore
-from . import vision_inference
+from . import vision_calibration, vision_inference
 
 
 def terminal_locked(session, job, state, reason):
@@ -23,10 +25,10 @@ def terminal_locked(session, job, state, reason):
 def dispatch_session(session_id):
     with locked_session(session_id) as (_, session):
         now = timezone.now()
-        job = session.frame_jobs.select_for_update().filter(state='processing').first()
-        if job and job.claim_expires_at > now:
+        job = FrameJob.objects.select_for_update().filter(session=session, state='processing').first()
+        if job and job.claim_expires_at is not None and job.claim_expires_at > now:
             return False
-        job = job or session.frame_jobs.select_for_update().filter(state='pending').first()
+        job = job or FrameJob.objects.select_for_update().filter(session=session, state='pending').first()
         if job is None or not job.payload_ready:
             return False
         if job.expires_at <= now:
@@ -48,9 +50,10 @@ def dispatch_session(session_id):
         job_id, token, deadline = str(job.pk), str(job.publication_token), job.expires_at
     try:
         from .tasks.vision import process_frame
-        if settings.CELERY_TASK_ALWAYS_EAGER or process_frame.app.conf.task_always_eager:
+        task = cast(Task, process_frame)
+        if settings.CELERY_TASK_ALWAYS_EAGER or task.app.conf.task_always_eager:
             return False  # Never execute vision inline in a recovery/control process.
-        process_frame.apply_async(args=[job_id, token], queue=settings.INTERVIEW_ANALYSIS_VISION_QUEUE,
+        task.apply_async(args=[job_id, token], queue=settings.INTERVIEW_ANALYSIS_VISION_QUEUE,
             routing_key=settings.INTERVIEW_ANALYSIS_VISION_QUEUE, priority=0, expires=deadline,
             retry=False, ignore_result=True)
         return True
@@ -74,17 +77,26 @@ def execute_frame(job_id, publication_token):
         return
     store = PayloadStore()
     try:
-        data = store.get(job_id)
-        if data is None:
+        sample = 'attempt' in job.vision_context
+        skip_sample = sample and not vision_calibration.active_attempt(session, job, timezone.now())
+        data = None if skip_sample else store.get(job_id)
+        if skip_sample:
+            settle_frame(job_id, token, 'expired', reason='calibration_cancelled')
+        elif data is None:
             settle_frame(job_id, token, 'failed', reason='payload_missing')
         else:
-            result, versions = (vision_inference.analyze_jpeg(data, calibration=session.vision_calibration)
-                                if session.vision_calibration else vision_inference.analyze_jpeg(data))
+            baseline = (job.vision_context.get('baseline') if job.vision_context
+                        else session.vision_calibration if not session.gaze_setup else None)
+            kwargs = {'calibration': baseline} if baseline else {}
+            if sample or 'passive_attempt' in job.vision_context or 'calibration_id' in job.vision_context:
+                kwargs['strict_gaze'] = True
+            result, versions = vision_inference.analyze_jpeg(data, **kwargs)
             settle_frame(job_id, token, 'processed', result=result, versions=versions)
     except (RedisError, vision_inference.TransientInferenceError):
         with locked_job(job_id) as (_, session, current):
             if (current.state == 'processing' and current.claim_token == token
                     and current.publication_token == publication_token
+                    and current.claim_expires_at is not None
                     and current.claim_expires_at > timezone.now() and current.expires_at > timezone.now()):
                 if current.attempts >= settings.INTERVIEW_ANALYSIS_WORKER_ATTEMPTS:
                     terminal_locked(session, current, 'failed', 'worker_failed')
@@ -103,7 +115,7 @@ def execute_frame(job_id, publication_token):
         except RedisError:
             pass
         store.close()
-    dispatch_session(job.session_id)  # Scanner supplies liveness if this fails.
+    dispatch_session(session.pk)  # Scanner supplies liveness if this fails.
 
 
 def recover_frames(session_id):

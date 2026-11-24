@@ -13,11 +13,12 @@ from .vision_payloads import PayloadCapacity, PayloadStore
 class AdmissionDecision:
     status: str
     reason: str | None = None
+    diagnostic_reason: str | None = None
 
 
-def submit_sync(*, lease, generation, sequence, capture_ts, received_at, jpeg):
+def submit_sync(*, lease, generation, sequence, capture_ts, received_at, jpeg, calibration_sample=False):
     if not settings.INTERVIEW_ANALYSIS_VISION_ENABLED:
-        return AdmissionDecision('dropped', 'capacity')
+        return AdmissionDecision('dropped', 'capacity', 'vision_disabled')
     store = PayloadStore()
     def cleanup(job_id):
         try:
@@ -31,13 +32,16 @@ def submit_sync(*, lease, generation, sequence, capture_ts, received_at, jpeg):
     try:
         from .vision_inference import worker_ready
         if not worker_ready():
-            return AdmissionDecision('dropped', 'capacity')
+            return AdmissionDecision('dropped', 'capacity', 'worker_unready')
         with db_budget():
             job, reason = admit_frame(lease, generation, sequence, capture_ts,
-                                     retain_payload=retain, received_at=received_at)
+                                     retain_payload=retain, received_at=received_at,
+                                     calibration_sample=calibration_sample, frame_size=[jpeg.width, jpeg.height])
         return AdmissionDecision('accepted' if job else 'dropped', reason)
-    except (PayloadCapacity, RedisError):
-        return AdmissionDecision('dropped', 'capacity')
+    except PayloadCapacity:
+        return AdmissionDecision('dropped', 'capacity', 'payload_capacity')
+    except RedisError:
+        return AdmissionDecision('dropped', 'capacity', 'payload_redis_unavailable')
     finally:
         store.close()
 

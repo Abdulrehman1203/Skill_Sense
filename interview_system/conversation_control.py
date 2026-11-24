@@ -6,8 +6,10 @@ be installed on the configured agent; the durable stop job owns normal hang-up.
 import hashlib
 import json
 import re
+from collections import deque
 from datetime import timedelta
 from difflib import SequenceMatcher
+from itertools import chain
 
 from django.db import transaction
 from django.utils import timezone
@@ -94,7 +96,8 @@ def reply(row, message='Wait silently for the candidate.', *, speech_action='WAI
     question = row.questions[row.cursor] if row.cursor < len(row.questions) else None
     speak_text = ''
     if question and speech_action in ('ASK_QUESTION', 'REPEAT_QUESTION'):
-        speak_text = question['text']
+        # Use the same ordinal as the room, including on continuation calls.
+        speak_text = f"Question {row.cursor + 1}. {question['text']}"
     elif speech_action == 'ASK_FINISH':
         speak_text = FINISH_SPEECH
     elif speech_action == 'FAREWELL':
@@ -106,7 +109,7 @@ def reply(row, message='Wait silently for the candidate.', *, speech_action='WAI
 
 def _near_question(wording, spoken):
     expected, heard = wording.split(), spoken.split()
-    if not 8 <= len(expected) <= 200 or not 6 <= len(heard) <= 400:
+    if not 4 <= len(expected) <= 200 or not 3 <= len(heard) <= 400:
         return False
     matcher = SequenceMatcher(None, expected, heard, autojunk=False)
     blocks = matcher.get_matching_blocks()[:-1]
@@ -137,38 +140,54 @@ def question_segment(turns, questions, cursor, after_index, allow_variation, *, 
     other_questions = {clean(q['text']) for i, q in enumerate(questions) if i != cursor} - {wording, ''}
     anchor_start = None
     users = []
-    agent_fragments = []
-    for index in range(after_index + 1, len(turns)):
-        turn = turns[index]
+    agent_words = deque(maxlen=400)
+    for index, turn in enumerate(chain(turns[after_index + 1:], (None,)), after_index + 1):
         if not isinstance(turn, dict):
-            continue
+            if index < len(turns):
+                continue
+            turn = {}  # Evaluate a final agent turn even if nobody answered yet.
         text = turn.get('content', '')
         if not isinstance(text, str):
             continue
-        if turn.get('role') == 'agent':
-            spoken = clean(text)
-            agent_fragments = [*agent_fragments[-2:], (index, spoken)]
-            window = ' '.join(fragment for _, fragment in agent_fragments)
-            other = any(q and q in window for q in other_questions)
-            if allow_variation and wording not in window and not other:
-                other = any(_near_question(q, window) for q in other_questions)
-            if other:
+        role = turn.get('role')
+        if role == 'agent':
+            agent_words.extend((index, word) for word in clean(text).split())
+            if allow_variation:
+                continue
+        elif role != 'user' and index < len(turns):
+            continue
+        if agent_words:
+            speech = ' '.join(word for _, word in agent_words)
+            match, start = _spoken_question(speech, wording, other_questions, allow_variation)
+            if match == wording and not users:
+                anchor_start = agent_words[start][0]
+                if first_anchor:
+                    return anchor_start, []
+            elif match and match != wording:
                 anchor_start = None
                 users.clear()
-                agent_fragments.clear()
-            elif wording in spoken or (
-                allow_variation and (wording in window or _near_question(wording, window))
-            ):
-                if not users:
-                    anchor_start = index if wording in spoken else agent_fragments[0][0]
-                    if first_anchor:
-                        return anchor_start, []
-                agent_fragments.clear()
-        elif turn.get('role') == 'user':
-            agent_fragments.clear()
-            if anchor_start is not None and clean(text):
-                users.append((index, text))
+            agent_words.clear()
+        if role == 'user' and anchor_start is not None and clean(text):
+            users.append((index, text))
     return anchor_start, users
+
+
+def _spoken_question(speech, wording, other_questions, allow_variation):
+    padded = f' {speech} '
+    exact = []
+    for question in (wording, *other_questions):
+        start = padded.rfind(f' {question} ')
+        if start >= 0:
+            exact.append((start + len(question), len(question), start, question))
+    if exact:
+        _, _, start, question = max(exact)
+        return question, len(speech[:start].split())
+    if allow_variation:
+        if other := next((q for q in other_questions if _near_question(q, speech)), None):
+            return other, 0
+        if _near_question(wording, speech):
+            return wording, 0
+    return None, 0
 
 
 def is_clarification(text):
@@ -177,9 +196,18 @@ def is_clarification(text):
         PAUSE_REQUEST.fullmatch(value)
         or RESUME_REQUEST.fullmatch(value)
         or explicit_repeat(text)
-        or any(phrase in value for phrase in ('cannot hear', 'can t hear', 'didn t hear', 'did not hear'))
+        or re.fullmatch(
+            r'(?:sorry )?i (?:cannot|can t|didn t|did not) hear(?: you| it| that| the question)?(?: clearly)?',
+            value,
+        )
+        or re.fullmatch(r'(?:hello |hi )?(?:can|could) you hear me(?: now)?', value)
+        or re.fullmatch(
+            r'(?:so )?(?:(?:you re|are you) (?:speaking of|asking|on)|'
+            r'(?:is|was) (?:it|that|this)) question [a-z0-9]+(?: or (?:question )?[a-z0-9]+)?',
+            value,
+        )
         or value in {
-            '', 'yes', 'no', 'okay', 'ok', 'sorry', 'pardon', 'silence', 'cough', 'coughing',
+            '', 'hello', 'hi', 'yes', 'no', 'okay', 'ok', 'sorry', 'pardon', 'silence', 'cough', 'coughing',
             'noise', 'background noise', 'unintelligible', 'unintelligible audio', 'inaudible', 'inaudible audio',
         }
     )
@@ -265,6 +293,53 @@ def timed_out_answer(call):
             if args and args.get('action') in ('answer', 'skip'):
                 return args
             return None
+    return None
+
+
+def acknowledged_prompt_recovery(row, call):
+    """Recover a committed prompt that Retell acknowledged but never spoke.
+
+    This never accepts another answer. Match the prior answer hash, successful
+    signed tool result and expected next prompt; recover_prompt fences playback.
+    """
+    if not row.cursor or row.paused or row.end_kind:
+        return None
+    previous_id = row.questions[row.cursor - 1]['id']
+    previous = row.progress[previous_id]
+    turns, trace = call.get('transcript_object'), call.get('transcript_with_tool_calls')
+    index = previous.get('turn_index', -1)
+    if (previous.get('source_interview') or previous.get('delivery_recovered')
+            or not isinstance(turns, list) or not 0 <= index < len(turns) <= 10000
+            or not isinstance(trace, list) or len(trace) > 10000):
+        return None
+    users = [(n, t['content']) for n, t in enumerate(turns[:index + 1])
+             if isinstance(t, dict) and t.get('role') == 'user' and isinstance(t.get('content'), str)]
+    if not any(hashlib.sha256(text.strip().encode()).hexdigest() == previous.get('evidence_hash')
+               for _, text in candidate_quotes(users, combine=True)):
+        return None
+    invocations = {t.get('tool_call_id'): t for t in trace if isinstance(t, dict)
+                   and t.get('role') == 'tool_call_invocation' and isinstance(t.get('tool_call_id'), str)}
+    expected = 'ASK_QUESTION' if row.cursor < len(row.questions) else 'ASK_FINISH'
+    for result in reversed(trace):
+        if not isinstance(result, dict) or result.get('role') != 'tool_call_result' or result.get('successful') is not True:
+            continue
+        invocation = invocations.get(result.get('tool_call_id'), {})
+        args = invocation.get('arguments')
+        try:
+            args = json.loads(args) if isinstance(args, str) else args
+            reply_data = json.loads(result.get('content', ''))
+        except (TypeError, ValueError):
+            continue
+        args = tool_arguments(invocation.get('name'), args)
+        if (not args or args.get('question_id') != previous_id
+                or args.get('action') not in ('answer', 'skip')
+                or not isinstance(reply_data, dict) or reply_data.get('speech_action') != expected):
+            continue
+        target = reply_data.get('current_question')
+        if ((expected == 'ASK_QUESTION' and isinstance(target, dict)
+                and target.get('id') == row.questions[row.cursor]['id'])
+                or (expected == 'ASK_FINISH' and target is None)):
+            return args
     return None
 
 
@@ -426,9 +501,13 @@ def control(payload):
     if recovery:
         args = timed_out_answer(call)
         if not args:
-            return reply(row, 'There is no timed-out answer to recover. Wait silently.')
+            args = acknowledged_prompt_recovery(row, call)
+            if not args or not recover_prompt(row, call, args):
+                return reply(row, 'There is no unspoken prompt to recover. Wait silently.')
+            recovered_prompt = True
         action = args['action']
-        recovered_prompt = recover_prompt(row, call, args)
+        if not recovered_prompt:
+            recovered_prompt = recover_prompt(row, call, args)
     if action == 'stop_early':
         explicit = STOP_REQUEST.fullmatch(clean(last_user(call)))
         if not explicit:
@@ -466,7 +545,7 @@ def control(payload):
             if matched and explicit_repeat(matched[1]) and matched[0] > progress.get('repeat_turn_index', -1):
                 progress['repeat_turn_index'] = matched[0]
                 speech_action = 'REPEAT_QUESTION'
-                message = 'Repeat the current question verbatim once, then wait silently.'
+                message = 'Say speak_text verbatim once, then wait silently.'
     elif action in ('answer', 'skip') and not recovered_prompt:
         if row.paused or row.cursor >= len(row.questions):
             message = 'Do not advance while paused or after the final question. Read the current state.'
@@ -495,7 +574,7 @@ def control(payload):
             if recovered_prompt or progress['status'] == 'NOT_ASKED':
                 progress['status'] = 'AWAITING_ANSWER'
                 speech_action = 'ASK_QUESTION'
-                message = 'Ask the current question verbatim once, then wait silently.'
+                message = 'Say speak_text verbatim once, then wait silently.'
         else:
             progress = row.progress[row.questions[-1]['id']]
             if recovered_prompt or not progress.get('finish_prompt_issued'):

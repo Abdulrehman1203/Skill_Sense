@@ -34,13 +34,20 @@ class InvalidChunk(ValueError):
 
 
 def configured():
-    return all((settings.REPLAY_R2_ENDPOINT, settings.REPLAY_R2_BUCKET,
-                settings.REPLAY_R2_ACCESS_KEY, settings.REPLAY_R2_SECRET_KEY))
+    if not all((settings.REPLAY_R2_ENDPOINT, settings.REPLAY_R2_BUCKET,
+                settings.REPLAY_R2_ACCESS_KEY, settings.REPLAY_R2_SECRET_KEY)):
+        return False
+    try:
+        endpoint = urlsplit(settings.REPLAY_R2_ENDPOINT)
+        return bool(endpoint.scheme == 'https' and endpoint.hostname and endpoint.port in (None, 443)
+                    and not endpoint.username and not endpoint.password and endpoint.path in ('', '/')
+                    and not endpoint.query and not endpoint.fragment)
+    except ValueError:
+        return False
 
 
 def client():
-    endpoint = urlsplit(settings.REPLAY_R2_ENDPOINT)
-    if not configured() or endpoint.scheme != 'https' or not endpoint.hostname:
+    if not configured():
         raise ValueError('Private replay storage is not configured.')
     return boto3.client(
         's3', endpoint_url=settings.REPLAY_R2_ENDPOINT, region_name='auto',

@@ -31,6 +31,7 @@ class TicketErrorSerializer(serializers.Serializer):
     error = serializers.ChoiceField(choices=[
         'invalid_request', 'authentication_failed', 'credential_invalid', 'credential_expired',
         'access_denied', 'account_inactive', 'video_not_enabled', 'session_not_publishable',
+        'monitor_unavailable', 'relay_unavailable',
         'ticket_limit', 'authorization_unavailable', 'method_not_allowed', 'not_acceptable',
         'unsupported_media_type', 'request_failed',
     ])
@@ -50,7 +51,8 @@ class SocketTicketView(APIView):
     def handle_exception(self, exc):
         # Stable errors, including authentication/parser/permission failures; no reflected secrets.
         if isinstance(exc, SocketAuthorizationError):
-            return Response({'error': exc.reason}, status=exc.status)
+            headers = {'Retry-After': str(exc.retry_after)} if exc.retry_after is not None else None
+            return Response({'error': exc.reason}, status=exc.status, headers=headers)
         if isinstance(exc, DatabaseError):
             return Response({'error': 'authorization_unavailable'}, status=503)
         response = super().handle_exception(exc)

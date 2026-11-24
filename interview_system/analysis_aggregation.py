@@ -1,12 +1,13 @@
 """B6 CPU-only fold of the admitted ledger. No model/runtime initialization."""
-from collections import deque
-from datetime import timezone as dt_timezone
+from collections import Counter, deque
+from datetime import datetime, timezone as dt_timezone
 import uuid
+from django.conf import settings
 from django.utils import timezone
 
 from ai.vision.rules import RuleConfig, evaluate
 from .models import FrameJob
-from .video_lifecycle import _validate_observation
+from .video_lifecycle import FRAME_DROP_REASONS, _validate_observation
 
 
 def iso(value):
@@ -38,15 +39,37 @@ def observation_projection(frame, result):
 
 def calculate(session, base_coverage):
     config = RuleConfig()
+    supported_rules = (config.version, config.legacy_version)
     coverage = {**base_coverage, 'valid_gaze': 0, 'unknown_gaze': 0,
                 'usable_frames': 0, 'unusable_frames': 0, 'unsupported_frames': 0}
     versions = {name: set() for name in ('pipeline_version', 'model_version', 'rules_version', 'config_version')}
     recent = deque(maxlen=20)
     known = {'gaze': 0., 'objects': 0., 'face': 0.}
+    continuous = dict.fromkeys(known, 0.)
+    longest = dict.fromkeys(known, 0.)
     centered = 0.
+    calibration_frames = 0
     previous = None
     rows_seen = 0
     versions_truncated = False
+    diagnostics_enabled = settings.INTERVIEW_ANALYSIS_CAMERA_DIAGNOSTICS_ENABLED
+    window_end = session.admission_sealed_at or timezone.now()
+    last_covered = (session.video_activated_at or session.started_at or window_end).timestamp()
+    gap_count, gap_seconds, latest_gap = 0, 0., None
+    latest_processed, latest_usable = None, None
+    terminal_reasons = Counter()
+    signal_samples = dict(phone_detected=0, phone_at_entry_confidence=0, no_face=0)
+
+    def record_gap(end):
+        nonlocal gap_count, gap_seconds, latest_gap
+        duration = end - last_covered
+        if duration > config.max_gap:
+            gap_count += 1
+            gap_seconds += duration
+            latest_gap = {
+                'start': iso(datetime.fromtimestamp(last_covered, dt_timezone.utc)),
+                'end': iso(datetime.fromtimestamp(end, dt_timezone.utc)),
+            }
 
     def remember(name, value):
         nonlocal versions_truncated
@@ -58,7 +81,7 @@ def calculate(session, base_coverage):
             versions_truncated = True
 
     def samples():
-        nonlocal previous, centered, rows_seen, versions_truncated
+        nonlocal previous, centered, rows_seen, last_covered, latest_processed, latest_usable, calibration_frames
         jobs = FrameJob.objects.filter(session=session).select_related('observation').order_by('admission_number')
         for job in jobs.iterator(chunk_size=200):
             rows_seen += 1
@@ -67,7 +90,12 @@ def calculate(session, base_coverage):
             timestamp = job.received_at.timestamp()
             result, frame = {'vision_details': None}, getattr(job, 'observation', None)
             valid = False
-            if job.state == 'processed':
+            if 'attempt' in job.vision_context:
+                calibration_frames += 1
+                coverage['unknown_gaze'] += job.state == 'processed'
+            elif job.state == 'processed':
+                if diagnostics_enabled and (latest_processed is None or job.terminal_at > latest_processed):
+                    latest_processed = job.terminal_at
                 if frame is not None:
                     result = {'gaze_direction': frame.gaze_direction, 'face_count': frame.face_count,
                               'detected_objects': frame.detected_objects, 'vision_details': frame.vision_details}
@@ -77,7 +105,8 @@ def calculate(session, base_coverage):
                     if isinstance(frame.vision_details, dict):
                         remember('config_version', frame.vision_details.get('config_version'))
                     try:
-                        if provenance['pipeline_version'] != 'vision-v1' or provenance['rules_version'] != config.version:
+                        if (provenance['pipeline_version'] != 'vision-v1'
+                                or provenance['rules_version'] not in supported_rules):
                             raise ValueError('Unsupported evidence provenance.')
                         _validate_observation(result, provenance)
                         valid = True
@@ -94,23 +123,66 @@ def calculate(session, base_coverage):
                     coverage['valid_gaze'] += 1
                 else:
                     coverage['unknown_gaze'] += 1
+            elif diagnostics_enabled and job.state in ('failed', 'expired'):
+                reason = job.terminal_reason
+                if reason not in ('payload_missing', 'publication_failed', 'inference_failed',
+                                  'worker_failed', 'deadline_expired'):
+                    reason = 'unknown'
+                terminal_reasons[reason] += 1
             details = result.get('vision_details')
             usable = bool(details and details['quality']['usable'])
+            if diagnostics_enabled and usable:
+                latest_usable = job.received_at
+                signal_samples['no_face'] += (details['face_count'] == 0)
+                phone_confidence = max((item['confidence'] for item in result['detected_objects']
+                                        if item['label'] == 'phone'), default=None)
+                if phone_confidence is not None:
+                    signal_samples['phone_detected'] += 1
+                    signal_samples['phone_at_entry_confidence'] += (phone_confidence >= config.enter_confidence)
             gaze = result.get('gaze_direction', 'unknown') if usable else 'unknown'
+            calibration = job.vision_context.get('calibration_id') or (details or {}).get('calibration')
             if previous is not None:
                 gap = timestamp-previous[0]
-                if 0 <= gap <= config.max_gap and usable and previous[1]:
+                supported = (0 <= gap <= config.max_gap and usable and previous[1]
+                             and previous[3] == job.generation)
+                supported_gaze = supported and gaze != 'unknown' and gaze == previous[2] and calibration == previous[4]
+                for key, interval in (('objects', supported), ('face', supported), ('gaze', supported_gaze)):
+                    continuous[key] = continuous[key] + gap if interval else 0.
+                    longest[key] = max(longest[key], continuous[key])
+                if supported:
+                    if diagnostics_enabled:
+                        record_gap(previous[0])
+                        last_covered = max(last_covered, timestamp)
                     known['objects'] += gap
                     known['face'] += gap
                     # A transition interval is not allocated to either class.
-                    if gaze != 'unknown' and gaze == previous[2]:
+                    if supported_gaze:
                         known['gaze'] += gap
                         if gaze == 'centered':
                             centered += gap
-            previous = timestamp, usable, gaze
-            yield timestamp, job.admission_number, result
+            previous = timestamp, usable, gaze, job.generation, calibration
+            yield timestamp, job.admission_number, {**result, 'capture_generation': job.generation}
 
     episodes = evaluate(samples(), config)
+    if diagnostics_enabled:
+        drop_reasons = {name: session.frame_drop_reasons[name] for name in FRAME_DROP_REASONS
+                        if name in session.frame_drop_reasons}
+        unclassified = coverage['dropped'] - sum(drop_reasons.values())
+        if unclassified > 0:
+            drop_reasons['unknown'] = unclassified
+        coverage['camera_diagnostics_state'] = {
+            'latest_processed_at': iso(latest_processed) if latest_processed else None,
+            'latest_usable_sample_at': iso(latest_usable) if latest_usable else None,
+            'drop_reasons': drop_reasons,
+            'terminal_reasons': dict(terminal_reasons),
+            'signal_samples': signal_samples if coverage['usable_frames'] else None,
+            'closed_gap_count': gap_count,
+            'closed_gap_seconds': round(gap_seconds, 6),
+            'latest_closed_gap': latest_gap,
+            'tail_started_at': iso(datetime.fromtimestamp(last_covered, dt_timezone.utc)),
+            'window_end': iso(window_end),
+            'max_sample_gap_seconds': config.max_gap,
+        }
     mixed = versions_truncated or any(len(value) > 1 for value in versions.values())
     counts, durations = {}, {}
     for kind in ('phone_visible', 'multiple_people_observed', 'no_face_observed', 'gaze_away'):
@@ -130,7 +202,8 @@ def calculate(session, base_coverage):
     else:
         status = 'complete'
     limitations = []
-    if not session.vision_calibration:
+    gaze_status = session.gaze_setup.get('state') or ('legacy' if session.vision_calibration else 'uncalibrated')
+    if gaze_status == 'uncalibrated' and not known['gaze']:
         limitations.append('gaze_not_calibrated')
     if coverage['processed'] and known['face'] == 0 and known['objects'] == 0:
         limitations.append('insufficient_temporal_coverage')
@@ -146,7 +219,12 @@ def calculate(session, base_coverage):
             'gaze_duration': known['gaze'] > 0,
             'expression': False},
         'reason': 'no_usable_evidence' if final and status == 'failed' else 'mixed_provenance' if mixed else None,
-        'coverage': {**coverage, 'known_seconds': {key: round(value, 6) for key, value in known.items()}},
+        'coverage': {**coverage, 'known_seconds': {key: round(value, 6) for key, value in known.items()},
+                     'longest_supported_seconds': {key: round(value, 6) for key, value in longest.items()},
+                     'minimum_episode_seconds': config.onset_seconds, 'calibration_frames': calibration_frames},
+        'gaze_measurement': {'calibration_status': gaze_status,
+                             'centered_seconds': round(centered, 6) if known['gaze'] else None,
+                             'away_seconds': round(known['gaze'] - centered, 6) if known['gaze'] else None},
         'gaze_centered_pct': round(100*centered/known['gaze'], 4) if known['gaze'] > 0 else None,
         'episodes': {**episodes, 'episode_counts': counts, 'observed_seconds': durations},
         'versions': {name: sorted(value) for name, value in versions.items()},

@@ -1,0 +1,8 @@
+{% autoescape off %}Hi{% if first_name %} {{ first_name }}{% endif %},
+
+Thank you for applying for {{ job_title }}{% if company_name %} at {{ company_name }}{% endif %}. The hiring team has decided to move forward with other candidates.
+
+We appreciate your time and interest. You can sign in to SkillSense to view your application status.
+
+The SkillSense team
+{% endautoescape %}

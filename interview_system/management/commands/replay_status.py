@@ -15,16 +15,30 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument('--inventory', action='store_true')
+        parser.add_argument('--check-storage', action='store_true', help='Check bucket access without writing objects.')
 
     def handle(self, *args, **options):
         if options['inventory']:
             self.audit()
+        storage_access = 'unchecked'
+        if options['check_storage']:
+            try:
+                s3 = storage.client()
+                s3.head_bucket(Bucket=settings.REPLAY_R2_BUCKET)
+                s3.list_objects_v2(Bucket=settings.REPLAY_R2_BUCKET, Prefix=storage.PREFIX, MaxKeys=1)
+            except (BotoCoreError, ClientError, ValueError):
+                raise CommandError('Replay bucket or prefix is unreachable with the configured credentials.') from None
+            storage_access = 'bucket_and_prefix_readable'
         now = timezone.now()
         active = InterviewReplay.objects.filter(state__in=('recording', 'processing'))
         oldest = (active.filter(due_at__lt=now)
                   .filter(Q(lease_until__isnull=True) | Q(lease_until__lte=now))
                   .aggregate(first=Min('due_at'))['first'])
         self.stdout.write(json.dumps({
+            'capture_enabled': settings.REPLAY_CAPTURE_ENABLED,
+            'playback_enabled': settings.REPLAY_PLAYBACK_ENABLED,
+            'storage_configured': storage.configured(),
+            'storage_access': storage_access,
             'states': dict(InterviewReplay.objects.values('state').annotate(count=Count('pk')).values_list('state', 'count')),
             'reasons': dict(InterviewReplay.objects.exclude(detail='').values('detail').annotate(count=Count('pk')).values_list('detail', 'count')),
             'queued_age_seconds': int((now - oldest).total_seconds()) if oldest else 0,

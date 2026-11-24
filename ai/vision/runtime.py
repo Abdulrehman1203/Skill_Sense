@@ -119,7 +119,7 @@ class VisionRuntime:
             self.close()
             raise
 
-    def _models(self, rgb, calibration):
+    def _models(self, rgb, calibration, *, strict_gaze=False):
         import numpy as np
         faces = self.face.detect(self.mp.Image(image_format=self.mp.ImageFormat.SRGB,
                                                data=np.ascontiguousarray(rgb)))
@@ -129,10 +129,11 @@ class VisionRuntime:
         boxes = postprocess(output, transform, self.config.object_confidence, self.config.nms_iou)
         objects = normalize_detections(boxes, {0: 'person', 67: 'cell phone'}, rgb.shape[1], rgb.shape[0])
         matrices = faces.facial_transformation_matrixes
-        gaze = estimate(faces.face_landmarks, matrices[0] if len(matrices) == 1 else None, calibration)
+        gaze = estimate(faces.face_landmarks, matrices[0] if len(matrices) == 1 else None,
+                        calibration, rgb=rgb if strict_gaze else None)
         return len(faces.face_landmarks), gaze, objects
 
-    def analyze(self, data, calibration=None):
+    def analyze(self, data, calibration=None, *, strict_gaze=False):
         if os.getpid() != self.pid or threading.get_ident() != self.owner:
             raise RuntimeError('Vision runtime used outside its owning execution context.')
         if not self.ready:
@@ -142,7 +143,8 @@ class VisionRuntime:
             assessment = quality(rgb)
             if not assessment.usable:
                 return Observation(assessment, None, Gaze(reason='quality_unusable'))
-            count, gaze, detections = self._models(rgb, calibration)
+            count, gaze, detections = (self._models(rgb, calibration, strict_gaze=True) if strict_gaze
+                                        else self._models(rgb, calibration))
             return Observation(assessment, count, gaze, detections)
 
     def close(self):

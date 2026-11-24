@@ -4,7 +4,7 @@ No scoring dispatch. Recovery executes the existing aggregate task directly on
 the normal worker/management path, avoiding a growing publication queue.
 """
 import asyncio
-from datetime import timedelta
+from datetime import datetime, timedelta
 import json
 import logging
 import uuid
@@ -24,6 +24,53 @@ from .video_lifecycle import (ACTIVE_JOBS, coverage_locked, drain_locked,
 
 logger = logging.getLogger(__name__)
 SNAPSHOT_COUNTS = ('received', 'admitted', 'processed', 'dropped', 'superseded', 'failed', 'expired', 'valid_gaze', 'unknown_gaze')
+
+
+def _review_settings(report):
+    reviewed_rules = report.report.get('episodes', {}).get('rules_version', '').startswith('episodes-v2-')
+    return {
+        'phone_visible': reviewed_rules and settings.INTERVIEW_ANALYSIS_PHONE_VISIBLE_REVIEW_ENABLED,
+        'no_face_observed': reviewed_rules and settings.INTERVIEW_ANALYSIS_NO_FACE_OBSERVED_REVIEW_ENABLED,
+        'multiple_people_observed': reviewed_rules and settings.INTERVIEW_ANALYSIS_MULTIPLE_PEOPLE_REVIEW_ENABLED,
+    }
+
+
+def _review_observations(observations, enabled):
+    signal_by_kind = {'phone': 'phone_visible', 'person': 'multiple_people_observed', 'face': 'no_face_observed'}
+    visible = []
+    for observation in observations:
+        kind = observation['kind']
+        if kind == 'gaze' and not settings.INTERVIEW_ANALYSIS_GAZE_REVIEW_ENABLED:
+            continue
+        if not enabled.get(signal_by_kind.get(kind), True):
+            continue
+        if kind == 'face' and not enabled['multiple_people_observed'] and observation['value'] in ('one', 'multiple'):
+            observation = {**observation, 'value': 'present'}
+        visible.append(observation)
+    return visible
+
+
+def _review_episodes(episodes, enabled):
+    enabled = {**enabled, 'gaze_away': settings.INTERVIEW_ANALYSIS_GAZE_REVIEW_ENABLED}
+    value = {**episodes}
+    value['events'] = [row for row in episodes['events'] if enabled.get(row['type'], True)]
+    for key in ('episode_counts', 'observed_seconds'):
+        value[key] = {name: amount if enabled.get(name, True) else None
+                      for name, amount in episodes[key].items()}
+    value['signal_diagnostics'] = {name: stats for name, stats in episodes.get('signal_diagnostics', {}).items()
+                                   if enabled.get(name, False)}
+    value['events_truncated'] = sum(amount or 0 for amount in value['episode_counts'].values()) > len(value['events'])
+    return value
+
+
+def _review_coverage(coverage):
+    if settings.INTERVIEW_ANALYSIS_GAZE_REVIEW_ENABLED:
+        return coverage
+    value = {**coverage, 'valid_gaze': 0, 'unknown_gaze': coverage['processed']}
+    for name in ('known_seconds', 'longest_supported_seconds'):
+        if name in value:
+            value[name] = {**value[name], 'gaze': None}
+    return value
 
 
 def _authorize(session, user_id, recruiter_only=False):
@@ -175,9 +222,59 @@ def report_response(session_id, user_id, *, snapshot=False):
                         if session.lifecycle_version != 1 or (report and report.report_schema_version != 1)
                         else 'ready' if report else 'pending')
         value = (_snapshot(session, report) if snapshot else report.report) if availability == 'ready' else None
-        return {'session_id': str(session.pk), 'availability': availability,
+        if value is not None:
+            enabled = _review_settings(report)
+            value = {**value, 'observations': _review_observations(value['observations'], enabled)}
+        if value is not None and not snapshot:
+            coverage = {**value['coverage']}
+            start = session.video_activated_at or session.started_at
+            end = session.admission_sealed_at if value['final'] else datetime.fromisoformat(value['generated_at'])
+            if start is not None and end is not None and end >= start:
+                coverage['evidence_window_seconds'] = (end - start).total_seconds()
+            gaze = value.get('gaze_measurement')
+            if gaze is not None:
+                window = coverage.get('evidence_window_seconds')
+                known = (coverage.get('known_seconds') or {}).get('gaze')
+                value['gaze_measurement'] = {**gaze, 'unknown_seconds': (
+                    round(max(0, window - known), 6) if window is not None and known is not None else None)}
+            diagnostics = coverage.pop('camera_diagnostics_state', None)
+            if settings.INTERVIEW_ANALYSIS_CAMERA_DIAGNOSTICS_ENABLED and diagnostics is not None:
+                coverage['camera_diagnostics'] = _camera_diagnostics(diagnostics, session, enabled)
+            value.update(coverage=_review_coverage(coverage), signal_review=enabled,
+                         episodes=_review_episodes(value['episodes'], enabled))
+            if not settings.INTERVIEW_ANALYSIS_GAZE_REVIEW_ENABLED:
+                value.update(gaze_centered_pct=None,
+                             gaze_measurement={'calibration_status': 'disabled', 'centered_seconds': None, 'away_seconds': None},
+                             measurement_availability={**value.get('measurement_availability', {}), 'gaze_duration': False})
+        elif value is not None:
+            value['coverage'] = _review_coverage(value['coverage'])
+        from .browser_observations import projection
+        return {'browser_observations': projection(session), 'session_id': str(session.pk), 'availability': availability,
                 'revision': report.revision if availability == 'ready' else 0,
                 'snapshot' if snapshot else 'report': value}
+
+
+def _camera_diagnostics(stored, session, enabled):
+    value = {**stored}
+    count = value.pop('closed_gap_count')
+    seconds = value.pop('closed_gap_seconds')
+    latest = value.pop('latest_closed_gap')
+    start = value.pop('tail_started_at')
+    end = session.admission_sealed_at or timezone.now()
+    end = max(end, datetime.fromisoformat(value.pop('window_end')))
+    samples = value.get('signal_samples')
+    if samples is not None:
+        keys = {'phone_detected': 'phone_visible', 'phone_at_entry_confidence': 'phone_visible',
+                'no_face': 'no_face_observed'}
+        value['signal_samples'] = {key: amount for key, amount in samples.items()
+                                   if enabled.get(keys.get(key), False)} or None
+    duration = (end - datetime.fromisoformat(start)).total_seconds()
+    if duration > value['max_sample_gap_seconds']:
+        count += 1
+        seconds += duration
+        latest = {'start': start, 'end': iso(end)}
+    return {**value, 'gap_count': count, 'gap_seconds': round(seconds, 6),
+            'latest_gap': latest, 'coverage_as_of': iso(end)}
 
 
 def status_response(session_id, user_id):
@@ -194,7 +291,8 @@ def status_response(session_id, user_id):
             'final': bool(report and report.finalized_at), 'video_required': session.video_required,
             'availability': availability}
         if can_observe(user, session):
-            value['coverage'] = report.coverage if report else None
+            value['coverage'] = (_review_coverage({key: value for key, value in report.coverage.items()
+                                 if key != 'camera_diagnostics_state'}) if report else None)
         return value
 
 

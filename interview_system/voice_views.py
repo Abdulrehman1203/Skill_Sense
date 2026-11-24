@@ -77,6 +77,7 @@ class CandidateVoiceResultSerializer(serializers.Serializer):
     audio_ended_at = serializers.DateTimeField(allow_null=True)
     disconnection_reason = serializers.CharField(allow_blank=True)
     workflow_state = serializers.CharField()
+    live_monitor_available = serializers.BooleanField()
 
 
 def _private(response):
@@ -246,6 +247,8 @@ class VoiceInterviewMixin:
             ),
         )
         if request.user.role == User.Role.CANDIDATE:
+            from .socket_auth import monitor_status
+            result['live_monitor_available'] = monitor_status(session) == 'available'
             # Transcript/recording/provider analysis release belongs to feedback,
             # not to joining or polling the media lifecycle.
             for field in ('transcript', 'transcript_object', 'recording_url', 'call_analysis', 'completion_outcome', 'evaluation_status'):

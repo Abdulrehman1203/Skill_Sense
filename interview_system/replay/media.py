@@ -99,35 +99,59 @@ def download_audio(call, path):
         raise MediaUnavailable
     # Retell documents recording_url as the mixed recording and multi-channel
     # as one speaker per channel. Prefer both channels when available.
+    reason = 'audio_pending'
     for key in ('recording_multi_channel_url', 'recording_url'):
+        url = call.get(key)
+        if not url:
+            continue
         try:
-            download_provider_asset(call.get(key), path)
-        except MediaUnavailable:
+            download_provider_asset(url, path)
+        except MediaUnavailable as error:
+            reason = str(error) or reason
             continue
         return
-    raise MediaUnavailable
+    raise MediaUnavailable(reason)
+
+
+def provider_asset_url(url):
+    if not isinstance(url, str):
+        raise MediaUnavailable('audio_pending')
+    try:
+        endpoint = urlsplit(url)
+        if (endpoint.scheme == 'https' and endpoint.hostname in settings.REPLAY_RETELL_AUDIO_HOSTS
+                and not endpoint.username and not endpoint.password and endpoint.port in (None, 443)
+                and not endpoint.fragment):
+            return url
+    except ValueError:
+        pass
+    raise MediaUnavailable('audio_host_unconfigured')
+
+
+def probe_provider_asset(url):
+    try:
+        with requests.get(provider_asset_url(url), headers={'Range': 'bytes=0-15'}, stream=True,
+                          allow_redirects=False, timeout=(2, 3)) as response:
+            if response.status_code not in (200, 206):
+                raise MediaUnavailable('audio_origin_unavailable')
+    except requests.RequestException:
+        raise MediaUnavailable('audio_origin_unavailable') from None
 
 
 def download_provider_asset(url, path):
-    if not isinstance(url, str):
-        raise MediaUnavailable
-    endpoint = urlsplit(url)
-    if (endpoint.scheme != 'https' or endpoint.hostname not in settings.REPLAY_RETELL_AUDIO_HOSTS
-            or endpoint.username or endpoint.password or endpoint.port not in (None, 443)):
-        raise MediaUnavailable
     try:
-        with requests.get(url, stream=True, allow_redirects=False, timeout=(4, 8)) as response, path.open('wb') as out:
+        with requests.get(provider_asset_url(url), stream=True, allow_redirects=False,
+                          timeout=(4, 8)) as response, path.open('wb') as out:
             if response.status_code != 200:
-                raise MediaUnavailable
+                raise MediaUnavailable('audio_origin_unavailable')
             total = 0
             deadline = time.monotonic() + 70
             for data in response.iter_content(1024 * 1024):
                 total += len(data)
                 if total > storage.MAX_AUDIO or time.monotonic() > deadline:
-                    raise MediaUnavailable
+                    raise MediaUnavailable('audio_origin_unavailable')
                 out.write(data)
     except requests.RequestException:
-        raise MediaUnavailable from None
+        raise MediaUnavailable('audio_origin_unavailable') from None
 
 
 def audio_anchor(call, audio):

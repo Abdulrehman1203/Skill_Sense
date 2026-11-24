@@ -61,10 +61,21 @@ async def heartbeat(lease, generation):
     return await database_sync_to_async(_call)(heartbeat_publisher, lease, generation)
 
 
+async def camera_feedback(lease, generation):
+    from .candidate_camera_feedback import status
+    return await database_sync_to_async(_call)(status, lease, generation)
+
+
+async def gaze_control(lease, generation, action, setup):
+    from .vision_calibration import control
+    return await database_sync_to_async(_call)(control, lease, generation, action, setup)
+
+
 async def disconnect(session_id, generation):
     return await database_sync_to_async(_call)(disconnect_publisher, session_id, generation)
 
 
-async def drop(lease, generation, sequence, *, validated=False):
+async def drop(lease, generation, sequence, *, validated=False, reason=None):
     from functools import partial
-    return await database_sync_to_async(_call)(partial(record_frame_drop, validated=validated), lease, generation, sequence)
+    return await database_sync_to_async(_call)(
+        partial(record_frame_drop, validated=validated, reason=reason), lease, generation, sequence)
