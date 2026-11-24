@@ -171,7 +171,9 @@ def finalize(replay, s3):
         publish(replay, key, size, digest, gaps, partial, timing)
     except storage.QuotaExceeded:
         retry(replay, 'quota_exhausted')
-    except (RetellUnavailableError, media.MediaUnavailable):
+    except media.MediaUnavailable as error:
+        retry(replay, str(error) or 'audio_pending')
+    except RetellUnavailableError:
         retry(replay, 'audio_pending')
     except media.Unaligned:
         with transaction.atomic():

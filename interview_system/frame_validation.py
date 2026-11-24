@@ -37,9 +37,25 @@ def parse_message(text):
         raise ProtocolError('invalid_message') from None
     if not isinstance(message, dict):
         raise ProtocolError('invalid_message')
-    if message == {'type': 'ping'}:
+    if (message == {'type': 'ping'} or
+            (set(message) == {'type', 'camera_feedback'} and message['type'] == 'ping'
+             and message['camera_feedback'] is True)):
         return message
-    if set(message) != {'type', 'protocol_version', 'sequence', 'capture_ts', 'data'} or message['type'] != 'frame':
+    if message.get('type') == 'gaze_calibration':
+        action = message.get('action')
+        fields = {'type', 'action'}
+        if action in ('begin', 'resume'):
+            fields.add('camera_setup')
+            setup = message.get('camera_setup')
+            if not isinstance(setup, str) or len(setup) != 32 or any(c not in '0123456789abcdef' for c in setup):
+                raise ProtocolError('invalid_message')
+        if action not in ('begin', 'resume', 'status', 'skip', 'cancel') or set(message) != fields:
+            raise ProtocolError('invalid_message')
+        return message
+    fields = {'type', 'protocol_version', 'sequence', 'capture_ts', 'data'}
+    if (set(message) != fields and
+            (set(message) != fields | {'calibration_sample'} or message.get('calibration_sample') is not True)
+            or message.get('type') != 'frame'):
         raise ProtocolError('invalid_message')
     if type(message['protocol_version']) is not int or message['protocol_version'] != 1:
         raise ProtocolError('unsupported_version')

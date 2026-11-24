@@ -107,7 +107,8 @@ def accept_transcript_locked(interview, session, payload, source):
     return revision
 
 
-def prepare_evaluation_locked(interview, prep=None, *, rerun=False, actor=None, reason=''):
+def prepare_evaluation_locked(interview, prep=None, *, rerun=False, actor=None, reason='', model_name=None,
+                              dispatch=True, uses_fallback=False):
     prep = prep or TranscriptPreparation.objects.filter(interview=interview).first()
     if not prep or not prep.selected or interview.status != 'DONE':
         return None
@@ -122,7 +123,8 @@ def prepare_evaluation_locked(interview, prep=None, *, rerun=False, actor=None, 
     unavailable = prep.state == 'UNAVAILABLE' or not context.snapshot['questions']
     row = InterviewEvaluation.objects.create(interview=interview, transcript=prep.selected, context=context,
         revision=(latest.revision + 1 if latest else 1), supersedes=latest,
-        model_name=getattr(settings, 'GEMINI_EVALUATION_MODEL_NAME', settings.GEMINI_MODEL_NAME),
+        model_name=model_name or settings.GEMINI_EVALUATION_MODEL_NAME,
+        uses_fallback=uses_fallback,
         final_evidence=prep.selected_source in ('call_analyzed', 'recruiter_selected'),
         run_number=(existing.run_number + 1 if existing else 0), requested_by=actor, request_reason=reason,
         prompt_version='answers-v2',
@@ -142,12 +144,43 @@ def prepare_evaluation_locked(interview, prep=None, *, rerun=False, actor=None, 
         from .models import Application
         stage_locked(interview, Application.Status.INTERVIEWED, 'Authenticated transcript enrichment became usable.')
     interview.save(update_fields=['evaluation_status', 'completion_outcome', 'updated_at'])
-    if not unavailable:
+    if not unavailable and dispatch:
         transaction.on_commit(lambda: dispatch_evaluation(row.pk))
-    else:
+    elif unavailable:
         from .evaluation_lifecycle import terminal_locked
         terminal_locked(interview, row)
     return row
+
+
+def grading_fallback_model(primary_model):
+    from .integrations.gemini_client import has_grading_backup_key
+
+    if settings.GROQ_API_KEY:
+        return 'groq/' + settings.GROQ_MODEL_NAME
+    model = settings.GEMINI_EVALUATION_FALLBACK_MODEL_NAME or primary_model
+    return model if model != primary_model or has_grading_backup_key() else None
+
+
+def uses_grading_fallback(row):
+    # Honor legacy revisions created for a distinct fallback model before the route was stored.
+    return row.uses_fallback or (row.model_name != settings.GEMINI_EVALUATION_MODEL_NAME
+                                 and row.model_name == settings.GEMINI_EVALUATION_FALLBACK_MODEL_NAME)
+
+
+def fallback_evaluation_locked(interview, failed):
+    """Start one alternate revision for the current chain under the interview lock."""
+    model = grading_fallback_model(failed.model_name)
+    if uses_grading_fallback(failed) or not model:
+        return None
+    prep = TranscriptPreparation.objects.filter(
+        interview=interview, state='READY', selected_id=failed.transcript_id,
+    ).first()
+    if (not prep or interview.completion_outcome != 'USABLE'
+            or failed.final_evidence != (prep.selected_source in ('call_analyzed', 'recruiter_selected'))
+            or interview.evaluations.filter(revision__gt=failed.revision).exists()):
+        return None
+    return prepare_evaluation_locked(interview, prep, rerun=True, model_name=model, uses_fallback=True,
+        reason='Configured grading fallback after a transient provider failure.')
 
 
 def dispatch_evaluation(pk):
@@ -246,6 +279,7 @@ def validate_evaluation(data, inputs):
         criteria = answer['criteria']
         require(isinstance(criteria, dict) and set(criteria) == set(q['criteria']), 'INVALID_CRITERION_IDS')
         if status == 'MISSING_EVIDENCE':
+            require(not alignment or alignment['state'] != 'ANSWERED', 'INVALID_ANSWER_ATTRIBUTION')
             require(all(v is None for v in criteria.values()))
         else:
             require(bool(asked), 'INVALID_QUESTION_ATTRIBUTION')

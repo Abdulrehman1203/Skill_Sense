@@ -13,6 +13,7 @@ from django.utils import timezone
 from django.views.decorators.debug import sensitive_variables
 
 from .authentication import ClerkJWTAuthentication
+from .monitor_configuration import monitor_configuration_status
 from .models import Interview, InterviewSession, SocketTicket, User
 
 MEDIA_ROLES = ('camera', 'viewer')
@@ -21,9 +22,10 @@ SESSION_RELATIONS = ('interview__application__candidate', 'interview__applicatio
 
 
 class SocketAuthorizationError(Exception):
-    def __init__(self, reason, status=403):
+    def __init__(self, reason, status=403, *, retry_after=None):
         self.reason = reason
         self.status = status
+        self.retry_after = retry_after
         super().__init__(reason)  # Only a fixed enum; never a credential or client input.
 
 
@@ -37,6 +39,19 @@ def can_observe(user, session):
                 and session.interview.application.job.recruiter.user_id == user.pk)
 
 
+def can_publish_live_video(session):
+    return (session.interview.status == Interview.Status.LIVE and session.started_at is not None
+            and session.ended_at is None and session.audio_ended_at is None
+            and not session.creation_uncertain and session.lifecycle_version == 1
+            and session.admission_sealed_at is None and session.video_state not in ('finalizing', 'ended'))
+
+
+def monitor_status(session):
+    if session is None or not session.video_required or not can_publish_live_video(session):
+        return 'session_not_publishable'
+    return monitor_configuration_status()
+
+
 def require_eligibility(user, session, purpose):
     if not user.is_active:
         raise SocketAuthorizationError('account_inactive')
@@ -45,14 +60,11 @@ def require_eligibility(user, session, purpose):
         raise SocketAuthorizationError('access_denied')
     if not session.video_required:
         raise SocketAuthorizationError('video_not_enabled', 409)
-    if purpose in MEDIA_ROLES and not settings.LIVE_MONITOR_ENABLED:
-        raise SocketAuthorizationError('monitor_unavailable', 409)
-    if purpose in ('publisher', *MEDIA_ROLES) and (
-        session.interview.status != Interview.Status.LIVE or session.started_at is None
-        or session.ended_at is not None or session.audio_ended_at is not None
-        or session.creation_uncertain or session.lifecycle_version != 1
-        or session.admission_sealed_at is not None or session.video_state in ('finalizing', 'ended')
-    ):
+    if purpose in MEDIA_ROLES:
+        status = monitor_status(session)
+        if status != 'available':
+            raise SocketAuthorizationError(status, 409)
+    if purpose == 'publisher' and not can_publish_live_video(session):
         raise SocketAuthorizationError('session_not_publishable', 409)
 
 
@@ -101,8 +113,11 @@ def issue_ticket(user_id, session_id, purpose, verified_claims):
             outstanding = outstanding.filter(purpose__in=MEDIA_ROLES)
         else:
             outstanding = outstanding.exclude(purpose__in=MEDIA_ROLES)
-        if outstanding.count() >= max(1, settings.INTERVIEW_ANALYSIS_MAX_OUTSTANDING_TICKETS):
-            raise SocketAuthorizationError('ticket_limit', 429)
+        ticket_limit = max(1, settings.INTERVIEW_ANALYSIS_MAX_OUTSTANDING_TICKETS)
+        blocking_expiry = outstanding.order_by('-expires_at').values_list('expires_at', flat=True)[ticket_limit - 1:ticket_limit]
+        if expires_at := next(iter(blocking_expiry), None):
+            retry_after = max(1, math.ceil((expires_at - now).total_seconds()))
+            raise SocketAuthorizationError('ticket_limit', 429, retry_after=retry_after)
         secret = secrets.token_urlsafe(32)
         expires = min(credential_expiry, now + timedelta(seconds=max(1, settings.INTERVIEW_ANALYSIS_TICKET_TTL_SECONDS)))
         SocketTicket.objects.create(

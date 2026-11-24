@@ -11,6 +11,8 @@ import statistics
 import threading
 import time
 
+from .validation import compare, staged_labels
+
 
 def encode(rgb):
     from PIL import Image
@@ -37,7 +39,14 @@ def real_frames(manifest_path):
     if manifest.get('consented_staged') is not True or manifest.get('schema_version') != 1:
         raise ValueError('A local consented/staged fixture manifest is required.')
     total = 0
-    for clip in manifest['clips']:
+    clips = manifest.get('clips')
+    if not isinstance(clips, list) or not 1 <= len(clips) <= 100:
+        raise ValueError('Invalid staged clip count.')
+    for clip_index, clip in enumerate(clips, start=1):
+        if not isinstance(clip, dict) or not isinstance(clip.get('path'), str):
+            raise ValueError('Invalid staged clip entry.')
+        fixture = f'clip-{clip_index:03}'
+        annotations = staged_labels(clip)
         path = (manifest_path.parent/clip['path']).resolve()
         if not path.is_relative_to(manifest_path.parent) or not path.is_file():
             raise ValueError('Fixture is missing or outside the local fixture directory.')
@@ -54,7 +63,7 @@ def real_frames(manifest_path):
                 raise ValueError('Invalid clip frame rate.')
             if not 64 <= width <= 1920 or not 64 <= height <= 1080:
                 raise ValueError('Fixture dimensions exceed the offline evaluation policy.')
-            frame_no, stride = 0, max(1, round(fps/3))
+            frame_no, stride, sampled = 0, max(1, round(fps/3)), 0
             while total < 1800:
                 okay, bgr = capture.read()
                 if not okay:
@@ -67,9 +76,12 @@ def real_frames(manifest_path):
                 if factor < 1:
                     bgr = cv2.resize(bgr, (int(width*factor), int(height*factor)))
                 total += 1
-                yield {'fixture': clip['path'], 'seconds': (frame_no-1)/fps,
+                sampled += 1
+                yield {'fixture': fixture, 'seconds': (frame_no-1)/fps, 'annotations': annotations,
                        'jpeg': encode(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)),
                        'calibration': clip.get('calibration')}
+            if not sampled:
+                raise ValueError('Staged clip yielded no samples.')
         finally:
             capture.release()
         if total >= 1800:
@@ -91,7 +103,8 @@ def run(directory, samples, *, synthetic_only):
     watcher = threading.Thread(target=monitor, daemon=True)
     watcher.start()
     runtime = None
-    outcomes, timeline, latencies = [], [], defaultdict(list)
+    outcomes, timelines, latencies = [], defaultdict(list), defaultdict(list)
+    annotations = {}
     started = time.perf_counter()
     try:
         runtime = VisionRuntime(directory)
@@ -104,18 +117,27 @@ def run(directory, samples, *, synthetic_only):
             observation = runtime.analyze(sample['jpeg'], baseline_gaze)
             latency = (time.perf_counter()-tick)*1000
             latencies[sample['fixture']].append(latency)
-            outcomes.append({'fixture': sample['fixture'], 'seconds': sample['seconds'],
-                'vision_details': observation.details(calibration=baseline_gaze, config_version=runtime.config.version,
-                                                     face_limit=runtime.config.max_faces),
-                'detected_objects': [item.as_dict() for item in observation.objects]})
-            timeline.append((sample['seconds'], index + 1, {
-                'vision_details': outcomes[-1]['vision_details'],
-                'detected_objects': outcomes[-1]['detected_objects']}))
+            result = {'vision_details': observation.details(calibration=baseline_gaze,
+                       config_version=runtime.config.version, face_limit=runtime.config.max_faces),
+                      'detected_objects': [item.as_dict() for item in observation.objects]}
+            fixture = sample['fixture']
+            if synthetic_only:
+                outcomes.append({'fixture': fixture, 'seconds': sample['seconds'], **result})
+                fixture = 'synthetic'
+            else:
+                annotations[fixture] = sample['annotations']
+            timeline = timelines[fixture]
+            timeline.append((sample['seconds'], len(timeline) + 1, result))
         peak[0] = max(peak[0], process.memory_info().rss)
+        rules = RuleConfig()
+        reports = {name: evaluate_rules(timeline, rules) for name, timeline in timelines.items()}
         return {'schema_version': 1, 'synthetic_only': synthetic_only,
             'execution_scope': 'offline_cpu_adapters_and_pure_rules_not_application_stream',
             'pipeline_version': 'vision-v1', 'rules_version': RuleConfig().version,
-            'episodes': evaluate_rules(timeline),
+            'episodes': (reports.get('synthetic') if synthetic_only else None),
+            'clips': [{'fixture': name, 'sampled_frames': len(timeline), 'episodes': reports[name],
+                       'validation': compare(timeline, reports[name], annotations[name], rules)}
+                      for name, timeline in timelines.items() if not synthetic_only],
             'accuracy_validation': 'outstanding' if synthetic_only else 'observations_for_human_review',
             'environment': {'python': platform.python_version(), 'platform': platform.platform(),
                 'processor': os.environ.get('PROCESSOR_IDENTIFIER', platform.processor()), 'device': 'cpu',
@@ -141,11 +163,14 @@ def main():
     group.add_argument('--manifest')
     parser.add_argument('--report', required=True)
     args = parser.parse_args()
-    report = run(args.models, synthetic() if args.synthetic else real_frames(args.manifest),
-                 synthetic_only=args.synthetic)
-    path = Path(args.report)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(report, indent=2)+'\n', encoding='utf-8')
+    try:
+        report = run(args.models, synthetic() if args.synthetic else real_frames(args.manifest),
+                     synthetic_only=args.synthetic)
+        path = Path(args.report)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(report, indent=2)+'\n', encoding='utf-8')
+    except (OSError, ValueError, KeyError) as error:
+        parser.exit(1, f'Camera validation failed ({type(error).__name__}). Check the local manifest, clips, model artifacts, and output path.\n')
     print(json.dumps({key: value for key, value in report.items() if key != 'observations'}, indent=2))
 
 

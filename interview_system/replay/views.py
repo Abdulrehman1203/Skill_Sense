@@ -16,9 +16,10 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from ..integrations import retell_client
 from ..models import Interview, InterviewReplay, InterviewSession, ReplayObject, RetellCall
 from ..permissions import IsCandidate, IsRecruiter
-from . import storage
+from . import media, storage
 
 State = InterviewReplay.State
 CHUNK_LIMIT = 1800
@@ -209,25 +210,64 @@ class ReplayPlayback(APIView):
 
     @extend_schema(responses=inline_serializer('InterviewReplayStatus', fields={
         'state': serializers.ChoiceField(choices=State.choices),
+        'reason': serializers.CharField(required=False),
         'gaps': serializers.ListField(child=serializers.DictField(child=serializers.FloatField()), required=False),
         'url': serializers.URLField(required=False),
         'expires_in': serializers.IntegerField(required=False),
     }))
     def get(self, request, pk):
         attempt = get_object_or_404(Interview, pk=pk, application__job__recruiter__user=request.user)
-        if not settings.REPLAY_PLAYBACK_ENABLED:
-            return private({'state': State.UNAVAILABLE})
         replay = InterviewReplay.objects.filter(session__interview=attempt).first()
         if not replay:
-            return private({'state': State.UNAVAILABLE})
+            reason = ('camera_recording_missing' if attempt.status == Interview.Status.DONE
+                      else 'playback_disabled' if not settings.REPLAY_PLAYBACK_ENABLED else 'capture_not_started')
+            return private({'state': State.UNAVAILABLE, 'reason': reason})
+        if not settings.REPLAY_PLAYBACK_ENABLED:
+            return private({'state': State.UNAVAILABLE, 'reason': 'playback_disabled'})
         remaining = int((replay.expires_at - timezone.now()).total_seconds())
         if remaining <= 0 or replay.state == State.EXPIRED:
             return private({'state': State.EXPIRED})
         result = {'state': replay.state, 'gaps': replay.gaps}
+        if replay.detail:
+            result['reason'] = replay.detail
         if replay.state in (State.READY, State.PARTIAL) and replay.output_key:
             seconds = min(remaining, storage.PLAYBACK_TTL)
             try:
                 result.update(url=storage.signed_url(replay.output_key, seconds), expires_in=seconds)
             except (ValueError, BotoCoreError, ClientError):
-                return private(status=503)
+                return private({'state': State.UNAVAILABLE, 'reason': 'storage_unavailable'}, status=503)
         return private(result)
+
+
+class RecordingAccess(APIView):
+    permission_classes = [IsAuthenticated, IsRecruiter]
+
+    @extend_schema(responses=inline_serializer('InterviewRecordingAccess', fields={
+        'recording_url': serializers.URLField(required=False),
+        'reason': serializers.CharField(required=False),
+    }))
+    def get(self, request, pk):
+        attempt = get_object_or_404(Interview, pk=pk, application__job__recruiter__user=request.user)
+        call = RetellCall.objects.filter(pk=attempt.retell_session_id, session__interview=attempt,
+                                        ended_at__isnull=False).first()
+        if call is None or call.status != 'ended':
+            return private({'reason': 'audio_pending'})
+        old_url = call.recording_url
+        reason = 'audio_pending'
+        if old_url:
+            try:
+                media.probe_provider_asset(old_url)
+                return private({'recording_url': old_url})
+            except media.MediaUnavailable as error:
+                reason = str(error)
+        try:
+            fresh = retell_client.get_call(call.pk).get('recording_url')
+        except retell_client.RetellUnavailableError:
+            return private({'reason': reason})
+        if fresh and fresh != old_url:
+            try:
+                media.probe_provider_asset(fresh)
+                return private({'recording_url': fresh})
+            except media.MediaUnavailable as error:
+                reason = str(error)
+        return private({'reason': reason})

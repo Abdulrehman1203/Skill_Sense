@@ -102,15 +102,18 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'ai_interview_recruitment.wsgi.application'
 
-# Email is delivered by Celery. Production supplies SMTP/provider settings.
-EMAIL_BACKEND = os.getenv("EMAIL_BACKEND", "django.core.mail.backends.console.EmailBackend" if DEBUG else "django.core.mail.backends.smtp.EmailBackend")
-EMAIL_HOST = os.getenv("EMAIL_HOST", "localhost")
+# Email is delivered by Celery. A Brevo key selects SMTP unless overridden.
+_brevo_smtp_key = os.getenv("SMTP_KEY", "").strip()
+_smtp_backend = "django.core.mail.backends.smtp.EmailBackend"
+_console_email_backend = "django.core.mail.backends.console.EmailBackend"
+EMAIL_BACKEND = os.getenv("EMAIL_BACKEND") or (_smtp_backend if _brevo_smtp_key or not DEBUG else _console_email_backend)
+EMAIL_HOST = os.getenv("EMAIL_HOST") or ("smtp-relay.brevo.com" if _brevo_smtp_key else "localhost")
 EMAIL_PORT = int(os.getenv("EMAIL_PORT", "587"))
-EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER", "")
-EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "")
+EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER", "").strip()
+EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD") or _brevo_smtp_key
 EMAIL_USE_TLS = os.getenv("EMAIL_USE_TLS", "True").lower() in ("true", "1", "yes")
 EMAIL_TIMEOUT = int(os.getenv("EMAIL_TIMEOUT", "10"))
-DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", "webmaster@localhost")
+DEFAULT_FROM_EMAIL = os.getenv("DEFAULT_FROM_EMAIL", "").strip() or "webmaster@localhost"
 
 
 # Database
@@ -195,14 +198,19 @@ CLERK_WEBHOOK_SECRET = os.getenv("CLERK_WEBHOOK_SECRET", "")
 CLERK_ISSUER = os.getenv("CLERK_ISSUER", CLERK_JWKS_URL.removesuffix("/.well-known/jwks.json"))
 CLERK_AUTHORIZED_PARTIES = [p.strip() for p in os.getenv("CLERK_AUTHORIZED_PARTIES", "").split(",") if p.strip()]
 
+GOOGLE_CALENDAR_CLIENT_ID = os.getenv("GOOGLE_CALENDAR_CLIENT_ID", "")
+GOOGLE_CALENDAR_CLIENT_SECRET = os.getenv("GOOGLE_CALENDAR_CLIENT_SECRET", "")
+GOOGLE_CALENDAR_REDIRECT_URI = os.getenv("GOOGLE_CALENDAR_REDIRECT_URI", "")
+GOOGLE_CALENDAR_TOKEN_KEY = os.getenv("GOOGLE_CALENDAR_TOKEN_KEY", "")
+
 # Ticket TTL controls redemption only; the credential exp always caps the lease.
 INTERVIEW_ANALYSIS_TICKET_TTL_SECONDS = int(os.getenv("INTERVIEW_ANALYSIS_TICKET_TTL_SECONDS", "30"))
 INTERVIEW_ANALYSIS_SOCKET_LEASE_SECONDS = int(os.getenv("INTERVIEW_ANALYSIS_SOCKET_LEASE_SECONDS", "60"))
 INTERVIEW_ANALYSIS_AUTH_CHECK_SECONDS = int(os.getenv("INTERVIEW_ANALYSIS_AUTH_CHECK_SECONDS", "5"))
 INTERVIEW_ANALYSIS_MAX_OUTSTANDING_TICKETS = int(os.getenv("INTERVIEW_ANALYSIS_MAX_OUTSTANDING_TICKETS", "4"))
 INTERVIEW_ANALYSIS_CONNECTION_LEASE_SECONDS = int(os.getenv("INTERVIEW_ANALYSIS_CONNECTION_LEASE_SECONDS", "15"))
-INTERVIEW_ANALYSIS_RECONNECT_GRACE_SECONDS = int(os.getenv("INTERVIEW_ANALYSIS_RECONNECT_GRACE_SECONDS", "30"))
-INTERVIEW_ANALYSIS_VIDEO_INACTIVITY_SECONDS = int(os.getenv("INTERVIEW_ANALYSIS_VIDEO_INACTIVITY_SECONDS", "30"))
+INTERVIEW_ANALYSIS_RECONNECT_GRACE_SECONDS = int(os.getenv("INTERVIEW_ANALYSIS_RECONNECT_GRACE_SECONDS", "60"))
+INTERVIEW_ANALYSIS_VIDEO_INACTIVITY_SECONDS = int(os.getenv("INTERVIEW_ANALYSIS_VIDEO_INACTIVITY_SECONDS", "120"))
 INTERVIEW_ANALYSIS_VIDEO_STARTUP_SECONDS = int(os.getenv("INTERVIEW_ANALYSIS_VIDEO_STARTUP_SECONDS", "120"))
 INTERVIEW_ANALYSIS_MAX_VIDEO_SECONDS = int(os.getenv("INTERVIEW_ANALYSIS_MAX_VIDEO_SECONDS", "3600"))
 INTERVIEW_ANALYSIS_VIDEO_RECOVERY_SECONDS = int(os.getenv("INTERVIEW_ANALYSIS_VIDEO_RECOVERY_SECONDS", "5"))
@@ -214,6 +222,32 @@ INTERVIEW_ANALYSIS_FRAME_CLAIM_SECONDS = int(os.getenv("INTERVIEW_ANALYSIS_FRAME
 INTERVIEW_ANALYSIS_MAX_SESSION_FRAMES = int(os.getenv('INTERVIEW_ANALYSIS_MAX_SESSION_FRAMES', '10800'))
 # Enable only with the pinned model artifacts and a dedicated warm vision worker.
 INTERVIEW_ANALYSIS_VISION_ENABLED = os.getenv('INTERVIEW_ANALYSIS_VISION_ENABLED', 'False').lower() in ('true', '1', 'yes')
+INTERVIEW_TAB_VISIBILITY_ENABLED = os.getenv('INTERVIEW_TAB_VISIBILITY_ENABLED', 'False').lower() in ('true', '1', 'yes')
+INTERVIEW_SCREEN_SHARING_ENABLED = os.getenv('INTERVIEW_SCREEN_SHARING_ENABLED', 'False').lower() in ('true', '1', 'yes')
+INTERVIEW_ANALYSIS_CAMERA_QUALITY_PROMPTS_ENABLED = os.getenv(
+    'INTERVIEW_ANALYSIS_CAMERA_QUALITY_PROMPTS_ENABLED', 'False'
+).lower() in ('true', '1', 'yes')
+INTERVIEW_ANALYSIS_NO_FACE_PROMPTS_ENABLED = os.getenv(
+    'INTERVIEW_ANALYSIS_NO_FACE_PROMPTS_ENABLED', 'False'
+).lower() in ('true', '1', 'yes')
+INTERVIEW_ANALYSIS_GAZE_CALIBRATION_ENABLED = os.getenv(
+    'INTERVIEW_ANALYSIS_GAZE_CALIBRATION_ENABLED', 'False'
+).lower() in ('true', '1', 'yes')
+INTERVIEW_ANALYSIS_GAZE_REVIEW_ENABLED = os.getenv(
+    'INTERVIEW_ANALYSIS_GAZE_REVIEW_ENABLED', 'False'
+).lower() in ('true', '1', 'yes')
+INTERVIEW_ANALYSIS_CAMERA_DIAGNOSTICS_ENABLED = os.getenv(
+    'INTERVIEW_ANALYSIS_CAMERA_DIAGNOSTICS_ENABLED', 'False'
+).lower() in ('true', '1', 'yes')
+INTERVIEW_ANALYSIS_PHONE_VISIBLE_REVIEW_ENABLED = os.getenv(
+    'INTERVIEW_ANALYSIS_PHONE_VISIBLE_REVIEW_ENABLED', 'False'
+).lower() in ('true', '1', 'yes')
+INTERVIEW_ANALYSIS_NO_FACE_OBSERVED_REVIEW_ENABLED = os.getenv(
+    'INTERVIEW_ANALYSIS_NO_FACE_OBSERVED_REVIEW_ENABLED', 'False'
+).lower() in ('true', '1', 'yes')
+INTERVIEW_ANALYSIS_MULTIPLE_PEOPLE_REVIEW_ENABLED = os.getenv(
+    'INTERVIEW_ANALYSIS_MULTIPLE_PEOPLE_REVIEW_ENABLED', 'False'
+).lower() in ('true', '1', 'yes')
 INTERVIEW_ANALYSIS_MODEL_DIRECTORY = os.getenv('INTERVIEW_ANALYSIS_MODEL_DIRECTORY', str(BASE_DIR / 'vision-artifacts'))
 INTERVIEW_ANALYSIS_MAX_FACES = int(os.getenv('INTERVIEW_ANALYSIS_MAX_FACES', '3'))
 INTERVIEW_ANALYSIS_PAYLOAD_REDIS_URL = os.getenv('PAYLOAD_REDIS_URL', 'redis://127.0.0.1:6385/0')
@@ -321,12 +355,17 @@ if INTERVIEW_ANALYSIS_VISION_ENABLED:
 
 # ── Gemini AI ────────────────────────────────────────────────
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY", "").strip()
+GROQ_MODEL_NAME = os.getenv("GROQ_MODEL_NAME", "openai/gpt-oss-120b").strip()
+GEMINI_API_KEY_FALL_BACK = os.getenv("GEMINI_API_KEY_FALL_BACK", "").strip()
 GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-3.5-flash-lite")
 GEMINI_REQUEST_TIMEOUT_MS = int(os.getenv("GEMINI_REQUEST_TIMEOUT_MS", "60000"))
 GEMINI_PARSE_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_PARSE_MAX_OUTPUT_TOKENS", "4096"))
 GEMINI_QUESTION_MODEL_NAME = os.getenv("GEMINI_QUESTION_MODEL_NAME", GEMINI_MODEL_NAME)
+GEMINI_QUESTION_FALLBACK_MODEL_NAME = os.getenv("GEMINI_QUESTION_FALLBACK_MODEL_NAME", "").strip()
 GEMINI_QUESTION_TIMEOUT_MS = int(os.getenv("GEMINI_QUESTION_TIMEOUT_MS", "15000"))
 GEMINI_EVALUATION_MODEL_NAME = os.getenv("GEMINI_EVALUATION_MODEL_NAME", GEMINI_MODEL_NAME)
+GEMINI_EVALUATION_FALLBACK_MODEL_NAME = os.getenv("GEMINI_EVALUATION_FALLBACK_MODEL_NAME", "").strip()
 TRANSCRIPT_ENRICHMENT_WAIT_SECONDS = min(900, max(30, int(os.getenv("TRANSCRIPT_ENRICHMENT_WAIT_SECONDS", "300"))))
 
 # ── SBERT Matching ───────────────────────────────────────────
@@ -437,6 +476,7 @@ if not DEBUG:
     _validate_clerk(globals())
 
 LIVE_MONITOR_ENABLED = os.getenv('LIVE_MONITOR_ENABLED', 'false').lower() == 'true'
+LIVE_MONITOR_ALLOW_DIRECT = os.getenv('LIVE_MONITOR_ALLOW_DIRECT', 'false').lower() == 'true'
 LIVE_MONITOR_TURN_URLS = os.getenv('LIVE_MONITOR_TURN_URLS', '').split()
 LIVE_MONITOR_STUN_URLS = os.getenv('LIVE_MONITOR_STUN_URLS', '').split()
 LIVE_MONITOR_TURN_SECRET = os.getenv('LIVE_MONITOR_TURN_SECRET', '')
@@ -452,7 +492,8 @@ REPLAY_R2_ACCESS_KEY = os.getenv('REPLAY_R2_ACCESS_KEY', '')
 REPLAY_R2_SECRET_KEY = os.getenv('REPLAY_R2_SECRET_KEY', '')
 REPLAY_BUDGET_BYTES = int(os.getenv('REPLAY_BUDGET_BYTES', '8000000000'))
 REPLAY_RETENTION_DAYS = int(os.getenv('REPLAY_RETENTION_DAYS', '30'))
-REPLAY_RETELL_AUDIO_HOSTS = tuple(os.getenv('REPLAY_RETELL_AUDIO_HOSTS', 'retellai.s3.us-west-2.amazonaws.com').split(','))
+REPLAY_RETELL_AUDIO_HOSTS = tuple(host.strip().lower() for host in
+    os.getenv('REPLAY_RETELL_AUDIO_HOSTS', 'retellai.s3.us-west-2.amazonaws.com').split(',') if host.strip())
 REPLAY_SCRATCH_DIRECTORY = os.getenv('REPLAY_SCRATCH_DIRECTORY') or None
 CELERY_TASK_ROUTES['interview_system.replay.*'] = {'queue': 'interview_replay'}
 if REPLAY_R2_BUCKET:
@@ -463,3 +504,4 @@ if REPLAY_R2_BUCKET:
 
 from corsheaders.defaults import default_headers as _cors_default_headers
 CORS_ALLOW_HEADERS = (*_cors_default_headers, 'x-replay-elapsed', 'x-replay-sha256')
+CORS_EXPOSE_HEADERS = ('Retry-After',)

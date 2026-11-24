@@ -6,6 +6,7 @@ Jobs and skills are registered via DRF routers. Manual paths
 """
 
 from django.urls import include, path
+from .browser_observations import BrowserObservationView
 from .resumes.download import ResumeDownloadView
 from .conversation_views import ConversationControlView
 from rest_framework.routers import DefaultRouter
@@ -32,9 +33,11 @@ from .views import (
     ScoringRubricViewSet,
 )
 from .webhook_views import ClerkWebhookView
+from .recruiter_calendar import CalendarConnectView, calendar_callback
+from .recruiter_workspace import RecruiterAccountDeleteView, WorkspaceExportView
 from .admin_views import AdminOperationsView, AdminOverviewView, AdminUserListView, AdminUserStatusView
 from .retell_webhook import RetellCallEndedView
-from .replay.views import ReplayChunk, ReplayConsent, ReplayPlayback, ReplaySeal
+from .replay.views import RecordingAccess, ReplayChunk, ReplayConsent, ReplayPlayback, ReplaySeal
 from .socket_ticket_views import SocketTicketView
 from .video_views import FinishVideoView
 from .question_views import ApplicationQuestionSetView, QuestionSetView
@@ -66,6 +69,7 @@ from .analysis_views import AnalysisStatusView, BehavioralReportView, AnalysisSn
 
 urlpatterns = [
     path('interviews/<uuid:pk>/replay/', ReplayPlayback.as_view(), name='interview-replay'),
+    path('interviews/<uuid:pk>/recording-access/', RecordingAccess.as_view(), name='recording-access'),
     path('interview-sessions/<uuid:pk>/replay/', ReplayConsent.as_view(), name='replay-capture'),
     path('interview-sessions/<uuid:pk>/replay/<int:segment>/chunks/<int:sequence>/', ReplayChunk.as_view(), name='replay-chunk'),
     path('interview-sessions/<uuid:pk>/replay/<int:segment>/seal/', ReplaySeal.as_view(), name='replay-seal'),
@@ -89,6 +93,7 @@ urlpatterns = [
     path("applications/<uuid:pk>/question-set/", ApplicationQuestionSetView.as_view(), name="application-question-set"),
     path("question-sets/<uuid:pk>/", QuestionSetView.as_view(), name="question-set"),
     path("interview-sessions/<uuid:pk>/analysis-status/", AnalysisStatusView.as_view(), name="analysis-status"),
+    path("interview-sessions/<uuid:pk>/browser-observations/", BrowserObservationView.as_view(), name="browser-observations"),
     path("interview-sessions/<uuid:pk>/behavioral-analysis/", BehavioralReportView.as_view(), name="behavioral-analysis"),
     path("interview-sessions/<uuid:pk>/analysis-snapshot/", AnalysisSnapshotView.as_view(), name="analysis-snapshot"),
     path("interview-sessions/<uuid:pk>/finish-video/", FinishVideoView.as_view(), name="finish-video"),
@@ -112,6 +117,10 @@ urlpatterns = [
 
     # Profile endpoints
     path("recruiters/profile/", RecruiterProfileView.as_view(), name="recruiter-profile"),
+    path("recruiters/workspace-export/", WorkspaceExportView.as_view(), name="recruiter-workspace-export"),
+    path("recruiters/account/delete/", RecruiterAccountDeleteView.as_view(), name="recruiter-account-delete"),
+    path("recruiters/calendar/connect/", CalendarConnectView.as_view(), name="recruiter-calendar-connect"),
+    path("recruiters/calendar/callback/", calendar_callback, name="recruiter-calendar-callback"),
     path("candidates/profile/", CandidateProfileView.as_view(), name="candidate-profile"),
     path("candidates/<uuid:pk>/score/", CandidateScoreView.as_view(), name="candidate-score"),
     path("jobs/<uuid:pk>/ranking/", JobRankingView.as_view(), name="job-ranking"),

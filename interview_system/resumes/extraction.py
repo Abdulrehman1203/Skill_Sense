@@ -4,8 +4,8 @@ Resume text extraction module.
 Supports PDF (via pdfplumber) and DOCX (via python-docx) with an OCR
 fallback (pytesseract + pdf2image) for scanned / image-only PDFs.
 
-This module is called exclusively from Celery tasks — never from the
-request/response cycle.
+Full-document extraction runs in Celery. Upload validation reads only
+the opening text used to check the candidate's name.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from __future__ import annotations
 import io
 import logging
 import tempfile
+from itertools import chain, islice
 from typing import TYPE_CHECKING, Any, IO, Union
 
 if TYPE_CHECKING:
@@ -87,7 +88,7 @@ def _extract_pdf_text(file_bytes: bytes) -> str:
     return _ocr_pdf(file_bytes)
 
 
-def _ocr_pdf(file_bytes: bytes) -> str:
+def _ocr_pdf(file_bytes: bytes, *, first_page_only: bool = False) -> str:
     """Rasterize PDF pages and run pytesseract OCR on each."""
     try:
         from pdf2image import convert_from_bytes
@@ -98,14 +99,15 @@ def _ocr_pdf(file_bytes: bytes) -> str:
         ) from exc
 
     try:
-        images = convert_from_bytes(file_bytes, dpi=300)
+        options = {"first_page": 1, "last_page": 1, "timeout": 5, "size": 2400} if first_page_only else {}
+        images = convert_from_bytes(file_bytes, dpi=300, **options)
     except Exception as exc:
         raise ExtractionError(f"Failed to rasterize PDF for OCR: {exc}") from exc
 
     ocr_parts: list[str] = []
     for i, img in enumerate(images):
         try:
-            raw_page_text = pytesseract.image_to_string(img)
+            raw_page_text = pytesseract.image_to_string(img, timeout=5 if first_page_only else 0)
             page_text = str(raw_page_text) if raw_page_text else ""
             ocr_parts.append(page_text)
         except Exception:
@@ -122,7 +124,7 @@ def _ocr_pdf(file_bytes: bytes) -> str:
     return full_text
 
 
-def _extract_docx_text(file_bytes: bytes) -> str:
+def _extract_docx_text(file_bytes: bytes, *, opening_only: bool = False) -> str:
     """Extract text from a DOCX file via python-docx."""
     try:
         from docx import Document
@@ -145,10 +147,14 @@ def _extract_docx_text(file_bytes: bytes) -> str:
             elif block.text.strip():
                 yield block.text
 
-    paragraphs = list(block_text(doc))
-    for section in doc.sections:
-        paragraphs.extend(block_text(section.header))
-        paragraphs.extend(block_text(section.footer))
+    if opening_only:
+        header = block_text(doc.sections[0].header) if doc.sections else ()
+        paragraphs = list(islice(chain(header, block_text(doc)), 8))
+    else:
+        paragraphs = list(block_text(doc))
+        for section in doc.sections:
+            paragraphs.extend(block_text(section.header))
+            paragraphs.extend(block_text(section.footer))
     full_text = "\n".join(paragraphs).strip()
 
     if not full_text:
@@ -156,6 +162,23 @@ def _extract_docx_text(file_bytes: bytes) -> str:
 
     logger.info("DOCX text extraction succeeded (%d chars)", len(full_text))
     return full_text
+
+
+def extract_resume_opening(file_bytes: bytes, *, is_pdf: bool) -> str:
+    """Read the candidate heading from an upload whose file type was validated."""
+    try:
+        if not is_pdf:
+            return _extract_docx_text(file_bytes, opening_only=True)
+
+        import pdfplumber
+
+        with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+            text = pdf.pages[0].extract_text() if pdf.pages else None
+        return text if text and text.strip() else _ocr_pdf(file_bytes, first_page_only=True)
+    except ExtractionError:
+        raise
+    except Exception as exc:
+        raise ExtractionError("Could not read the resume heading.") from exc
 
 
 def extract_text(resume_file: Union[IO[bytes], "File", Any]) -> str:

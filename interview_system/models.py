@@ -167,6 +167,17 @@ class RecruiterProfile(models.Model):
 #  CandidateProfile
 # ═══════════════════════════════════════════════════════════════
 
+class RecruiterCalendarConnection(models.Model):
+    recruiter = models.OneToOneField(
+        RecruiterProfile, on_delete=models.CASCADE, primary_key=True,
+        related_name="calendar_connection",
+    )
+    state_digest = models.CharField(max_length=64, null=True, unique=True, editable=False)
+    state_expires_at = models.DateTimeField(null=True)
+    encrypted_refresh_token = models.BinaryField(null=True, editable=False)
+    connected_at = models.DateTimeField(null=True)
+
+
 class CandidateProfile(models.Model):
     """One-to-one profile attached to every CANDIDATE user."""
 
@@ -358,6 +369,7 @@ class Resume(models.Model):
     )
     parse_claim = models.UUIDField(null=True, blank=True)
     parse_lease_until = models.DateTimeField(null=True, blank=True)
+    upload_hash = models.CharField(max_length=64, blank=True, default="", editable=False)
     content_hash = models.CharField(max_length=64, blank=True)
     parser_version = models.CharField(max_length=100, blank=True)
     uploaded_at = models.DateTimeField(auto_now_add=True)
@@ -806,6 +818,8 @@ class TemplateQuestion(models.Model):
 
 class InterviewSession(models.Model):
     vision_calibration = models.JSONField(default=dict, blank=True)
+    gaze_setup = models.JSONField(default=dict, blank=True, db_default={})
+    browser_observations = models.JSONField(default=dict, blank=True, db_default={})
     """The live/recorded session tied 1:1 to an interview."""
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -845,6 +859,7 @@ class InterviewSession(models.Model):
     finish_reason = models.CharField(max_length=24, blank=True, choices=[(s, s) for s in
         ('candidate_finished', 'audio_ended', 'reconnect_timeout', 'inactivity_timeout', 'duration_limit', 'service_failure')])
     received_count = models.PositiveBigIntegerField(default=0)
+    frame_drop_reasons = models.JSONField(default=dict, blank=True, db_default={})
     admitted_count = models.PositiveBigIntegerField(default=0)
     dropped_count = models.PositiveBigIntegerField(default=0)
     analysis_ready_at = models.DateTimeField(null=True, blank=True)
@@ -1038,6 +1053,7 @@ class InterviewEvaluation(models.Model):
     supersedes = models.OneToOneField('self', null=True, on_delete=models.PROTECT, related_name='superseded_by')
     status = models.CharField(max_length=16, default='QUEUED', choices=[(s, s) for s in ('QUEUED', 'PROCESSING', 'READY', 'FAILED', 'UNAVAILABLE')])
     model_name = models.CharField(max_length=128)
+    uses_fallback = models.BooleanField(default=False, db_default=False)
     prompt_version = models.CharField(max_length=32, default='answers-v1')
     final_evidence = models.BooleanField(default=False)
     run_number = models.PositiveIntegerField(default=0)
@@ -1047,8 +1063,10 @@ class InterviewEvaluation(models.Model):
     coverage = models.FloatField(null=True)
     error_code = models.CharField(max_length=64, blank=True)
     attempts = models.PositiveIntegerField(default=0)
+    provider_failures = models.PositiveIntegerField(default=0, db_default=0)
     claim_token = models.UUIDField(null=True)
     lease_until = models.DateTimeField(null=True)
+    grading_progress = models.JSONField(default=dict, blank=True, db_default={})
     next_attempt_at = models.DateTimeField(default=timezone.now, db_index=True)
     published_at = models.DateTimeField(null=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -1060,7 +1078,7 @@ class InterviewEvaluation(models.Model):
     def save(self, *args, **kwargs):
         if not self._state.adding:
             previous = type(self).objects.get(pk=self.pk)
-            frozen = ('interview_id', 'revision', 'transcript_id', 'context_id', 'supersedes_id', 'model_name', 'prompt_version', 'final_evidence', 'run_number', 'requested_by_id', 'request_reason')
+            frozen = ('interview_id', 'revision', 'transcript_id', 'context_id', 'supersedes_id', 'model_name', 'uses_fallback', 'prompt_version', 'final_evidence', 'run_number', 'requested_by_id', 'request_reason')
             if any(getattr(previous, f) != getattr(self, f) for f in frozen) or previous.published_at:
                 raise ValidationError('Evaluation inputs and published results are immutable.')
         return super().save(*args, **kwargs)
@@ -1327,6 +1345,7 @@ class FrameJob(models.Model):
     publication_token = models.UUIDField(null=True, blank=True)
     publication_attempts = models.PositiveSmallIntegerField(default=0)
     publication_due_at = models.DateTimeField(default=timezone.now)
+    vision_context = models.JSONField(default=dict, blank=True, db_default={})
 
     class Meta:
         constraints = [

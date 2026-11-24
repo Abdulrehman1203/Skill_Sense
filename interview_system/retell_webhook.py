@@ -62,7 +62,12 @@ class RetellCallEndedView(APIView):
                 return Response(status=204)
             if payload.get('event') == 'transcript_updated':
                 from .live_transcript import accept_live_transcript
-                accept_live_transcript(payload.get('call'))
+                call = payload.get('call')
+                if (isinstance(call, dict) and call.get('transcript_object') is None
+                        and call.get('transcript_with_tool_calls') is None
+                        and 'transcript_with_tool_calls' in payload):
+                    call = {**call, 'transcript_with_tool_calls': payload['transcript_with_tool_calls']}
+                accept_live_transcript(call)
                 return Response(status=204)
             if payload.get('event') not in ('call_ended', 'call_analyzed'):
                 return Response({'detail': 'Unsupported event.'}, status=400)

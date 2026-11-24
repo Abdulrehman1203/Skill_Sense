@@ -9,6 +9,8 @@ import hashlib
 import json
 import math
 
+CAMERA_SIGNALS = ('phone_visible', 'multiple_people_observed', 'no_face_observed')
+
 
 @dataclass(frozen=True)
 class RuleConfig:
@@ -26,14 +28,22 @@ class RuleConfig:
 
     @property
     def version(self):
+        return self.legacy_version.replace('episodes-v1-', 'episodes-v2-', 1)
+
+    @property
+    def legacy_version(self):
         return 'episodes-v1-'+hashlib.sha256(json.dumps(asdict(self), sort_keys=True).encode()).hexdigest()[:16]
 
 
 def signal(observation, name, active, config):
+    threshold = config.retain_confidence if active else config.enter_confidence
+    return signal_at_threshold(observation, name, threshold)
+
+
+def signal_at_threshold(observation, name, threshold):
     details = observation.get('vision_details')
     if not details or not details['quality']['usable']:
         return None
-    threshold = config.retain_confidence if active else config.enter_confidence
     detections = observation['detected_objects']
     if name == 'phone_visible':
         return any(d['label'] == 'phone' and d['confidence'] >= threshold for d in detections)
@@ -53,20 +63,26 @@ must be chronological, identities unique; replay the same persisted ordered
 ledger for a reproducible final result. Caller stores a bounded projection.
 """
     config = config or RuleConfig()
-    names = ('phone_visible', 'multiple_people_observed', 'no_face_observed', 'gaze_away')
+    names = (*CAMERA_SIGNALS, 'gaze_away')
     states = {name: None for name in names}
     events = deque(maxlen=100)
     episode_counts = {name: 0 for name in names}
     totals = {name: 0. for name in names}
+    diagnostics = {name: dict(frame_detections=0, entry_qualified_frames=0, unknown_frames=0,
+                              below_onset_runs=0, runs_interrupted_by_unknown=0)
+                   for name in CAMERA_SIGNALS}
     previous = None
 
-    def end(name):
+    def end(name, *, interrupted=False):
         state = states[name]
         if state and state['duration'] >= config.onset_seconds:
             episode_counts[name] += 1
             events.append({'type': name, 'episode_key': name+':'+str(state['first_ordinal']),
                            'start': state['start'], 'end': state['last_positive'],
                            'observed_seconds': round(state['duration'], 6), 'rules_version': config.version})
+        elif state and name in diagnostics:
+            diagnostics[name]['below_onset_runs'] += 1
+            diagnostics[name]['runs_interrupted_by_unknown'] += interrupted
         states[name] = None
 
     for timestamp, ordinal, observation in samples:
@@ -76,13 +92,20 @@ ledger for a reproducible final result. Caller stores a bounded projection.
         if previous and (timestamp < previous[0] or ordinal <= previous[1]):
             raise ValueError('Observations must be ordered and unique.')
         gap = timestamp-previous[0] if previous else 0.
+        generation = observation.get('capture_generation')
+        discontinuity = previous and (gap > config.max_gap or generation != previous[2])
         for name in names:
+            if discontinuity:
+                end(name, interrupted=True)
             state = states[name]
             value = signal(observation, name, state is not None, config)
-            if value is None or (previous and gap > config.max_gap):
-                end(name)
-                state = None
+            if name in diagnostics:
+                raw = signal_at_threshold(observation, name, 0.)
+                diagnostics[name]['unknown_frames'] += raw is None
+                diagnostics[name]['frame_detections'] += raw is True
+                diagnostics[name]['entry_qualified_frames'] += signal(observation, name, False, config) is True
             if value is None:
+                end(name, interrupted=True)
                 continue
             if value:
                 if state is None:
@@ -98,9 +121,10 @@ ledger for a reproducible final result. Caller stores a bounded projection.
                 state['negative_since'] = timestamp if state['negative_since'] is None else state['negative_since']
                 if timestamp-state['negative_since'] >= config.release_seconds:
                     end(name)
-        previous = timestamp, ordinal
+        previous = timestamp, ordinal, generation
     for name in names:
         end(name)
     return {'rules_version': config.version, 'events': list(events),
             'episode_counts': episode_counts, 'events_truncated': sum(episode_counts.values()) > len(events),
+            'signal_diagnostics': diagnostics,
             'observed_seconds': {name: round(value, 6) for name, value in totals.items()}}

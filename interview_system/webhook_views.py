@@ -253,8 +253,13 @@ class ClerkWebhookView(APIView):
 
         try:
             user = User.objects.get(clerk_id=clerk_id)
-            user.is_active = False
-            user.save(update_fields=["is_active"])
+            if user.role == User.Role.RECRUITER:
+                from .recruiter_workspace import deactivate_deleted_recruiter
+
+                deactivate_deleted_recruiter(clerk_id)
+            else:
+                user.is_active = False
+                user.save(update_fields=["is_active"])
             logger.info('Clerk identity event handled.')
         except User.DoesNotExist:
             logger.info('Clerk identity event handled.')

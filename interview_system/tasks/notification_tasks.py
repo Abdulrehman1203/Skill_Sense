@@ -10,6 +10,7 @@ from django.db.models import Q
 from django.utils import timezone
 
 from ..models import NotificationOutbox
+from ..notification_email import candidate_email
 from .guards import skip_missing_resource
 from ..notification_contract import EVENT_MESSAGES, event_name
 
@@ -45,9 +46,9 @@ def deliver_notification_outbox(outbox_id):
         row.email_status = 'SENDING'
         row.save()
     try:
-        subject, message = EVENT_MESSAGES[row.event]
+        subject, message = candidate_email(row)
         sent = send_mail(subject, message, settings.DEFAULT_FROM_EMAIL, [row.recipient.email],
-            fail_silently=False, connection=get_connection(timeout=10))
+            fail_silently=False, connection=get_connection())
         if sent != 1:
             raise RuntimeError('EMAIL_NOT_ACCEPTED')
     except Exception:

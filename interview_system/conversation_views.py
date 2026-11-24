@@ -1,8 +1,8 @@
 """Raw-body HMAC verification before parsing provider tool requests."""
 import json
-import time
 from django.core.cache import cache
 from drf_spectacular.utils import extend_schema, OpenApiResponse
+from redis.exceptions import RedisError
 from rest_framework.permissions import AllowAny
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -12,7 +12,7 @@ from .conversation_protocol import ANSWER_TOOL
 
 
 def answer_resumed(payload):
-    """Hold answer submission outside DB locks and fence resumed candidate speech."""
+    """Use newer authenticated speech already received, without waiting in the tool."""
     if payload.get('name') != ANSWER_TOOL:
         return False
     call = payload.get('call')
@@ -23,27 +23,22 @@ def answer_resumed(payload):
 
     def candidate_text(turns):
         return ' '.join(clean(t.get('content', '')) for t in turns
-                        if isinstance(t, dict) and t.get('role') == 'user')
+                        if isinstance(t, dict) and t.get('role') == 'user').split()
 
-    original = candidate_text(call.get('transcript_object') or [])
-    delay = 5.0
-    started = call.get('start_timestamp')
-    turns = call.get('transcript_object') or []
-    end = max((word.get('end', 0) for turn in turns
-               if isinstance(turn, dict) and turn.get('role') == 'user'
-               for word in (turn.get('words') or [])
-               if isinstance(word, dict) and type(word.get('end')) in (int, float)
-               and 0 <= word['end'] < 86400), default=None)
-    if type(started) in (int, float) and end is not None:
-        elapsed = time.time() - started / 1000 - end
-        if 0 <= elapsed < 86400:
-            delay = max(0, 5 - elapsed)
-    time.sleep(delay)
-    latest = cache.get(transcript_key(call['call_id']))
+    turns = call.get('transcript_object')
+    if not isinstance(turns, list) or len(turns) > 10000:
+        return False
+    original = candidate_text(turns)
+    if not original:
+        return False
+    try:
+        latest = cache.get(transcript_key(call['call_id']))
+    except RedisError:
+        return False  # The signed tool payload remains valid evidence.
     if not latest:
         return False
     heard = candidate_text(latest['turns'])
-    return bool(heard and heard != original and not original.startswith(heard))
+    return len(heard) > len(original) and heard[:len(original)] == original
 
 
 class ConversationControlView(APIView):

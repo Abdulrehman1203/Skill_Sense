@@ -7,13 +7,16 @@ import uuid
 
 from channels.generic.websocket import AsyncWebsocketConsumer
 from django.conf import settings
+from django.db import DatabaseError
 from django.utils import timezone
 from django.views.decorators.debug import sensitive_variables
 
 from . import frame_admission, observer_delivery, socket_db
+from .candidate_camera_feedback import enabled as camera_feedback_enabled
 from .frame_validation import ProtocolError, get_decoder, parse_message
 from .socket_auth import SocketAuthorizationError
 from .socket_guard import SocketGuard
+from .vision_calibration import enabled as gaze_calibration_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +101,10 @@ class AnalysisSocket(AsyncWebsocketConsumer):
                 ready.update(connection_generation=str(self.generation), target_fps=min(3, settings.INTERVIEW_ANALYSIS_FRAME_FPS),
                     max_message_bytes=settings.INTERVIEW_ANALYSIS_MAX_MESSAGE_BYTES, max_jpeg_bytes=settings.INTERVIEW_ANALYSIS_MAX_JPEG_BYTES,
                     max_pixels=settings.INTERVIEW_ANALYSIS_MAX_PIXELS, max_width=settings.INTERVIEW_ANALYSIS_MAX_WIDTH, max_height=settings.INTERVIEW_ANALYSIS_MAX_HEIGHT)
+                if gaze_calibration_enabled():
+                    ready['gaze_calibration'] = True
+                if camera_feedback_enabled():
+                    ready['camera_feedback'] = True
             else:
                 ready['session_id'] = str(self.lease.session_id)
             await self.emit(ready)
@@ -155,8 +162,19 @@ class AnalysisSocket(AsyncWebsocketConsumer):
                 if message['type'] == 'ping':
                     if self.purpose == 'publisher':
                         await io(socket_db.heartbeat(self.lease, self.generation))
+                    pong = {'type': 'pong', 'server_ts': timezone.now().isoformat().replace('+00:00', 'Z')}
+                    if self.purpose == 'publisher' and message.get('camera_feedback') and camera_feedback_enabled():
+                        try:
+                            pong['camera_feedback'] = await io(socket_db.camera_feedback(self.lease, self.generation))
+                        except (TimeoutError, DatabaseError):
+                            pong['camera_feedback'] = 'unknown'
                     await self.authorize()
-                    await self.emit({'type': 'pong', 'server_ts': timezone.now().isoformat().replace('+00:00', 'Z')})
+                    await self.emit(pong)
+                elif self.purpose == 'publisher' and message['type'] == 'gaze_calibration':
+                    result = await io(socket_db.gaze_control(self.lease, self.generation, message['action'],
+                                                             message.get('camera_setup')))
+                    await self.authorize()
+                    await self.emit(result)
                 elif self.purpose == 'publisher':
                     await self.frame(message, received_at)
                 else:
@@ -177,23 +195,31 @@ class AnalysisSocket(AsyncWebsocketConsumer):
         if not await io(self.guard.allow('frame')):
             await self.ack(sequence, 'dropped', 'rate_limited')
             return
-        jpeg = await get_decoder().decode(message['data'])
+        try:
+            jpeg = await get_decoder().decode(message['data'])
+        except ProtocolError:
+            if settings.INTERVIEW_ANALYSIS_CAMERA_DIAGNOSTICS_ENABLED:
+                await io(socket_db.drop(self.lease, self.generation, sequence, reason='invalid_image'))
+            raise
         if jpeg is None:
-            await self.ack(sequence, 'dropped', 'capacity')
+            await self.ack(sequence, 'dropped', 'capacity', diagnostic_reason='decoder_unavailable')
             return
         await self.authorize()  # Decode may have outlived credentials/account eligibility.
         decision = await io(frame_admission.submit_frame(lease=self.lease, generation=self.generation,
-            sequence=sequence, capture_ts=message['capture_ts'], received_at=received_at, jpeg=jpeg))
+            sequence=sequence, capture_ts=message['capture_ts'], received_at=received_at, jpeg=jpeg,
+            **({'calibration_sample': True} if message.get('calibration_sample') else {})))
         if (not isinstance(decision, frame_admission.AdmissionDecision)
                 or decision.status not in ('accepted', 'dropped')
                 or (decision.status == 'accepted' and decision.reason is not None)
                 or (decision.status == 'dropped' and decision.reason not in ('capacity', 'rate_limited', 'stale'))):
             raise ValueError('Invalid admission decision.')
-        await self.ack(sequence, decision.status, decision.reason, validated=True)
+        await self.ack(sequence, decision.status, decision.reason, validated=True,
+                       diagnostic_reason=decision.diagnostic_reason)
 
-    async def ack(self, sequence, status, reason=None, *, validated=False):
+    async def ack(self, sequence, status, reason=None, *, validated=False, diagnostic_reason=None):
         if status == 'dropped':
-            await io(socket_db.drop(self.lease, self.generation, sequence, validated=validated))
+            await io(socket_db.drop(self.lease, self.generation, sequence, validated=validated,
+                                    reason=diagnostic_reason or reason))
         await self.authorize()
         message = {'type': 'ack', 'connection_generation': str(self.generation), 'sequence': sequence, 'status': status}
         if reason is not None:
@@ -259,7 +285,10 @@ class AnalysisSocket(AsyncWebsocketConsumer):
         logger.warning('analysis_socket_closed purpose=%s reason=%s code=%s accepted=%s',
                        self.purpose, reason, code, self.accepted)
         await self.cleanup()
-        if not self.accepted and self.lease is not None and reason in ('publisher_conflict', 'stale_connection'):
+        if not self.accepted and self.lease is not None and (
+            reason in ('publisher_conflict', 'stale_connection')
+            or (self.purpose == 'publisher' and reason == 'connection_limit')
+        ):
             # A valid ticket may race cleanup of the previous generation.
             # Deliver its actionable transport reason before closing.
             with suppress(Exception):

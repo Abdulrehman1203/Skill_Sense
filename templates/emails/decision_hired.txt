@@ -1,0 +1,8 @@
+{% autoescape off %}Hi{% if first_name %} {{ first_name }}{% endif %},
+
+Congratulations! The hiring team has selected you for {{ job_title }}{% if company_name %} at {{ company_name }}{% endif %}.
+
+Sign in to SkillSense to view the decision, and watch for a follow-up from the hiring team about next steps.
+
+The SkillSense team
+{% endautoescape %}

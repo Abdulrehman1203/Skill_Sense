@@ -13,6 +13,7 @@ from channels.generic.websocket import AsyncWebsocketConsumer
 from django.conf import settings
 
 from .consumers import io
+from .monitor_configuration import monitor_configuration_status, relay_configured
 from .socket_auth import SocketAuthorizationError, check_lease_async, redeem_ticket_async
 from .socket_guard import SocketGuard
 
@@ -21,13 +22,14 @@ MAX_BYTES = 32768
 
 
 def ice_configuration():
-    secret = settings.LIVE_MONITOR_TURN_SECRET
-    urls = settings.LIVE_MONITOR_TURN_URLS
-    if not secret or not urls or any(not u.startswith(('turn:', 'turns:')) for u in urls):
+    if monitor_configuration_status() != 'available':
         raise ValueError('relay_unavailable')
-    username = f'{int(time.time()) + 600}:{uuid.uuid4().hex}'
-    credential = base64.b64encode(hmac.digest(secret.encode(), username.encode(), 'sha1')).decode()
-    servers = [{'urls': urls, 'username': username, 'credential': credential}]
+    servers = []
+    if relay_configured():
+        username = f'{int(time.time()) + 600}:{uuid.uuid4().hex}'
+        credential = base64.b64encode(hmac.digest(settings.LIVE_MONITOR_TURN_SECRET.encode(),
+                                                   username.encode(), 'sha1')).decode()
+        servers.append({'urls': settings.LIVE_MONITOR_TURN_URLS, 'username': username, 'credential': credential})
     if settings.LIVE_MONITOR_STUN_URLS:
         servers.append({'urls': settings.LIVE_MONITOR_STUN_URLS})
     return {'iceServers': servers, 'iceTransportPolicy': 'relay' if settings.LIVE_MONITOR_RELAY_ONLY else 'all'}

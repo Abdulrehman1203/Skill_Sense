@@ -1,5 +1,6 @@
 """Leased question generation with durable dispatch recovery and no draft overwrite."""
 from datetime import timedelta
+import logging
 import uuid
 
 from celery import shared_task
@@ -10,6 +11,9 @@ from django.utils import timezone
 from ..models import Application, Notification, PreparedQuestion, QuestionPreparationIntent, QuestionReviewDelivery, QuestionSet
 from .guards import skip_missing_resource
 from ..question_preparation import dispatch, generation_context, prepare_locked
+
+
+logger = logging.getLogger(__name__)
 
 
 @shared_task(ignore_result=True, acks_late=True, soft_time_limit=50, time_limit=60)
@@ -35,16 +39,19 @@ def generate_question_set(set_id):
         row.save()
     try:
         from ..integrations.gemini_client import (
-            fit_questions_to_mix, generate_questions_for, get_template_questions, question_mix,
+            fit_questions_to_mix, generate_questions_for, get_template_questions,
+            question_failure_code, question_mix,
         )
         job, candidate = generation_context(row)
         fallback_reason = ""
         try:
             questions = generate_questions_for(job, candidate)
             fallback_reason = getattr(questions, 'fallback_reason', '')
-        except Exception:
+        except Exception as exc:
+            fallback_reason = question_failure_code(exc)
+            logger.warning("Question generation failed set_id=%s reason=%s (%s)",
+                set_id, fallback_reason, type(exc).__name__)
             questions = fit_questions_to_mix(get_template_questions(), question_mix(job))
-            fallback_reason = "GENERATOR_UNAVAILABLE"
         if not questions:
             questions = fit_questions_to_mix(get_template_questions(), question_mix(job))
             fallback_reason = "EMPTY_GENERATION"
@@ -59,6 +66,16 @@ def generate_question_set(set_id):
         with transaction.atomic():
             current = QuestionSet.objects.select_for_update().get(pk=set_id)
             if current.claim_token != token or current.revision != row.revision or current.approved_at or current.frozen_at:
+                return
+            if fallback and current.attempts == 1 and fallback_reason in (
+                "GENERATOR_PROVIDER_BUSY", "GENERATOR_TIMEOUT",
+            ):
+                # Let the existing recovery task retry after the provider has had time to recover.
+                current.generation_status = "QUEUED"
+                current.next_attempt_at = timezone.now() + timedelta(seconds=30)
+                current.claim_token = current.lease_until = None
+                current.save(update_fields=["generation_status", "next_attempt_at", "claim_token", "lease_until"])
+                logger.info("Question generation retry scheduled set_id=%s reason=%s", set_id, fallback_reason)
                 return
             preserved = list(current.items.filter(archived_at__isnull=True))
             questions = questions[:max(0, 100 - len(preserved))]
@@ -115,8 +132,7 @@ def dispatch_review_delivery(delivery_id):
     try:
         deliver_question_review.apply_async(args=[str(delivery_id)], retry=False)
     except Exception:
-        import logging
-        logging.getLogger(__name__).warning("Question review notification deferred delivery_id=%s", delivery_id)
+        logger.warning("Question review notification deferred delivery_id=%s", delivery_id)
 
 
 @shared_task(ignore_result=True)

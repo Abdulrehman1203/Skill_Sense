@@ -1,0 +1,12 @@
+{% load tz %}{% autoescape off %}Hi{% if first_name %} {{ first_name }}{% endif %},
+
+Your interview for {{ job_title }}{% if company_name %} at {{ company_name }}{% endif %} is scheduled.
+{% timezone "UTC" %}{% if interview.deadline_at %}
+Complete your interview by {{ interview.deadline_at|date:"l, F j, Y" }} at {{ interview.deadline_at|date:"H:i" }} UTC. You can start any time before the deadline.
+{% elif interview.scheduled_at %}
+Your interview starts on {{ interview.scheduled_at|date:"l, F j, Y" }} at {{ interview.scheduled_at|date:"H:i" }} UTC.
+{% endif %}{% endtimezone %}
+Sign in to SkillSense to view the details and start your interview.
+
+The SkillSense team
+{% endautoescape %}

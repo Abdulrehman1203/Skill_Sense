@@ -23,7 +23,21 @@ def calibrate_center(samples):
     return Calibration(median(x for x, _ in good), median(y for _, y in good))
 
 
-def estimate(landmarks, matrix, calibration=None):
+def _eye_image_usable(rgb, x0, y0, x1, y1):
+    if not (0 <= x0 < x1 <= 1 and 0 <= y0 < y1 <= 1):
+        return False
+    height, width = rgb.shape[:2]
+    left, right = max(0, int(x0 * width)), min(width, math.ceil(x1 * width))
+    top, bottom = max(0, int(y0 * height)), min(height, math.ceil(y1 * height))
+    if right - left < 4 or bottom - top < 3:
+        return False
+    gray = rgb[top:bottom, left:right].mean(axis=2)
+    # Reject clipped or textureless eye regions even when the full image is usable.
+    return (35 <= gray.mean() <= 225 and gray.std() >= 8
+            and (gray >= 245).mean() <= .25)
+
+
+def estimate(landmarks, matrix, calibration=None, *, rgb=None):
     if len(landmarks) != 1:
         return Gaze(reason='no_face' if not landmarks else 'multiple_faces')
     points = landmarks[0]
@@ -42,6 +56,8 @@ def estimate(landmarks, matrix, calibration=None):
             x0, x1 = sorted((points[left].x, points[right].x))
             y0, y1 = sorted((points[top].y, points[bottom].y))
             if x1-x0 < 0.015 or y1-y0 < 0.004 or (y1-y0)/(x1-x0) < 0.12:
+                return Gaze(reason='eyes_unusable')
+            if rgb is not None and not _eye_image_usable(rgb, x0, y0, x1, y1):
                 return Gaze(reason='eyes_unusable')
             ratios.append(((points[iris].x-x0)/(x1-x0), (points[iris].y-y0)/(y1-y0)))
         if any(not math.isfinite(v) or not 0 <= v <= 1 for pair in ratios for v in pair):
